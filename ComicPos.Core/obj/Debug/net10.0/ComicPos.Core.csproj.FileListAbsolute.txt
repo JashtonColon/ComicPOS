@@ -1,0 +1,12 @@
+C:\ALLCODE\comicPOS\ComicPos.Core\bin\Debug\net10.0\ComicPos.Core.deps.json
+C:\ALLCODE\comicPOS\ComicPos.Core\bin\Debug\net10.0\ComicPos.Core.dll
+C:\ALLCODE\comicPOS\ComicPos.Core\bin\Debug\net10.0\ComicPos.Core.pdb
+C:\ALLCODE\comicPOS\ComicPos.Core\obj\Debug\net10.0\ComicPos.Core.GeneratedMSBuildEditorConfig.editorconfig
+C:\ALLCODE\comicPOS\ComicPos.Core\obj\Debug\net10.0\ComicPos.Core.AssemblyInfoInputs.cache
+C:\ALLCODE\comicPOS\ComicPos.Core\obj\Debug\net10.0\ComicPos.Core.AssemblyInfo.cs
+C:\ALLCODE\comicPOS\ComicPos.Core\obj\Debug\net10.0\ComicPos.Core.csproj.CoreCompileInputs.cache
+C:\ALLCODE\comicPOS\ComicPos.Core\obj\Debug\net10.0\ComicPos.Core.sourcelink.json
+C:\ALLCODE\comicPOS\ComicPos.Core\obj\Debug\net10.0\ComicPos.Core.dll
+C:\ALLCODE\comicPOS\ComicPos.Core\obj\Debug\net10.0\refint\ComicPos.Core.dll
+C:\ALLCODE\comicPOS\ComicPos.Core\obj\Debug\net10.0\ComicPos.Core.pdb
+C:\ALLCODE\comicPOS\ComicPos.Core\obj\Debug\net10.0\ref\ComicPos.Core.dll

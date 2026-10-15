@@ -1,0 +1,16 @@
+C:\ALLCODE\comicPOS\ComicPos.Data\bin\Debug\net10.0\ComicPos.Data.deps.json
+C:\ALLCODE\comicPOS\ComicPos.Data\bin\Debug\net10.0\ComicPos.Data.dll
+C:\ALLCODE\comicPOS\ComicPos.Data\bin\Debug\net10.0\ComicPos.Data.pdb
+C:\ALLCODE\comicPOS\ComicPos.Data\bin\Debug\net10.0\ComicPos.Core.dll
+C:\ALLCODE\comicPOS\ComicPos.Data\bin\Debug\net10.0\ComicPos.Core.pdb
+C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ComicPos.Data.csproj.AssemblyReference.cache
+C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ComicPos.Data.GeneratedMSBuildEditorConfig.editorconfig
+C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ComicPos.Data.AssemblyInfoInputs.cache
+C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ComicPos.Data.AssemblyInfo.cs
+C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ComicPos.Data.csproj.CoreCompileInputs.cache
+C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ComicPos.Data.sourcelink.json
+C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ComicPos.0D041C6F.Up2Date
+C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ComicPos.Data.dll
+C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\refint\ComicPos.Data.dll
+C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ComicPos.Data.pdb
+C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ref\ComicPos.Data.dll

@@ -1,0 +1,16 @@
+C:\ALLCODE\comicPOS\ComicPos.Importers\bin\Debug\net10.0\ComicPos.Importers.deps.json
+C:\ALLCODE\comicPOS\ComicPos.Importers\bin\Debug\net10.0\ComicPos.Importers.dll
+C:\ALLCODE\comicPOS\ComicPos.Importers\bin\Debug\net10.0\ComicPos.Importers.pdb
+C:\ALLCODE\comicPOS\ComicPos.Importers\bin\Debug\net10.0\ComicPos.Core.dll
+C:\ALLCODE\comicPOS\ComicPos.Importers\bin\Debug\net10.0\ComicPos.Core.pdb
+C:\ALLCODE\comicPOS\ComicPos.Importers\obj\Debug\net10.0\ComicPos.Importers.csproj.AssemblyReference.cache
+C:\ALLCODE\comicPOS\ComicPos.Importers\obj\Debug\net10.0\ComicPos.Importers.GeneratedMSBuildEditorConfig.editorconfig
+C:\ALLCODE\comicPOS\ComicPos.Importers\obj\Debug\net10.0\ComicPos.Importers.AssemblyInfoInputs.cache
+C:\ALLCODE\comicPOS\ComicPos.Importers\obj\Debug\net10.0\ComicPos.Importers.AssemblyInfo.cs
+C:\ALLCODE\comicPOS\ComicPos.Importers\obj\Debug\net10.0\ComicPos.Importers.csproj.CoreCompileInputs.cache
+C:\ALLCODE\comicPOS\ComicPos.Importers\obj\Debug\net10.0\ComicPos.Importers.sourcelink.json
+C:\ALLCODE\comicPOS\ComicPos.Importers\obj\Debug\net10.0\ComicPos.B9692BA0.Up2Date
+C:\ALLCODE\comicPOS\ComicPos.Importers\obj\Debug\net10.0\ComicPos.Importers.dll
+C:\ALLCODE\comicPOS\ComicPos.Importers\obj\Debug\net10.0\refint\ComicPos.Importers.dll
+C:\ALLCODE\comicPOS\ComicPos.Importers\obj\Debug\net10.0\ComicPos.Importers.pdb
+C:\ALLCODE\comicPOS\ComicPos.Importers\obj\Debug\net10.0\ref\ComicPos.Importers.dll
