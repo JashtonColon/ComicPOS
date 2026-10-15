@@ -6,8 +6,8 @@ public class Issue{
     
     public int Id { get; set; }
     public int SeriesId { get; set; }
-    public int IssueNumber { get; set; }
-    public float IssueNumberFloat { get; set; } 
+    public float IssueNumber { get; set; }
+     
     
     public string Author { get; set; } = string.Empty;
     public string Penciler { get; set; } = string.Empty;
