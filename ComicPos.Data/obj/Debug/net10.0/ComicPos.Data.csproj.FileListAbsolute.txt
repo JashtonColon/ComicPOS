@@ -14,3 +14,5 @@ C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ComicPos.Data.dll
 C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\refint\ComicPos.Data.dll
 C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ComicPos.Data.pdb
 C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ref\ComicPos.Data.dll
+C:\ALLCODE\comicPOS\ComicPos.Data\bin\Debug\net10.0\ComicPos.Data.runtimeconfig.json
+C:\ALLCODE\comicPOS\ComicPos.Data\obj\Debug\net10.0\ComicPos.Data.genruntimeconfig.cache

@@ -3,4 +3,5 @@
   <Project Path="ComicPos.Core/ComicPos.Core.csproj" />
   <Project Path="ComicPos.Data/ComicPos.Data.csproj" />
   <Project Path="ComicPos.Importers/ComicPos.Importers.csproj" />
+  <Project Path="ComicPos.Scratch/ComicPos.Scratch.csproj" />
 </Solution>

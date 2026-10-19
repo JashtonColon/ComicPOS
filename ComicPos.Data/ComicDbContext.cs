@@ -8,12 +8,14 @@ public class ComicDbContext : DbContext
     public DbSet<Series> AllSeries { get; set; } = null!;
     public DbSet<Issue> Issues { get; set; } = null!;
     public DbSet<Cover> Covers { get; set; } = null!;
-    // add a DbSet<Issue> here, named Issues
-    // add a DbSet<Cover> here, named Covers
 
     protected override void OnConfiguring(DbContextOptionsBuilder options)
     {
-        options.UseSqlite("Data Source=comic_pos.db");
-        // call options.UseSqlite(...) with "Data Source=comic_pos.db"
+        var folder = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var dbPath = Path.Combine(folder, "ComicPos", "comic_pos.db");
+
+        Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+
+        options.UseSqlite($"Data Source={dbPath}");
     }
 }
