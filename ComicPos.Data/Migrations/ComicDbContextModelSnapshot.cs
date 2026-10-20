@@ -48,9 +48,36 @@ namespace ComicPos.Data.Migrations
 
                     b.HasKey("Id");
 
+                    b.HasIndex("Barcode")
+                        .IsUnique();
+
                     b.HasIndex("IssueId");
 
-                    b.ToTable("Covers");
+                    b.ToTable("Covers", (string)null);
+                });
+
+            modelBuilder.Entity("ComicPos.Core.Models.Customer", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Email")
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("IsActive")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Phone")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Customers", (string)null);
                 });
 
             modelBuilder.Entity("ComicPos.Core.Models.Issue", b =>
@@ -99,7 +126,84 @@ namespace ComicPos.Data.Migrations
 
                     b.HasIndex("SeriesId");
 
-                    b.ToTable("Issues");
+                    b.ToTable("Issues", (string)null);
+                });
+
+            modelBuilder.Entity("ComicPos.Core.Models.PullListEntry", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("CustomerId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("IsActive")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("PreferredCoverLetter")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("SeriesId")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CustomerId");
+
+                    b.HasIndex("SeriesId");
+
+                    b.ToTable("PullListEntries", (string)null);
+                });
+
+            modelBuilder.Entity("ComicPos.Core.Models.Sale", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("CustomerId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("SoldAt")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CustomerId");
+
+                    b.ToTable("Sales", (string)null);
+                });
+
+            modelBuilder.Entity("ComicPos.Core.Models.SaleLine", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("CoverId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<decimal>("DiscountPercent")
+                        .HasColumnType("TEXT");
+
+                    b.Property<decimal>("PriceEach")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("Quantity")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("SaleId")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CoverId");
+
+                    b.HasIndex("SaleId");
+
+                    b.ToTable("SaleLines", (string)null);
                 });
 
             modelBuilder.Entity("ComicPos.Core.Models.Series", b =>
@@ -114,7 +218,7 @@ namespace ComicPos.Data.Migrations
 
                     b.HasKey("Id");
 
-                    b.ToTable("AllSeries");
+                    b.ToTable("AllSeries", (string)null);
                 });
 
             modelBuilder.Entity("ComicPos.Core.Models.Cover", b =>
@@ -139,9 +243,66 @@ namespace ComicPos.Data.Migrations
                     b.Navigation("Series");
                 });
 
+            modelBuilder.Entity("ComicPos.Core.Models.PullListEntry", b =>
+                {
+                    b.HasOne("ComicPos.Core.Models.Customer", "Customer")
+                        .WithMany("PullListEntries")
+                        .HasForeignKey("CustomerId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("ComicPos.Core.Models.Series", "Series")
+                        .WithMany()
+                        .HasForeignKey("SeriesId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Customer");
+
+                    b.Navigation("Series");
+                });
+
+            modelBuilder.Entity("ComicPos.Core.Models.Sale", b =>
+                {
+                    b.HasOne("ComicPos.Core.Models.Customer", "Customer")
+                        .WithMany()
+                        .HasForeignKey("CustomerId");
+
+                    b.Navigation("Customer");
+                });
+
+            modelBuilder.Entity("ComicPos.Core.Models.SaleLine", b =>
+                {
+                    b.HasOne("ComicPos.Core.Models.Cover", "Cover")
+                        .WithMany()
+                        .HasForeignKey("CoverId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("ComicPos.Core.Models.Sale", "Sale")
+                        .WithMany("Lines")
+                        .HasForeignKey("SaleId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Cover");
+
+                    b.Navigation("Sale");
+                });
+
+            modelBuilder.Entity("ComicPos.Core.Models.Customer", b =>
+                {
+                    b.Navigation("PullListEntries");
+                });
+
             modelBuilder.Entity("ComicPos.Core.Models.Issue", b =>
                 {
                     b.Navigation("Covers");
+                });
+
+            modelBuilder.Entity("ComicPos.Core.Models.Sale", b =>
+                {
+                    b.Navigation("Lines");
                 });
 
             modelBuilder.Entity("ComicPos.Core.Models.Series", b =>

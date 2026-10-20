@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("ComicPos.Data")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+8eb2f5298160a4ab36e085dd316f5209c4e96ddb")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+c9dbd1de0c488091759ac1c528a12f31ff82e803")]
 [assembly: System.Reflection.AssemblyProductAttribute("ComicPos.Data")]
 [assembly: System.Reflection.AssemblyTitleAttribute("ComicPos.Data")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

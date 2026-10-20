@@ -109,7 +109,7 @@ public class CheckoutControl : UserControl
                 break;
         }
 
-        RefreshCart(); // redraw everything, including the recalculated Total column and the label
+        BeginInvoke(RefreshCart); // deferred, so we don't rebuild the grid mid-click // redraw everything, including the recalculated Total column and the label
     }
 
     private void BtnComplete_Click(object? sender, EventArgs e)
@@ -145,11 +145,11 @@ public class CheckoutControl : UserControl
             row.Cells["Quantity"].Value = line.Quantity;
             row.Cells["PriceEach"].Value = line.PriceEach.ToString("0.00");
             row.Cells["Discount"].Value = line.DiscountPercent.ToString("0.00");
-            row.Cells["Total"].Value = (line.PriceEach * line.Quantity * (1 - line.DiscountPercent)).ToString("C");
+            row.Cells["Total"].Value = (line.PriceEach * line.Quantity * (1 - line.DiscountPercent / 100)).ToString("C");
 
             row.Tag = line;
         }
 
-        lblTotal.Text = "Total: " + _sale.Lines.Sum(l => l.PriceEach * l.Quantity * (1 - l.DiscountPercent)).ToString("C");
+        lblTotal.Text = "Total: " + _sale.Lines.Sum(l => l.PriceEach * l.Quantity * (1 - l.DiscountPercent / 100)).ToString("C");
     }
 }

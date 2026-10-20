@@ -1,4 +1,4 @@
-    using ComicPos.Core.Models;
+using ComicPos.Core.Models;
 
 namespace ComicPos.Core.Services;
 

@@ -12,7 +12,8 @@ static class Program
         using var db = new ComicDbContext();
         var inventory = new InventoryService(db);
         var checkout = new CheckoutService(db, inventory);
+        var history = new SalesHistoryService(db);
 
-        Application.Run(new MainForm(inventory, checkout));
+        Application.Run(new MainForm(inventory, checkout, history));
     }
 }
