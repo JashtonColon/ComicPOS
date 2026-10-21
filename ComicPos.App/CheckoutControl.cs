@@ -140,7 +140,7 @@ public class CheckoutControl : UserControl
             var rowIndex = gridCart.Rows.Add();
             var row = gridCart.Rows[rowIndex];
 
-            row.Cells["Series"].Value = line.Cover.Issue.Series.Name;
+            row.Cells["Series"].Value = $"{line.Cover.Issue.Series.Name} ({line.Cover.Issue.Series.StartYear})";
             row.Cells["Issue"].Value = line.Cover.Issue.IssueNumber;
             row.Cells["Cover"].Value = line.Cover.CoverLetter;
             row.Cells["Quantity"].Value = line.Quantity;
