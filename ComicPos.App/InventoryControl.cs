@@ -6,10 +6,13 @@ namespace ComicPos.App;
 public class InventoryControl : UserControl
 {
     private readonly IInventoryService _inventory;
-    private readonly TextBox txtSearch = new();
-    private readonly DataGridView gridIssues = new();
-    private readonly DataGridView gridCovers = new();
-    private List<Issue> _results = new();
+    private readonly Label lblBreadcrumb = new();
+    private readonly Button btnBack = new();
+    private readonly DataGridView grid = new();
+
+    private string? _selectedSeries = null;
+    private int? _selectedIssueId = null;
+    private int? _selectedIssueNumber = null;
 
     public InventoryControl(IInventoryService inventory)
     {
@@ -17,78 +20,106 @@ public class InventoryControl : UserControl
 
         Dock = DockStyle.Fill;
 
-        // Two grids stacked in a split container
-        var split = new SplitContainer
+        lblBreadcrumb.Dock = DockStyle.Top;
+        lblBreadcrumb.Height = 30;
+        lblBreadcrumb.TextAlign = ContentAlignment.MiddleLeft;
+
+        btnBack.Dock = DockStyle.Top;
+        btnBack.Height = 30;
+        btnBack.Text = "< Back";
+        btnBack.Click += (s, e) =>
         {
-            Dock = DockStyle.Fill,
-            Orientation = Orientation.Horizontal
+            if (_selectedIssueId != null)
+                ShowIssueList(_selectedSeries!);
+            else if (_selectedSeries != null)
+                ShowSeriesList();
         };
 
-        ConfigureGrid(gridIssues);
-        ConfigureGrid(gridCovers);
-        split.Panel1.Controls.Add(gridIssues);
-        split.Panel2.Controls.Add(gridCovers);
-
-        txtSearch.Dock = DockStyle.Top;
-        txtSearch.PlaceholderText = "Search series name...";
-
-        Controls.Add(split);
-        Controls.Add(txtSearch);
-
-        txtSearch.TextChanged += (s, e) => Search();
-        gridIssues.SelectionChanged += (s, e) => ShowCovers();
-
-        Search();
-    }
-
-    private static void ConfigureGrid(DataGridView grid)
-    {
         grid.Dock = DockStyle.Fill;
         grid.ReadOnly = true;
         grid.AllowUserToAddRows = false;
-        grid.AllowUserToDeleteRows = false;
-        grid.MultiSelect = false;
-        grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         grid.RowHeadersVisible = false;
+        grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        grid.MultiSelect = false;
+        grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+        grid.CellDoubleClick += Grid_CellDoubleClick;
+
+        Controls.Add(grid);
+        Controls.Add(lblBreadcrumb);
+        Controls.Add(btnBack);
+
+        ShowSeriesList();
     }
 
-    private void Search()
+    private void ShowSeriesList()
     {
-        _results = _inventory.SearchIssues(txtSearch.Text);
+        _selectedSeries = null;
+        _selectedIssueId = null;
+        _selectedIssueNumber = null;
+        btnBack.Visible = false;
+        lblBreadcrumb.Text = "All Series";
 
-        gridIssues.DataSource = _results
+        grid.DataSource = null;
+        grid.Rows.Clear();
+        grid.Columns.Clear();
+        grid.AutoGenerateColumns = false;
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Series", HeaderText = "Series" });
+
+        var allSeries = _inventory.GetAllSeriesForDisplay(); // see below
+
+        foreach (var series in allSeries)
+        {
+            var rowIndex = grid.Rows.Add();
+            var row = grid.Rows[rowIndex];
+            row.Cells["Series"].Value = $"{series.Name} ({series.StartYear})";
+            row.Tag = series.Name; // the RAW name, for click-handling
+        }
+    }
+
+    private void ShowIssueList(string seriesName)
+    {
+        _selectedSeries = seriesName;
+        _selectedIssueId = null;
+        _selectedIssueNumber = null;
+        btnBack.Visible = true;
+        lblBreadcrumb.Text = $"{seriesName} — Issues";
+
+        grid.Columns.Clear();
+        grid.AutoGenerateColumns = true;
+
+        var issues = _inventory.GetIssuesForSeries(seriesName);
+
+        grid.DataSource = issues
             .Select(i => new
             {
                 i.Id,
-                Series = i.Series.Name,
                 Issue = i.IssueNumber,
-                Publisher = i.Publisher,
+                i.Publisher,
                 Total = i.Covers.Sum(c => c.StockQuantity)
             })
             .ToList();
-
-        ShowCovers();
     }
 
-    private void ShowCovers()
+    private void ShowCoverDetail(int issueId, int issueNumber)
     {
-        if (gridIssues.CurrentRow == null)
-        {
-            gridCovers.DataSource = null;
-            return;
-        }
+        _selectedIssueId = issueId;
+        _selectedIssueNumber = issueNumber;
+        btnBack.Visible = true;
+        lblBreadcrumb.Text = $"{_selectedSeries} #{issueNumber} — Covers";
 
-        var id = Convert.ToInt32(gridIssues.CurrentRow.Cells["Id"].Value);
-        var issue = _results.FirstOrDefault(i => i.Id == id);
+        grid.Columns.Clear();
+        grid.AutoGenerateColumns = true;
+
+        var issues = _inventory.GetIssuesForSeries(_selectedSeries!);
+        var issue = issues.FirstOrDefault(i => i.Id == issueId);
 
         if (issue == null)
         {
-            gridCovers.DataSource = null;
+            grid.DataSource = null;
             return;
         }
 
-        gridCovers.DataSource = issue.Covers
+        grid.DataSource = issue.Covers
             .OrderBy(c => c.CoverLetter)
             .Select(c => new
             {
@@ -100,8 +131,36 @@ public class InventoryControl : UserControl
             })
             .ToList();
     }
+
+    private void Grid_CellDoubleClick(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (e.RowIndex < 0) return;
+
+        var row = grid.Rows[e.RowIndex];
+
+        if (_selectedSeries == null)
+        {
+            var seriesName = row.Tag as string;
+            if (seriesName != null)
+                ShowIssueList(seriesName);
+        }
+        else if (_selectedIssueId == null)
+        {
+            if (int.TryParse(row.Cells["Id"].Value?.ToString(), out var issueId) &&
+                int.TryParse(row.Cells["Issue"].Value?.ToString(), out var issueNumber))
+            {
+                ShowCoverDetail(issueId, issueNumber);
+            }
+        }
+    }
+
     public void ReloadData()
     {
-        Search();
+        if (_selectedIssueId != null)
+            ShowCoverDetail(_selectedIssueId.Value, _selectedIssueNumber!.Value);
+        else if (_selectedSeries != null)
+            ShowIssueList(_selectedSeries);
+        else
+            ShowSeriesList();
     }
 }
