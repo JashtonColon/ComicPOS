@@ -35,12 +35,13 @@ public class CheckoutControl : UserControl
         lblTotal.Text = "Total: $0.00";
 
         btnComplete.Dock = DockStyle.Bottom;
+        btnComplete.Height = 35;
         btnComplete.Text = "Complete Sale";
 
         Controls.Add(gridCart);
         Controls.Add(lblTotal);
         Controls.Add(btnComplete);
-        Controls.Add(txtBarcode);
+        Controls.Add(txtBarcode);   
 
         txtBarcode.KeyDown += TxtBarcode_KeyDown;
         btnComplete.Click += BtnComplete_Click;
