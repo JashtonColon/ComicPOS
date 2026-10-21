@@ -26,8 +26,6 @@ public class SalesHistoryService : ISalesHistoryService
     public List<string> GetSeriesWithSales()
     {
         return _db.SaleLines
-            .Include(l => l.Cover).ThenInclude(c => c.Issue).ThenInclude(i => i.Series)
-            .Include(l => l.Sale)
             .Select(l => l.Cover.Issue.Series.Name)
             .Distinct()
             .ToList();
@@ -36,11 +34,19 @@ public class SalesHistoryService : ISalesHistoryService
     public List<Issue> GetIssuesWithSales(string seriesName)
     {
         return _db.SaleLines
-            .Include(l => l.Cover).ThenInclude(c => c.Issue).ThenInclude(i => i.Series)
-            .Include(l => l.Sale)
             .Where(l => l.Cover.Issue.Series.Name == seriesName)
             .Select(l => l.Cover.Issue)
             .Distinct()
+            .ToList();
+    }
+
+    public List<SaleLine> GetSalesForIssue(int issueId)
+    {
+        return _db.SaleLines
+            .Include(l => l.Cover).ThenInclude(c => c.Issue).ThenInclude(i => i.Series)
+            .Include(l => l.Sale)
+            .Where(l => l.Cover.IssueId == issueId)
+            .OrderByDescending(l => l.Sale.SoldAt)
             .ToList();
     }
 }
