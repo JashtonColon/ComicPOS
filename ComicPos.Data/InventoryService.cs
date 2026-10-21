@@ -29,4 +29,24 @@ public class InventoryService : IInventoryService
             .Where(i => EF.Functions.Like(i.Series.Name, $"%{text}%"))
             .ToList();
     }
+
+    public List<string> GetAllSeriesNames()
+    {
+        return _db.AllSeries
+            .Select(s => s.Name)
+            .ToList();
+    }
+    public List<Issue> GetIssuesForSeries(string seriesName)
+    {
+        return _db.Issues
+            .Include(i => i.Series)
+            .Include(i => i.Covers)
+            .Where(i => i.Series.Name == seriesName)
+            .ToList();
+    }
+
+    public List<Series> GetAllSeriesForDisplay()
+    {
+        return _db.AllSeries.ToList();
+    }
 }
