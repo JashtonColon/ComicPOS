@@ -22,4 +22,25 @@ public class SalesHistoryService : ISalesHistoryService
             .OrderByDescending(l => l.Sale.SoldAt)
             .ToList();
     }
+
+    public List<string> GetSeriesWithSales()
+    {
+        return _db.SaleLines
+            .Include(l => l.Cover).ThenInclude(c => c.Issue).ThenInclude(i => i.Series)
+            .Include(l => l.Sale)
+            .Select(l => l.Cover.Issue.Series.Name)
+            .Distinct()
+            .ToList();
+    }
+
+    public List<Issue> GetIssuesWithSales(string seriesName)
+    {
+        return _db.SaleLines
+            .Include(l => l.Cover).ThenInclude(c => c.Issue).ThenInclude(i => i.Series)
+            .Include(l => l.Sale)
+            .Where(l => l.Cover.Issue.Series.Name == seriesName)
+            .Select(l => l.Cover.Issue)
+            .Distinct()
+            .ToList();
+    }
 }
