@@ -49,5 +49,11 @@ public class InventoryService : IInventoryService
     {
         return _db.AllSeries.ToList();
     }
+    public List<Series> SearchSeriesForDisplay(string text)
+    {
+        return _db.AllSeries
+            .Where(s => EF.Functions.Like(s.Name, $"%{text}%"))
+            .ToList();
+    }
 
 }
