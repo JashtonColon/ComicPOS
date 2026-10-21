@@ -25,6 +25,7 @@ public class HistoryControl : UserControl
 
         btnBack.Dock = DockStyle.Top;
         btnBack.Text = "< Back";
+        btnBack.Height = 30;
         btnBack.Click += (s, e) =>
         {
             if (_selectedIssueId != null)
