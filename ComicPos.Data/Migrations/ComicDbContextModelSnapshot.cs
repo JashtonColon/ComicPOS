@@ -53,7 +53,7 @@ namespace ComicPos.Data.Migrations
 
                     b.HasIndex("IssueId");
 
-                    b.ToTable("Covers", (string)null);
+                    b.ToTable("Covers");
                 });
 
             modelBuilder.Entity("ComicPos.Core.Models.Customer", b =>
@@ -77,7 +77,7 @@ namespace ComicPos.Data.Migrations
 
                     b.HasKey("Id");
 
-                    b.ToTable("Customers", (string)null);
+                    b.ToTable("Customers");
                 });
 
             modelBuilder.Entity("ComicPos.Core.Models.Issue", b =>
@@ -122,11 +122,14 @@ namespace ComicPos.Data.Migrations
                     b.Property<int>("SeriesId")
                         .HasColumnType("INTEGER");
 
+                    b.Property<int>("Type")
+                        .HasColumnType("INTEGER");
+
                     b.HasKey("Id");
 
                     b.HasIndex("SeriesId");
 
-                    b.ToTable("Issues", (string)null);
+                    b.ToTable("Issues");
                 });
 
             modelBuilder.Entity("ComicPos.Core.Models.PullListEntry", b =>
@@ -154,7 +157,7 @@ namespace ComicPos.Data.Migrations
 
                     b.HasIndex("SeriesId");
 
-                    b.ToTable("PullListEntries", (string)null);
+                    b.ToTable("PullListEntries");
                 });
 
             modelBuilder.Entity("ComicPos.Core.Models.Sale", b =>
@@ -173,7 +176,7 @@ namespace ComicPos.Data.Migrations
 
                     b.HasIndex("CustomerId");
 
-                    b.ToTable("Sales", (string)null);
+                    b.ToTable("Sales");
                 });
 
             modelBuilder.Entity("ComicPos.Core.Models.SaleLine", b =>
@@ -203,7 +206,7 @@ namespace ComicPos.Data.Migrations
 
                     b.HasIndex("SaleId");
 
-                    b.ToTable("SaleLines", (string)null);
+                    b.ToTable("SaleLines");
                 });
 
             modelBuilder.Entity("ComicPos.Core.Models.Series", b =>
@@ -216,9 +219,12 @@ namespace ComicPos.Data.Migrations
                         .IsRequired()
                         .HasColumnType("TEXT");
 
+                    b.Property<int>("StartYear")
+                        .HasColumnType("INTEGER");
+
                     b.HasKey("Id");
 
-                    b.ToTable("AllSeries", (string)null);
+                    b.ToTable("AllSeries");
                 });
 
             modelBuilder.Entity("ComicPos.Core.Models.Cover", b =>
