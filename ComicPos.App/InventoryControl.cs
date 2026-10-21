@@ -23,7 +23,7 @@ public class InventoryControl : UserControl
         Dock = DockStyle.Fill;
 
         lblBreadcrumb.Dock = DockStyle.Top;
-        lblBreadcrumb.Height = 30;
+        lblBreadcrumb.Height = 30; //"all series" in the inverntory screen 
         lblBreadcrumb.TextAlign = ContentAlignment.MiddleLeft;
 
         btnBack.Dock = DockStyle.Top;
@@ -48,9 +48,14 @@ public class InventoryControl : UserControl
         grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         grid.CellDoubleClick += Grid_CellDoubleClick;
 
+        txtSearch.Dock = DockStyle.Top;
+        txtSearch.PlaceholderText = "Search series name...";
+        txtSearch.TextChanged += (s, e) => ShowSeriesList();
+
         Controls.Add(grid);
         Controls.Add(lblBreadcrumb);
         Controls.Add(btnBack);
+        Controls.Add(txtSearch);
 
         ShowSeriesList();
     }
@@ -70,7 +75,7 @@ public class InventoryControl : UserControl
         grid.AutoGenerateColumns = false;
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Series", HeaderText = "Series" });
 
-        var allSeries = _inventory.GetAllSeriesForDisplay();
+        var allSeries = _inventory.SearchSeriesForDisplay(txtSearch.Text);
 
         foreach (var series in allSeries)
         {
