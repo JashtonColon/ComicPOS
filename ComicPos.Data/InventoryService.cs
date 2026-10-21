@@ -36,12 +36,12 @@ public class InventoryService : IInventoryService
             .Select(s => s.Name)
             .ToList();
     }
-    public List<Issue> GetIssuesForSeries(string seriesName)
+    public List<Issue> GetIssuesForSeries(string seriesName, IssueType type)
     {
         return _db.Issues
             .Include(i => i.Series)
             .Include(i => i.Covers)
-            .Where(i => i.Series.Name == seriesName)
+            .Where(i => i.Series.Name == seriesName && i.Type == type)
             .ToList();
     }
 
@@ -49,4 +49,5 @@ public class InventoryService : IInventoryService
     {
         return _db.AllSeries.ToList();
     }
+
 }
