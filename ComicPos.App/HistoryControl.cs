@@ -6,8 +6,11 @@ namespace ComicPos.App;
 public class HistoryControl : UserControl
 {
     private readonly ISalesHistoryService _history;
-    private readonly TextBox txtSearch = new();
-    private readonly DataGridView gridHistory = new();
+    private readonly Label lblBreadcrumb = new();
+    private readonly Button btnBack = new();
+    private readonly DataGridView grid = new();
+
+    private string? _selectedSeries = null;
 
     public HistoryControl(ISalesHistoryService history)
     {
@@ -15,41 +18,76 @@ public class HistoryControl : UserControl
 
         Dock = DockStyle.Fill;
 
-        txtSearch.Dock = DockStyle.Top;
-        txtSearch.PlaceholderText = "Search series name...";
+        lblBreadcrumb.Dock = DockStyle.Top;
+        lblBreadcrumb.Height = 30;
+        lblBreadcrumb.TextAlign = ContentAlignment.MiddleLeft;
 
-        gridHistory.Dock = DockStyle.Fill;
-        gridHistory.ReadOnly = true;
-        gridHistory.AllowUserToAddRows = false;
-        gridHistory.AllowUserToDeleteRows = false;
-        gridHistory.MultiSelect = false;
-        gridHistory.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        gridHistory.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
-        gridHistory.RowHeadersVisible = false;
+        btnBack.Dock = DockStyle.Top;
+        btnBack.Text = "< Back";
+        btnBack.Click += (s, e) => ShowSeriesList();
 
-        Controls.Add(gridHistory);
-        Controls.Add(txtSearch);
+        grid.Dock = DockStyle.Fill;
+        grid.ReadOnly = true;
+        grid.AllowUserToAddRows = false;
+        grid.RowHeadersVisible = false;
+        grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        grid.MultiSelect = false;
+        grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+        grid.CellDoubleClick += Grid_CellDoubleClick;
 
-        txtSearch.TextChanged += (s, e) => Search();
+        Controls.Add(grid);
+        Controls.Add(lblBreadcrumb);
+        Controls.Add(btnBack);
+        
 
-        Search();
+        ShowSeriesList();
     }
 
-    private void Search()
+    private void ShowSeriesList()
     {
-        var results = _history.GetHistoryForSeries(txtSearch.Text);
+        _selectedSeries = null;
+        btnBack.Visible = false;
+        lblBreadcrumb.Text = "All Series";
 
-        gridHistory.DataSource = results
-            .Select(l => new
+        var seriesNames = _history.GetSeriesWithSales();
+
+        grid.DataSource = seriesNames
+            .Select(name => new { Series = name })
+            .ToList();
+    }
+
+    private void ShowIssueList(string seriesName)
+    {
+        _selectedSeries = seriesName;
+        btnBack.Visible = true;
+        lblBreadcrumb.Text = $"{seriesName} — Issues";
+
+        var issues = _history.GetIssuesWithSales(seriesName);
+
+        grid.DataSource = issues
+            .Select(i => new
             {
-                Series = l.Cover.Issue.Series.Name,
-                Issue = l.Cover.Issue.IssueNumber,
-                Cover = l.Cover.CoverLetter,
-                l.Quantity,
-                PriceEach = l.PriceEach.ToString("C"),
-                Discount = l.DiscountPercent.ToString("0.0") + "%",
-                SoldAt = l.Sale.SoldAt.ToString("g")
+                i.Id,
+                Issue = i.IssueNumber,
+                i.Publisher
             })
             .ToList();
+    }
+
+    private void Grid_CellDoubleClick(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (e.RowIndex < 0) return; // header row, ignore
+
+        if (_selectedSeries == null)
+        {
+            var row = grid.Rows[e.RowIndex];
+            var seriesName = row.Cells["Series"].Value?.ToString();
+            if (seriesName != null)
+                ShowIssueList(seriesName);
+        }
+        else
+        {
+            // next session's work: drill into the clicked issue's covers/sales
+        }
     }
 }
