@@ -9,5 +9,5 @@ public interface IInventoryService
     List<string> GetAllSeriesNames();
     List<Issue> GetIssuesForSeries(string seriesName, IssueType type);
     List<Series> GetAllSeriesForDisplay();
-    
+    List<Series> SearchSeriesForDisplay(string text);
 }
