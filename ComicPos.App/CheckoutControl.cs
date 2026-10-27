@@ -26,6 +26,24 @@ public class CheckoutControl : UserControl
 
         Dock = DockStyle.Fill;
 
+        var customerPanel = new Panel { Dock = DockStyle.Top, Height = 110 };
+
+        lblCustomer.Dock = DockStyle.Top;
+        lblCustomer.Height = 20;
+        lblCustomer.Text = "Customer: Walk-in";
+
+        txtCustomerSearch.Dock = DockStyle.Top;
+        txtCustomerSearch.PlaceholderText = "Search customer (optional)...";
+        txtCustomerSearch.TextChanged += (s, e) => SearchCustomers();
+
+        lstCustomerResults.Dock = DockStyle.Top;
+        lstCustomerResults.Height = 60;
+        lstCustomerResults.SelectedIndexChanged += CustomerResult_Selected;
+
+        customerPanel.Controls.Add(lstCustomerResults);
+        customerPanel.Controls.Add(txtCustomerSearch);
+        customerPanel.Controls.Add(lblCustomer);
+
         txtBarcode.Dock = DockStyle.Top;
         txtBarcode.PlaceholderText = "Scan barcode...";
 
@@ -49,7 +67,8 @@ public class CheckoutControl : UserControl
         Controls.Add(gridCart);
         Controls.Add(lblTotal);
         Controls.Add(btnComplete);
-        Controls.Add(txtBarcode);   
+        Controls.Add(txtBarcode);
+        Controls.Add(customerPanel);
 
         txtBarcode.KeyDown += TxtBarcode_KeyDown;
         btnComplete.Click += BtnComplete_Click;
@@ -160,5 +179,26 @@ public class CheckoutControl : UserControl
         }
 
         lblTotal.Text = "Total: " + _sale.Lines.Sum(l => l.PriceEach * l.Quantity * (1 - l.DiscountPercent / 100)).ToString("C");
+    }
+
+    private void SearchCustomers()
+    {
+        lstCustomerResults.Items.Clear();
+        _customerResults.Clear();
+
+        if (string.IsNullOrWhiteSpace(txtCustomerSearch.Text)) return;
+
+        _customerResults = _customers.SearchCustomers(txtCustomerSearch.Text);
+        foreach (var customer in _customerResults)
+            lstCustomerResults.Items.Add(customer.Name);
+    }
+
+    private void CustomerResult_Selected(object? sender, EventArgs e)
+    {
+        if (lstCustomerResults.SelectedIndex < 0) return;
+
+        var selected = _customerResults[lstCustomerResults.SelectedIndex];
+        _sale.CustomerId = selected.Id;
+        lblCustomer.Text = $"Customer: {selected.Name}";
     }
 }
