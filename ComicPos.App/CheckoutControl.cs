@@ -12,7 +12,11 @@ public class CheckoutControl : UserControl
     private readonly DataGridView gridCart = new();
     private readonly Label lblTotal = new();
     private readonly Button btnComplete = new();
-    
+
+    private readonly TextBox txtCustomerSearch = new();
+    private readonly ListBox lstCustomerResults = new();
+    private readonly Label lblCustomer = new();
+    private List<Customer> _customerResults = new(); 
 
     public CheckoutControl(ICheckoutService checkout, ICustomerService customers)
     {
@@ -39,6 +43,8 @@ public class CheckoutControl : UserControl
         btnComplete.Dock = DockStyle.Bottom;
         btnComplete.Height = 35;
         btnComplete.Text = "Complete Sale";
+
+
 
         Controls.Add(gridCart);
         Controls.Add(lblTotal);
