@@ -20,7 +20,7 @@ public class MainForm : Form
         inventoryTab.Controls.Add(inventoryControl);
 
         var checkoutTab = new TabPage("Checkout");
-        CheckoutControl checkoutControl = new CheckoutControl(checkout);
+        CheckoutControl checkoutControl = new CheckoutControl(checkout, customers);
         checkoutTab.Controls.Add(checkoutControl);
 
         var historyTab = new TabPage("History");
