@@ -200,5 +200,8 @@ public class CheckoutControl : UserControl
         var selected = _customerResults[lstCustomerResults.SelectedIndex];
         _sale.CustomerId = selected.Id;
         lblCustomer.Text = $"Customer: {selected.Name}";
+
+        txtCustomerSearch.Text = "";
+        lstCustomerResults.Items.Clear();
     }
 }
