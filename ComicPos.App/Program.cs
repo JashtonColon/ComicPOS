@@ -13,7 +13,8 @@ static class Program
         var inventory = new InventoryService(db);
         var checkout = new CheckoutService(db, inventory);
         var history = new SalesHistoryService(db);
+        var customers = new CustomerService(db);
 
-        Application.Run(new MainForm(inventory, checkout, history));
+        Application.Run(new MainForm(inventory, checkout, history, customers));
     }
 }
