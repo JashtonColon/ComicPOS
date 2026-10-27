@@ -6,16 +6,18 @@ namespace ComicPos.App;
 public class CheckoutControl : UserControl
 {
     private readonly ICheckoutService _checkout;
+    private readonly ICustomerService _customers;
     private Sale _sale;
-
     private readonly TextBox txtBarcode = new();
     private readonly DataGridView gridCart = new();
     private readonly Label lblTotal = new();
     private readonly Button btnComplete = new();
+    
 
-    public CheckoutControl(ICheckoutService checkout)
+    public CheckoutControl(ICheckoutService checkout, ICustomerService customers)
     {
         _checkout = checkout;
+        _customers = customers;
         _sale = _checkout.StartSale();
 
         Dock = DockStyle.Fill;
