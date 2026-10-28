@@ -17,6 +17,7 @@ public class CheckoutControl : UserControl
     private readonly ListBox lstCustomerResults = new();
     private readonly Label lblCustomer = new();
     private List<Customer> _customerResults = new(); 
+    private readonly Panel customerPanel = new();
 
     public CheckoutControl(ICheckoutService checkout, ICustomerService customers)
     {
@@ -26,7 +27,8 @@ public class CheckoutControl : UserControl
 
         Dock = DockStyle.Fill;
 
-        var customerPanel = new Panel { Dock = DockStyle.Top, Height = 110 };
+        customerPanel.Dock = DockStyle.Top;
+    customerPanel.Height = 48;
 
         lblCustomer.Dock = DockStyle.Top;
         lblCustomer.Height = 20;
@@ -186,13 +188,19 @@ public class CheckoutControl : UserControl
         lstCustomerResults.Items.Clear();
         _customerResults.Clear();
 
-        if (string.IsNullOrWhiteSpace(txtCustomerSearch.Text)) return;
+        if (string.IsNullOrWhiteSpace(txtCustomerSearch.Text))
+        {
+            lstCustomerResults.Visible = false;
+            customerPanel.Height = 48;
+            return;
+        }
 
         _customerResults = _customers.SearchCustomers(txtCustomerSearch.Text);
         foreach (var customer in _customerResults)
             lstCustomerResults.Items.Add(customer.Name);
 
         lstCustomerResults.Visible = lstCustomerResults.Items.Count > 0;
+        customerPanel.Height = lstCustomerResults.Visible ? 108 : 48;
     }
 
     private void CustomerResult_Selected(object? sender, EventArgs e)
