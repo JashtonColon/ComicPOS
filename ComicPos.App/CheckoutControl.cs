@@ -191,6 +191,8 @@ public class CheckoutControl : UserControl
         _customerResults = _customers.SearchCustomers(txtCustomerSearch.Text);
         foreach (var customer in _customerResults)
             lstCustomerResults.Items.Add(customer.Name);
+
+        lstCustomerResults.Visible = lstCustomerResults.Items.Count > 0;
     }
 
     private void CustomerResult_Selected(object? sender, EventArgs e)
@@ -203,5 +205,6 @@ public class CheckoutControl : UserControl
 
         txtCustomerSearch.Text = "";
         lstCustomerResults.Items.Clear();
+        lstCustomerResults.Visible = false;
     }
 }
