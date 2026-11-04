@@ -28,18 +28,20 @@ public class CheckoutControl : UserControl
         Dock = DockStyle.Fill;
 
         customerPanel.Dock = DockStyle.Top;
-    customerPanel.Height = 48;
+        customerPanel.Height = lstCustomerResults.Visible ? 120 : 60;
 
         lblCustomer.Dock = DockStyle.Top;
-        lblCustomer.Height = 20;
+        lblCustomer.Height = 32;
         lblCustomer.Text = "Customer: Walk-in";
+        lblCustomer.Padding = new Padding(0, 6, 0, 6);
+         
 
         txtCustomerSearch.Dock = DockStyle.Top;
         txtCustomerSearch.PlaceholderText = "Search customer (optional)...";
         txtCustomerSearch.TextChanged += (s, e) => SearchCustomers();
 
         lstCustomerResults.Dock = DockStyle.Top;
-        lstCustomerResults.Height = 60;
+        customerPanel.Height = lstCustomerResults.Visible ? 120 : 60;
         lstCustomerResults.SelectedIndexChanged += CustomerResult_Selected;
 
         customerPanel.Controls.Add(lstCustomerResults);
@@ -154,6 +156,11 @@ public class CheckoutControl : UserControl
 
         _checkout.CompleteSale(_sale);
         _sale = _checkout.StartSale();
+        lblCustomer.Text = "Customer: Walk-in";
+        txtCustomerSearch.Text = "";
+        lstCustomerResults.Items.Clear();
+        lstCustomerResults.Visible = false;
+        customerPanel.Height = lstCustomerResults.Visible ? 120 : 60;
         RefreshCart();
     }
 
@@ -191,7 +198,7 @@ public class CheckoutControl : UserControl
         if (string.IsNullOrWhiteSpace(txtCustomerSearch.Text))
         {
             lstCustomerResults.Visible = false;
-            customerPanel.Height = 48;
+            customerPanel.Height = lstCustomerResults.Visible ? 120 : 60;
             return;
         }
 
@@ -200,7 +207,7 @@ public class CheckoutControl : UserControl
             lstCustomerResults.Items.Add(customer.Name);
 
         lstCustomerResults.Visible = lstCustomerResults.Items.Count > 0;
-        customerPanel.Height = lstCustomerResults.Visible ? 108 : 48;
+        customerPanel.Height = lstCustomerResults.Visible ? 120 : 60;
     }
 
     private void CustomerResult_Selected(object? sender, EventArgs e)
@@ -214,5 +221,6 @@ public class CheckoutControl : UserControl
         txtCustomerSearch.Text = "";
         lstCustomerResults.Items.Clear();
         lstCustomerResults.Visible = false;
+        customerPanel.Height = lstCustomerResults.Visible ? 120 : 60;
     }
 }
