@@ -19,7 +19,8 @@ static class Program
         var focReport = new FocReportService(db);
         var email = new EmailService();
         var emailSettings = new EmailSettingsService();
+        var dashboard = new DashboardService(db);
 
-        Application.Run(new MainForm(inventory, checkout, history, customers, pullLists, import, focReport, email, emailSettings));
+        Application.Run(new MainForm(inventory, checkout, history, customers, pullLists, import, focReport, email, emailSettings, dashboard));
     }
 }
