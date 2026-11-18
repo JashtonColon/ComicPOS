@@ -10,4 +10,5 @@ public interface IInventoryService
     List<Issue> GetIssuesForSeries(string seriesName, IssueType type);
     List<Series> GetAllSeriesForDisplay();
     List<Series> SearchSeriesForDisplay(string text);
+    void UpdateCover(Cover cover);
 }
