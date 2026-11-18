@@ -49,4 +49,14 @@ public class SalesHistoryService : ISalesHistoryService
             .OrderByDescending(l => l.Sale.SoldAt)
             .ToList();
     }
+
+    public List<SaleLine> GetHistoryForCustomer(int customerId)
+    {
+        return _db.SaleLines
+            .Include(l => l.Cover).ThenInclude(c => c.Issue).ThenInclude(i => i.Series)
+            .Include(l => l.Sale)
+            .Where(l => l.Sale.CustomerId == customerId)
+            .OrderByDescending(l => l.Sale.SoldAt)
+            .ToList();
+    }
 }
