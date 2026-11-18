@@ -1,0 +1,6 @@
+Series,StartYear,IssueNumber,Publisher,CoverLetter,Barcode,Price,FocDate,ReleaseDate,Type
+Venom,2018,2,Marvel Comics,A,9001,4.99,2026-12-01,2026-12-24,SingleIssue
+Venom,2018,2,Marvel Comics,B,9002,4.99,2026-12-01,2026-12-24,SingleIssue
+Nova,2024,1,Marvel Comics,A,9003,3.99,2026-12-01,2026-12-24,SingleIssue
+Nova,2024,1,Marvel Comics,B,9004,4.99,2026-12-01,2026-12-24,SingleIssue
+Saga,2012,61,Image Comics,A,9005,3.99,2026-12-08,2026-12-31,SingleIssue
