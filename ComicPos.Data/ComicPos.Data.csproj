@@ -1,7 +1,8 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\ComicPos.Core\ComicPos.Core.csproj" />
+    <ProjectReference Include="..\ComicPos.Importers\ComicPos.Importers.csproj" />
   </ItemGroup>
 
   <ItemGroup>
