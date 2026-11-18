@@ -56,4 +56,12 @@ public class InventoryService : IInventoryService
             .ToList();
     }
 
+    // Used when receiving a shipment (stock goes up) or correcting price/
+    // description - the cover passed in is already the tracked EF entity
+    // (fetched via GetIssuesForSeries), so this just persists the changes.
+    public void UpdateCover(Cover cover)
+    {
+        _db.Covers.Update(cover);
+        _db.SaveChanges();
+    }
 }
