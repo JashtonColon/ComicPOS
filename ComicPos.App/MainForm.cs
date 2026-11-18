@@ -13,7 +13,8 @@ public class MainForm : Form
         IImportService import,
         IFocReportService focReport,
         IEmailService email,
-        IEmailSettingsService emailSettings)
+        IEmailSettingsService emailSettings,
+        IDashboardService dashboard)
     {
         Text = "Comic POS";
         Width = 1000;
@@ -52,6 +53,11 @@ public class MainForm : Form
         SettingsControl settingsControl = new SettingsControl(emailSettings);
         settingsTab.Controls.Add(settingsControl);
 
+        var dashboardTab = new TabPage("Dashboard");
+        DashboardControl dashboardControl = new DashboardControl(dashboard);
+        dashboardTab.Controls.Add(dashboardControl);
+
+        tabs.TabPages.Add(dashboardTab);
         tabs.TabPages.Add(inventoryTab);
         tabs.TabPages.Add(checkoutTab);
         tabs.TabPages.Add(historyTab);
@@ -66,6 +72,8 @@ public class MainForm : Form
         {
             if (tabs.SelectedTab == inventoryTab)
                 inventoryControl.ReloadData();
+            else if (tabs.SelectedTab == dashboardTab)
+                dashboardControl.RefreshAll();
         };
     }
 }
