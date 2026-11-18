@@ -8,4 +8,5 @@ public interface ISalesHistoryService
     List<string> GetSeriesWithSales();
     List<Issue> GetIssuesWithSales(string seriesName);
     List<SaleLine> GetSalesForIssue(int issueId);
+    List<SaleLine> GetHistoryForCustomer(int customerId);
 }
