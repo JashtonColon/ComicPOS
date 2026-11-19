@@ -81,6 +81,12 @@ public class DashboardControl : UserControl
         Controls.Add(btnRefresh);
 
         RefreshAll();
+
+        UiTheme.StyleForm(this);
+        UiTheme.StyleAll(this);
+        lblToday.ForeColor = UiTheme.PrimaryDark;
+        lblWeek.ForeColor = UiTheme.PrimaryDark;
+        lblMonth.ForeColor = UiTheme.PrimaryDark;
     }
 
     private static void ConfigureGrid(DataGridView grid)
