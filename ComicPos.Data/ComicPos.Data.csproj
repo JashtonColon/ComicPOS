@@ -11,6 +11,11 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.13" />
+    <!-- Used by ComicListService to parse comiclist.info's weekly master
+         shipping-list post. A real HTML parser instead of hand-rolled
+         regex tag-stripping, which breaks the moment the markup changes
+         even slightly. -->
+    <PackageReference Include="HtmlAgilityPack" Version="1.11.72" />
   </ItemGroup>
 
   <PropertyGroup>
