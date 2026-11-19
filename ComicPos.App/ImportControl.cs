@@ -25,9 +25,9 @@ public class ImportControl : UserControl
         lblHelp.Height = 60;
         lblHelp.Padding = new Padding(8);
         lblHelp.Text =
-            "Import new comics from a solicitation CSV.\r\n" +
-            "Required columns: Series, IssueNumber, Barcode. Optional: StartYear, Publisher, CoverLetter, Price, FocDate, ReleaseDate, Type (SingleIssue/CollectedEdition).\r\n" +
-            "Re-importing the same file is safe - existing series/issues/covers are matched and updated, never duplicated.";
+            "Import new comics from a solicitation CSV, or receive a shipment of comics already in the system.\r\n" +
+            "Required columns: Series, IssueNumber, Barcode. Optional: StartYear, Publisher, CoverLetter, Price, FocDate, ReleaseDate, Type (SingleIssue/CollectedEdition), ReceivedQty.\r\n" +
+            "ReceivedQty adds to stock (0 if omitted - solicited but not arrived yet). Re-importing the same file is safe - existing series/issues/covers are matched and updated, never duplicated.";
 
         topPanel = new Panel { Dock = DockStyle.Top, Height = 40 };
 
@@ -36,6 +36,7 @@ public class ImportControl : UserControl
         btnRunImport.Text = "Run Import";
         btnRunImport.Enabled = false;
         btnRunImport.Click += BtnRunImport_Click;
+        btnRunImport.Tag = "primary";
 
         btnChooseFile.Dock = DockStyle.Right;
         btnChooseFile.Width = 110;
@@ -46,9 +47,13 @@ public class ImportControl : UserControl
         lblFilePath.TextAlign = ContentAlignment.MiddleLeft;
         lblFilePath.Text = "No file selected.";
 
+        // Dock=Right siblings stack with the LAST control added ending up
+        // closest to the right edge, so "Choose File..." (the first step)
+        // has to be added before "Run Import" (the final step) to read
+        // left-to-right in that order.
         topPanel.Controls.Add(lblFilePath);
-        topPanel.Controls.Add(btnRunImport);
         topPanel.Controls.Add(btnChooseFile);
+        topPanel.Controls.Add(btnRunImport);
 
         txtResults.Dock = DockStyle.Fill;
         txtResults.Multiline = true;
@@ -59,6 +64,9 @@ public class ImportControl : UserControl
         Controls.Add(txtResults);
         Controls.Add(topPanel);
         Controls.Add(lblHelp);
+
+        UiTheme.StyleForm(this);
+        UiTheme.StyleAll(this);
     }
 
     private void BtnChooseFile_Click(object? sender, EventArgs e)
