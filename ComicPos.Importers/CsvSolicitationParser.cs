@@ -83,6 +83,7 @@ public static class CsvSolicitationParser
 
             var coverLetter = Get("CoverLetter");
             var type = Get("Type");
+            int.TryParse(Get("ReceivedQty"), out var receivedQty);
 
             result.Rows.Add(new SolicitationRow
             {
@@ -95,7 +96,8 @@ public static class CsvSolicitationParser
                 Price = price,
                 FocDate = focDate,
                 ReleaseDate = releaseDate,
-                Type = string.IsNullOrWhiteSpace(type) ? "SingleIssue" : type
+                Type = string.IsNullOrWhiteSpace(type) ? "SingleIssue" : type,
+                ReceivedQty = receivedQty
             });
         }
 
