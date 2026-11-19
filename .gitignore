@@ -484,3 +484,6 @@ $RECYCLE.BIN/
 
 #DataBase 
 comic_pos.db
+
+# Check Now debug trace (see DebugLog.cs) - regenerated every run
+checknow-debug.txt

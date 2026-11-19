@@ -32,8 +32,43 @@ public class AutoFetchService : IAutoFetchService
     public AutoFetchResult CheckForNewIssues()
     {
         var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Check Now run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
 
+        try
+        {
+            RunCheckForNewIssues(result, trace);
+            return result;
+        }
+        finally
+        {
+            // Written whether the run succeeds, partially fails, or
+            // throws - this is meant to answer "what actually happened"
+            // without needing another test round just to find out.
+            trace.AppendLine();
+            trace.AppendLine(new string('=', 60));
+            trace.AppendLine($"Final: checked {result.SeriesChecked} series, linked {result.SeriesAutoLinked}, added {result.NewIssuesAdded} new issue(s).");
+            if (result.Added.Count > 0)
+            {
+                trace.AppendLine();
+                trace.AppendLine("Added:");
+                foreach (var line in result.Added) trace.AppendLine("  " + line);
+            }
+            if (result.Errors.Count > 0)
+            {
+                trace.AppendLine();
+                trace.AppendLine("Errors:");
+                foreach (var line in result.Errors) trace.AppendLine("  " + line);
+            }
+            DebugLog.WriteCheckNowLog(trace.ToString());
+        }
+    }
+
+    private void RunCheckForNewIssues(AutoFetchResult result, System.Text.StringBuilder trace)
+    {
         var allSeries = _db.AllSeries.Include(s => s.Issues).ToList();
+        trace.AppendLine($"Rechecking {allSeries.Count} series already in inventory...");
 
         foreach (var series in allSeries)
         {
@@ -44,6 +79,7 @@ public class AutoFetchService : IAutoFetchService
 
             CheckOneSeries(series, result);
         }
+        trace.AppendLine($"  done - linked {result.SeriesAutoLinked}, {result.NewIssuesAdded} issue(s) so far from existing series.");
 
         // allSeries only covers books the store already carries. A series
         // that has never been carried has no row here at all, so it would
@@ -68,19 +104,29 @@ public class AutoFetchService : IAutoFetchService
         //     as the sole source if they're ever both unreachable (every
         //     source here fails soft - null/empty, not an exception - so
         //     one breaking never breaks the others).
+        var beforeComicList = result.NewIssuesAdded;
         DiscoverFromComicList(allSeries, result);
+        trace.AppendLine($"ComicList: +{result.NewIssuesAdded - beforeComicList} issue(s).");
+
+        var beforeGcd = result.NewIssuesAdded;
         DiscoverFromGcd(allSeries, result);
+        trace.AppendLine($"GCD: +{result.NewIssuesAdded - beforeGcd} issue(s).");
+
+        var beforeComicVine = result.NewIssuesAdded;
         DiscoverNewNumberOnes(allSeries, result);
+        trace.AppendLine($"Comic Vine discovery: +{result.NewIssuesAdded - beforeComicVine} issue(s).");
 
         var saved = true;
         try
         {
             _db.SaveChanges();
+            trace.AppendLine("SaveChanges: OK.");
         }
         catch (Exception ex)
         {
             saved = false;
             result.Errors.Add($"Some changes could not be saved: {ex.Message}");
+            trace.AppendLine($"SaveChanges: FAILED - {ex.Message}");
 
             // A failed SaveChanges does NOT roll back the change tracker -
             // every Series/Issue/Cover added this run is still sitting in
@@ -100,8 +146,6 @@ public class AutoFetchService : IAutoFetchService
             settings.LastAutoFetchRun = DateTime.Now;
             _storeSettings.Save(settings);
         }
-
-        return result;
     }
 
     // Picks the best Comic Vine match for a series with no human in the

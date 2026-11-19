@@ -52,23 +52,30 @@ public class ComicListService : IComicListService
             ?? throw new InvalidOperationException("couldn't find a 'Chuck's Comic List' master post link on the index page (comiclist.info/categories/this-week/) - site layout may have changed");
 
         var html = Http.GetStringAsync(postUrl).GetAwaiter().GetResult();
-        var doc = new HtmlDocument();
-        doc.LoadHtml(html);
-
-        var releaseDate = ParseReleaseDate(doc, postUrl);
-        var lines = ExtractTextLines(doc.DocumentNode);
+        var releaseDate = ParseReleaseDate(html, postUrl);
+        var lines = ExtractTextLines(html);
         var entries = ParseEntries(lines);
 
         if (entries.Count < MinPlausibleEntries)
         {
-            // Rich enough to actually diagnose from the Check Now popup
-            // alone, without needing another round-trip: how much HTML
-            // came back at all, how many lines the extractor found, and a
-            // sample of what those lines actually looked like.
+            // Enough here to actually diagnose from the debug log alone
+            // (see DebugLog/AutoFetchService), rather than guessing again:
+            // how much HTML came back, how many lines got extracted, a
+            // sample of those lines, AND a chunk of the raw HTML itself -
+            // specifically to tell apart "the real list just isn't in the
+            // static HTML at all (likely loaded by JavaScript after the
+            // page loads, which a plain HTTP request can never see)" from
+            // "the content's there but something about its shape still
+            // isn't being split into lines right."
             var sample = string.Join(" | ", lines.Take(3).Select(l => l.Length > 80 ? l[..80] + "..." : l));
+            var bodyStart = html.IndexOf("<body", StringComparison.OrdinalIgnoreCase);
+            var rawSnippet = bodyStart >= 0
+                ? html.Substring(bodyStart, Math.Min(4000, html.Length - bodyStart))
+                : html[..Math.Min(4000, html.Length)];
             throw new InvalidOperationException(
                 $"parsed only {entries.Count} entries from {postUrl} (expected {MinPlausibleEntries}+) - " +
-                $"fetched {html.Length} chars of HTML, extracted {lines.Count} line(s). Sample: [{sample}]");
+                $"fetched {html.Length} chars of HTML, extracted {lines.Count} line(s). Sample lines: [{sample}]\n" +
+                $"--- raw HTML near <body> (first 4000 chars) ---\n{rawSnippet}");
         }
 
         return new ComicListWeek { ReleaseDate = releaseDate, Entries = entries };
@@ -111,10 +118,11 @@ public class ComicListService : IComicListService
     // Prefers a date spelled out in the page itself ("Chuck's Comic List
     // for November 18, 2026" - the actual street date) over the post's
     // own publish-date URL, which is usually a couple of days earlier.
-    private static DateOnly ParseReleaseDate(HtmlDocument doc, string postUrl)
+    // Works on the raw HTML string directly (not a parsed DOM) - see
+    // ExtractTextLines below for why.
+    private static DateOnly ParseReleaseDate(string html, string postUrl)
     {
-        var text = doc.DocumentNode.InnerText;
-        var m = Regex.Match(text, @"for\s+([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})");
+        var m = Regex.Match(html, @"for\s+([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})");
         if (m.Success && DateOnly.TryParse($"{m.Groups[1].Value} {m.Groups[2].Value}, {m.Groups[3].Value}", out var parsed))
             return parsed;
 
@@ -125,64 +133,37 @@ public class ComicListService : IComicListService
         return DateOnly.FromDateTime(DateTime.Today);
     }
 
-    // Generic block-level-tag-to-newline text extraction, deliberately not
-    // tied to any specific class name or div structure, since that's the
-    // part of the page most likely to change over time. Every <p>, <li>,
-    // <h1-6>, <br>, <div>, <td> boundary becomes a line break; everything
-    // else is just concatenated text.
-    private static readonly HashSet<string> BlockTags = new(StringComparer.OrdinalIgnoreCase)
-        { "p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "br", "div", "td", "tr" };
-
-    private static List<string> ExtractTextLines(HtmlNode root)
+    // Works directly on the raw HTML string with regex instead of walking
+    // HtmlAgilityPack's parsed DOM. The DOM-walking version of this (an
+    // earlier attempt) returned zero lines against this site's actual
+    // master-list post even though the real content was plainly sitting
+    // in the raw HTML - something about that specific page's markup
+    // apparently trips up the parser/tree-walk, even though the SAME
+    // library parses the index page fine. Regex against the literal
+    // string can't be thrown off by that: block-level tag boundaries
+    // become newlines, inline tags (a, strong, span, img, etc.) are just
+    // stripped so a hyperlinked title and its price stay on one line, and
+    // everything else left over is one final pass.
+    private static List<string> ExtractTextLines(string html)
     {
-        var lines = new List<string>();
-        var current = new System.Text.StringBuilder();
+        var text = Regex.Replace(html, @"<script[^>]*>.*?</script>", "", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+        text = Regex.Replace(text, @"<style[^>]*>.*?</style>", "", RegexOptions.Singleline | RegexOptions.IgnoreCase);
 
-        void Flush()
-        {
-            var text = System.Net.WebUtility.HtmlDecode(current.ToString());
-            text = Regex.Replace(text, @"\s+", " ").Trim();
-            if (text.Length > 0) lines.Add(text);
-            current.Clear();
-        }
+        // Block-level boundaries -> newline.
+        text = Regex.Replace(text, @"</?(p|li|h[1-6]|div|tr|td|br|header|footer|article|ul|ol)\b[^>]*>", "\n", RegexOptions.IgnoreCase);
 
-        void Walk(HtmlNode node)
-        {
-            if (node.NodeType == HtmlNodeType.Comment) return;
-            if (node.NodeType == HtmlNodeType.Text)
-            {
-                // Don't rely on HTML tags alone for line breaks - a post
-                // can lay out hundreds of entries as plain text separated
-                // by literal newline characters inside one big container,
-                // with no <p>/<li>/<br> per entry at all. A newline INSIDE
-                // a text node is just as much a line break as a block tag
-                // is; missing this was the real cause of a 0-entry parse
-                // against comiclist.info's actual master-list markup.
-                var segments = node.InnerText.Split('\n');
-                for (var i = 0; i < segments.Length; i++)
-                {
-                    current.Append(segments[i]);
-                    if (i < segments.Length - 1) Flush();
-                }
-                return;
-            }
-            if (node.NodeType != HtmlNodeType.Element) return;
+        // Everything else (links, bold, spans, images, ...) just stripped,
+        // keeping its text inline.
+        text = Regex.Replace(text, @"<[^>]+>", "");
 
-            var name = node.Name.ToLowerInvariant();
-            if (name is "script" or "style" or "head" or "nav" or "footer") return;
+        text = System.Net.WebUtility.HtmlDecode(text);
 
-            var isBlock = BlockTags.Contains(name);
-            if (isBlock) Flush();
-
-            foreach (var child in node.ChildNodes) Walk(child);
-
-            if (isBlock) Flush();
-        }
-
-        Walk(root);
-        Flush();
-        return lines;
+        return text.Split('\n')
+            .Select(l => Regex.Replace(l, @"\s+", " ").Trim())
+            .Where(l => l.Length > 0)
+            .ToList();
     }
+
 
     // "Title text ..., $4.99" / "Title text ..., AR" - matched against the
     // LAST comma on the line (titles themselves sometimes contain commas,
