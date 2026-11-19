@@ -20,4 +20,9 @@ public interface ICheckoutService
 
 
     List<string> GetLowStockWarnings(Sale sale);
+
+    // Restores stock for every line and marks the sale voided. Throws if
+    // the sale is already voided, so it can't be "un-voided" by accident
+    // or double-restock the same stock twice.
+    void VoidSale(int saleId);
 }
