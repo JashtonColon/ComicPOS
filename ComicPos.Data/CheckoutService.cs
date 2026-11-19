@@ -68,4 +68,24 @@ public class CheckoutService : ICheckoutService
         }
         return warnings;
     }
+
+    public void VoidSale(int saleId)
+    {
+        var sale = _db.Sales
+            .Include(s => s.Lines)
+            .ThenInclude(l => l.Cover)
+            .FirstOrDefault(s => s.Id == saleId);
+
+        if (sale == null)
+            throw new InvalidOperationException($"Sale {saleId} not found.");
+
+        if (sale.IsVoided)
+            throw new InvalidOperationException("This sale is already voided.");
+
+        foreach (var line in sale.Lines)
+            line.Cover.StockQuantity += line.Quantity;
+
+        sale.IsVoided = true;
+        _db.SaveChanges();
+    }
 }
