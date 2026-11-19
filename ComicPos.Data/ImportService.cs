@@ -75,14 +75,15 @@ public class ImportService : IImportService
             var existingCover = _db.Covers.FirstOrDefault(c => c.Barcode == row.Barcode);
             if (existingCover == null)
             {
-                // New covers start at 0 stock - they haven't actually arrived yet,
-                // stock gets added when the shipment is received.
+                // New covers normally start at 0 stock (solicited but not
+                // received yet). A ReceivedQty column in the CSV lets the
+                // same import double as a "receive this shipment" action.
                 var newCover = new Cover
                 {
                     Barcode = row.Barcode,
                     CoverLetter = row.CoverLetter,
                     Price = row.Price,
-                    StockQuantity = 0
+                    StockQuantity = row.ReceivedQty
                 };
                 issue.Covers.Add(newCover);
                 barcodesAddedThisRun[row.Barcode] = newCover;
@@ -92,6 +93,7 @@ public class ImportService : IImportService
             {
                 existingCover.Price = row.Price;
                 existingCover.CoverLetter = row.CoverLetter;
+                existingCover.StockQuantity += row.ReceivedQty;
                 coversUpdated++;
             }
         }
