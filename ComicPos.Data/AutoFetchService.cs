@@ -108,9 +108,15 @@ public class AutoFetchService : IAutoFetchService
         DiscoverFromComicList(allSeries, result);
         trace.AppendLine($"ComicList: +{result.NewIssuesAdded - beforeComicList} issue(s).");
 
-        var beforeGcd = result.NewIssuesAdded;
-        DiscoverFromGcd(allSeries, result);
-        trace.AppendLine($"GCD: +{result.NewIssuesAdded - beforeGcd} issue(s).");
+        // GCD (comics.org) discovery is disabled here: now that
+        // ComicList's scraper actually works (confirmed parsing the full
+        // weekly list - see DiscoverFromComicList above), it already
+        // covers the whole week comprehensively, which makes GCD purely
+        // redundant. All GCD ever added was noisy "429 Too Many Requests"
+        // errors on repeated Check Now runs (its per-IP rate limit), with
+        // no real upside since ComicList already found every new issue.
+        // DiscoverFromGcd/GcdService are left in the codebase, unused, in
+        // case ComicList ever needs a second source again.
 
         var beforeComicVine = result.NewIssuesAdded;
         DiscoverNewNumberOnes(allSeries, result);
