@@ -15,6 +15,8 @@ public class InventoryControl : UserControl
     private int? _selectedIssueId = null;
     private float? _selectedIssueNumber = null;
     private readonly TextBox txtSearch = new();
+    private readonly Button btnAddItem = new();
+    private readonly PictureBox picCoverPreview = new();
 
     public InventoryControl(IInventoryService inventory)
     {
@@ -47,17 +49,36 @@ public class InventoryControl : UserControl
         grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         grid.CellDoubleClick += Grid_CellDoubleClick;
         grid.CellEndEdit += Grid_CellEndEdit;
+        grid.SelectionChanged += Grid_SelectionChanged;
+
+        picCoverPreview.Dock = DockStyle.Right;
+        picCoverPreview.Width = 160;
+        picCoverPreview.SizeMode = PictureBoxSizeMode.Zoom;
+        picCoverPreview.BackColor = Color.White;
+        picCoverPreview.BorderStyle = BorderStyle.FixedSingle;
+        picCoverPreview.Visible = false;
 
         txtSearch.Dock = DockStyle.Top;
         txtSearch.PlaceholderText = "Search series name...";
         txtSearch.TextChanged += (s, e) => ShowSeriesList();
 
+        btnAddItem.Dock = DockStyle.Top;
+        btnAddItem.Height = 32;
+        btnAddItem.Text = "+ Add New Item";
+        btnAddItem.Click += BtnAddItem_Click;
+        btnAddItem.Tag = "primary";
+
         Controls.Add(grid);
+        Controls.Add(picCoverPreview);
         Controls.Add(lblBreadcrumb);
         Controls.Add(btnBack);
         Controls.Add(txtSearch);
+        Controls.Add(btnAddItem);
 
         ShowSeriesList();
+
+        UiTheme.StyleForm(this);
+        UiTheme.StyleAll(this);
     }
 
     private void ShowSeriesList()
@@ -68,6 +89,7 @@ public class InventoryControl : UserControl
         _selectedIssueNumber = null;
         btnBack.Visible = false;
         lblBreadcrumb.Text = "All Series";
+        picCoverPreview.Visible = false;
 
         grid.DataSource = null;
         grid.Rows.Clear();
@@ -86,6 +108,16 @@ public class InventoryControl : UserControl
         }
     }
 
+    private void BtnAddItem_Click(object? sender, EventArgs e)
+    {
+        using var form = new AddItemForm(_inventory);
+        if (form.ShowDialog(this) == DialogResult.OK)
+        {
+            txtSearch.Clear();
+            ShowSeriesList();
+        }
+    }
+
     private void ShowTypeChoice(string seriesName)
     {
         _selectedSeries = seriesName;
@@ -94,6 +126,7 @@ public class InventoryControl : UserControl
         _selectedIssueNumber = null;
         btnBack.Visible = true;
         lblBreadcrumb.Text = $"{seriesName} — Choose Type";
+        picCoverPreview.Visible = false;
 
         grid.DataSource = null;
         grid.Rows.Clear();
@@ -117,6 +150,7 @@ public class InventoryControl : UserControl
         _selectedIssueNumber = null;
         btnBack.Visible = true;
         lblBreadcrumb.Text = $"{seriesName} — {(type == IssueType.SingleIssue ? "Single Issues" : "Collected Editions")}";
+        picCoverPreview.Visible = false;
 
         grid.DataSource = null;
         grid.Rows.Clear();
@@ -147,14 +181,16 @@ public class InventoryControl : UserControl
         _selectedIssueId = issueId;
         _selectedIssueNumber = issueNumber;
         btnBack.Visible = true;
-        lblBreadcrumb.Text = $"{_selectedSeries} #{issueNumber:0.##} — Covers (double-click Price/Stock/Description to edit)";
+        lblBreadcrumb.Text = $"{_selectedSeries} #{issueNumber:0.##} — Covers (double-click a cell to edit; set the real Barcode here when a book from New Books arrives)";
+        picCoverPreview.Visible = true;
+        picCoverPreview.Image = null;
 
         grid.DataSource = null;
         grid.Rows.Clear();
         grid.Columns.Clear();
         grid.AutoGenerateColumns = false;
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Cover", HeaderText = "Cover", ReadOnly = true });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Barcode", HeaderText = "Barcode", ReadOnly = true });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Barcode", HeaderText = "Barcode", ReadOnly = false });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Price", HeaderText = "Price", ReadOnly = false });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Stock", HeaderText = "Stock", ReadOnly = false });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Description", HeaderText = "Description", ReadOnly = false });
@@ -187,8 +223,29 @@ public class InventoryControl : UserControl
         var columnName = grid.Columns[e.ColumnIndex].Name;
         var newValue = row.Cells[e.ColumnIndex].Value?.ToString() ?? "";
 
+        // Comics that New Books adds automatically get a placeholder
+        // "CV-..." barcode (not a real UPC - Comic Vine doesn't have one),
+        // so scanning the real barcode off the actual book in Add New Item
+        // won't find them. Editing Barcode here - typically when the book
+        // physically arrives - is how that placeholder gets replaced with
+        // the real one, after which Add New Item's barcode scan will match
+        // it for future receiving/restocking.
+        var barcodeChanged = false;
+        var previousBarcode = cover.Barcode;
+
         switch (columnName)
         {
+            case "Barcode":
+                var trimmed = newValue.Trim();
+                if (string.IsNullOrWhiteSpace(trimmed))
+                {
+                    MessageBox.Show("Barcode can't be blank.", "Invalid Input", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    BeginInvoke(() => ShowCoverDetail(_selectedIssueId!.Value, _selectedIssueNumber!.Value));
+                    return;
+                }
+                cover.Barcode = trimmed;
+                barcodeChanged = trimmed != previousBarcode;
+                break;
             case "Price":
                 if (decimal.TryParse(newValue, out var price) && price >= 0)
                     cover.Price = price;
@@ -202,8 +259,50 @@ public class InventoryControl : UserControl
                 break;
         }
 
-        _inventory.UpdateCover(cover);
+        try
+        {
+            _inventory.UpdateCover(cover);
+        }
+        catch (Exception)
+        {
+            // Barcode has a unique index (ComicDbContext) - most likely
+            // cause here is typing a barcode another cover already has.
+            // Revert in memory and in the (failed, now stale-tracked) DB
+            // context so this doesn't silently resurface as a duplicate
+            // on some later unrelated save, same class of bug fixed
+            // earlier in AutoFetchService.
+            if (barcodeChanged)
+                cover.Barcode = previousBarcode;
+            _inventory.ClearFailedChanges();
+            MessageBox.Show(
+                barcodeChanged
+                    ? "That barcode is already used by another item. Double-check the book and try again."
+                    : "Couldn't save that change.",
+                "Save Failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
         BeginInvoke(() => ShowCoverDetail(_selectedIssueId!.Value, _selectedIssueNumber!.Value));
+    }
+
+    private void Grid_SelectionChanged(object? sender, EventArgs e)
+    {
+        if (!picCoverPreview.Visible) return;
+
+        picCoverPreview.Image?.Dispose();
+        picCoverPreview.Image = null;
+
+        if (grid.CurrentRow?.Tag is not Cover cover) return;
+        if (string.IsNullOrWhiteSpace(cover.CoverImagePath) || !File.Exists(cover.CoverImagePath)) return;
+
+        try
+        {
+            using var fs = new FileStream(cover.CoverImagePath, FileMode.Open, FileAccess.Read);
+            picCoverPreview.Image = Image.FromStream(fs);
+        }
+        catch
+        {
+            // Missing/corrupt cached image - just show no preview.
+        }
     }
 
     private void Grid_CellDoubleClick(object? sender, DataGridViewCellEventArgs e)
