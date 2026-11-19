@@ -13,4 +13,5 @@ public class Cover
     public string? CoverArtist { get; set; }
     public decimal Price { get; set; }
     public int StockQuantity { get; set; }
+    public string? CoverImagePath { get; set; }
 }
