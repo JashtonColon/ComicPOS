@@ -9,5 +9,7 @@ public class Sale
     public int? CustomerId { get; set; }
     public Customer? Customer { get; set; }
 
+    public bool IsVoided { get; set; } = false;
+
     public List<SaleLine> Lines { get; set; } = new();
 }
