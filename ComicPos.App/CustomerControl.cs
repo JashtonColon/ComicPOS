@@ -11,6 +11,7 @@ public class CustomerControl : UserControl
     private readonly ISalesHistoryService _history;
     private readonly IPullListService _pullLists;
     private readonly IInventoryService _inventory;
+    private readonly ICheckoutService _checkout;
 
     // Shared chrome
     private readonly TextBox txtSearch = new();
@@ -23,6 +24,7 @@ public class CustomerControl : UserControl
     private readonly TextBox txtNewEmail = new();
     private readonly TextBox txtNewPhone = new();
     private readonly Button btnAdd = new();
+    private readonly Button btnVoidSale = new();
 
     // Detail / Edit screen
     private readonly Panel detailPanel;
@@ -57,12 +59,13 @@ public class CustomerControl : UserControl
     private string? _selectedSeriesName;
     private float? _selectedIssueNumber;
 
-    public CustomerControl(ICustomerService customers, ISalesHistoryService history, IPullListService pullLists, IInventoryService inventory)
+    public CustomerControl(ICustomerService customers, ISalesHistoryService history, IPullListService pullLists, IInventoryService inventory, ICheckoutService checkout)
     {
         _customers = customers;
         _history = history;
         _pullLists = pullLists;
         _inventory = inventory;
+        _checkout = checkout;
 
         Dock = DockStyle.Fill;
 
@@ -81,6 +84,12 @@ public class CustomerControl : UserControl
         btnBack.Text = "< Back";
         btnBack.Visible = false;
         btnBack.Click += BtnBack_Click;
+
+        btnVoidSale.Dock = DockStyle.Top;
+        btnVoidSale.Height = 30;
+        btnVoidSale.Text = "Void Selected Sale";
+        btnVoidSale.Visible = false;
+        btnVoidSale.Click += BtnVoidSale_Click;
 
         // --- grid, used by List, HistorySeries, HistoryIssues, HistoryLines, PullList ---
         grid.Dock = DockStyle.Fill;
@@ -107,6 +116,7 @@ public class CustomerControl : UserControl
         btnAdd.Width = 80;
         btnAdd.Text = "Add";
         btnAdd.Click += AddCustomer_Click;
+        btnAdd.Tag = "primary";
 
         addPanel.Controls.Add(txtNewName);
         addPanel.Controls.Add(txtNewEmail);
@@ -209,6 +219,7 @@ public class CustomerControl : UserControl
         btnSaveEdit.Width = 90;
         btnSaveEdit.Height = 30;
         btnSaveEdit.Click += BtnSaveEdit_Click;
+        btnSaveEdit.Tag = "primary";
 
         btnCancelEdit.Text = "Cancel";
         btnCancelEdit.Width = 90;
@@ -244,6 +255,7 @@ public class CustomerControl : UserControl
         btnAddToPullList.Width = 90;
         btnAddToPullList.Text = "Add";
         btnAddToPullList.Click += BtnAddToPullList_Click;
+        btnAddToPullList.Tag = "primary";
 
         pullTopRow.Controls.Add(txtPullSeriesSearch);
         pullTopRow.Controls.Add(txtPullCoverLetter);
@@ -264,10 +276,14 @@ public class CustomerControl : UserControl
         Controls.Add(detailPanel);
         Controls.Add(addPanel);
         Controls.Add(pullListAddPanel);
+        Controls.Add(btnVoidSale);
         Controls.Add(btnBack);
         Controls.Add(txtSearch);
 
         ShowList();
+
+        UiTheme.StyleForm(this);
+        UiTheme.StyleAll(this);
     }
 
     // ----- List screen -----
@@ -281,6 +297,7 @@ public class CustomerControl : UserControl
         txtSearch.Visible = true;
         addPanel.Visible = true;
         pullListAddPanel.Visible = false;
+        btnVoidSale.Visible = false;
         grid.Visible = true;
         detailPanel.Visible = false;
 
@@ -326,6 +343,7 @@ public class CustomerControl : UserControl
         txtSearch.Visible = false;
         addPanel.Visible = false;
         pullListAddPanel.Visible = false;
+        btnVoidSale.Visible = false;
         grid.Visible = false;
         detailPanel.Visible = true;
         viewPanel.Visible = true;
@@ -387,6 +405,7 @@ public class CustomerControl : UserControl
         txtSearch.Visible = true;
         addPanel.Visible = false;
         pullListAddPanel.Visible = false;
+        btnVoidSale.Visible = false;
         grid.Visible = true;
         detailPanel.Visible = false;
 
@@ -424,6 +443,7 @@ public class CustomerControl : UserControl
         txtSearch.Visible = false;
         addPanel.Visible = false;
         pullListAddPanel.Visible = false;
+        btnVoidSale.Visible = false;
         grid.Visible = true;
         detailPanel.Visible = false;
 
@@ -461,6 +481,7 @@ public class CustomerControl : UserControl
         txtSearch.Visible = false;
         addPanel.Visible = false;
         pullListAddPanel.Visible = false;
+        btnVoidSale.Visible = true;
         grid.Visible = true;
         detailPanel.Visible = false;
 
@@ -472,6 +493,7 @@ public class CustomerControl : UserControl
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "PriceEach", HeaderText = "Price Each", ReadOnly = true });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Discount", HeaderText = "Discount %", ReadOnly = true });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "SoldAt", HeaderText = "Date", ReadOnly = true });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Status", HeaderText = "Status", ReadOnly = true });
 
         var lines = _customerHistory
             .Where(l => l.Cover.Issue.Series.Name == _selectedSeriesName && l.Cover.Issue.IssueNumber == _selectedIssueNumber)
@@ -487,7 +509,42 @@ public class CustomerControl : UserControl
             row.Cells["PriceEach"].Value = line.PriceEach.ToString("0.00");
             row.Cells["Discount"].Value = line.DiscountPercent.ToString("0.00");
             row.Cells["SoldAt"].Value = line.Sale.SoldAt.ToString("g");
+            row.Cells["Status"].Value = line.Sale.IsVoided ? "VOIDED" : "";
+            if (line.Sale.IsVoided)
+                row.DefaultCellStyle.ForeColor = Color.Gray;
+            row.Tag = line;
         }
+    }
+
+    private void BtnVoidSale_Click(object? sender, EventArgs e)
+    {
+        if (grid.SelectedRows.Count == 0)
+        {
+            MessageBox.Show("Select a sale row first.", "No Row Selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (grid.SelectedRows[0].Tag is not SaleLine line) return;
+
+        if (line.Sale.IsVoided)
+        {
+            MessageBox.Show("That sale is already voided.", "Already Voided", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            $"Void this entire sale from {line.Sale.SoldAt:g}? This restores stock for every item on that sale.",
+            "Void Sale", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+
+        if (confirm != DialogResult.Yes) return;
+
+        _checkout.VoidSale(line.SaleId);
+
+        // Refresh the in-memory history snapshot too, so the Status column updates.
+        if (_selectedCustomer != null)
+            _customerHistory = _history.GetHistoryForCustomer(_selectedCustomer.Id);
+
+        ShowHistoryLines();
     }
 
     // ----- Pull list screen -----
@@ -502,6 +559,7 @@ public class CustomerControl : UserControl
         txtSearch.Visible = false;
         addPanel.Visible = false;
         pullListAddPanel.Visible = true;
+        btnVoidSale.Visible = false;
         grid.Visible = true;
         detailPanel.Visible = false;
 
