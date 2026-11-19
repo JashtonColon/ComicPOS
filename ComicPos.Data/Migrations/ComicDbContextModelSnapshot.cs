@@ -30,6 +30,9 @@ namespace ComicPos.Data.Migrations
                     b.Property<string>("CoverArtist")
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("CoverImagePath")
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("CoverLetter")
                         .IsRequired()
                         .HasColumnType("TEXT");
@@ -169,6 +172,9 @@ namespace ComicPos.Data.Migrations
                     b.Property<int?>("CustomerId")
                         .HasColumnType("INTEGER");
 
+                    b.Property<bool>("IsVoided")
+                        .HasColumnType("INTEGER");
+
                     b.Property<DateTime>("SoldAt")
                         .HasColumnType("TEXT");
 
@@ -214,6 +220,12 @@ namespace ComicPos.Data.Migrations
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER");
+
+                    b.Property<int?>("ComicVineVolumeId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("LastCheckedForNewIssues")
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Name")
                         .IsRequired()
