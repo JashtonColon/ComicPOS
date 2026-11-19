@@ -30,6 +30,7 @@ public class FocReportControl : UserControl
         btnSendEmail.Width = 150;
         btnSendEmail.Text = "Send Email to Admin";
         btnSendEmail.Click += BtnSendEmail_Click;
+        btnSendEmail.Tag = "primary";
 
         btnGenerate.Dock = DockStyle.Right;
         btnGenerate.Width = 90;
@@ -66,6 +67,9 @@ public class FocReportControl : UserControl
         Controls.Add(topPanel);
 
         GenerateReport();
+
+        UiTheme.StyleForm(this);
+        UiTheme.StyleAll(this);
     }
 
     private void GenerateReport()
