@@ -16,7 +16,7 @@ public class DashboardService : IDashboardService
     {
         var lines = _db.SaleLines
             .Include(l => l.Sale)
-            .Where(l => l.Sale.SoldAt >= from && l.Sale.SoldAt <= to)
+            .Where(l => l.Sale.SoldAt >= from && l.Sale.SoldAt <= to && !l.Sale.IsVoided)
             .ToList();
 
         return lines.Sum(l => l.PriceEach * l.Quantity * (1 - l.DiscountPercent / 100));
@@ -29,7 +29,7 @@ public class DashboardService : IDashboardService
         return _db.SaleLines
             .Include(l => l.Sale)
             .Include(l => l.Cover).ThenInclude(c => c.Issue).ThenInclude(i => i.Series)
-            .Where(l => l.Sale.SoldAt >= since)
+            .Where(l => l.Sale.SoldAt >= since && !l.Sale.IsVoided)
             .ToList()
             .GroupBy(l => l.Cover.Issue.Series.Name)
             .Select(g => new TopSellerEntry { SeriesName = g.Key, QuantitySold = g.Sum(l => l.Quantity) })
