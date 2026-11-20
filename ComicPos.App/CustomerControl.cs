@@ -47,7 +47,6 @@ public class CustomerControl : UserControl
     // Pull list screen - "add a series" panel, shown below the grid of current entries
     private readonly Panel pullListAddPanel;
     private readonly TextBox txtPullSeriesSearch = new();
-    private readonly TextBox txtPullCoverLetter = new();
     private readonly Button btnAddToPullList = new();
     private readonly ListBox lstPullSeriesResults = new();
     private List<Series> _pullSeriesResults = new();
@@ -247,10 +246,6 @@ public class CustomerControl : UserControl
         txtPullSeriesSearch.PlaceholderText = "Search a series to add...";
         txtPullSeriesSearch.TextChanged += PullSeriesSearch_TextChanged;
 
-        txtPullCoverLetter.Dock = DockStyle.Right;
-        txtPullCoverLetter.Width = 60;
-        txtPullCoverLetter.PlaceholderText = "Cover";
-
         btnAddToPullList.Dock = DockStyle.Right;
         btnAddToPullList.Width = 90;
         btnAddToPullList.Text = "Add";
@@ -258,7 +253,6 @@ public class CustomerControl : UserControl
         btnAddToPullList.Tag = "primary";
 
         pullTopRow.Controls.Add(txtPullSeriesSearch);
-        pullTopRow.Controls.Add(txtPullCoverLetter);
         pullTopRow.Controls.Add(btnAddToPullList);
 
         lstPullSeriesResults.Dock = DockStyle.Fill;
@@ -567,7 +561,6 @@ public class CustomerControl : UserControl
         lstPullSeriesResults.Items.Clear();
         _pullSeriesResults.Clear();
         _selectedSeriesForPullList = null;
-        txtPullCoverLetter.Clear();
 
         RefreshPullListGrid();
     }
@@ -581,6 +574,8 @@ public class CustomerControl : UserControl
         grid.AutoGenerateColumns = false;
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Series", HeaderText = "Series", ReadOnly = true });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Cover", HeaderText = "Preferred Cover", ReadOnly = true });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Qty", HeaderText = "Qty", ReadOnly = true });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Notes", HeaderText = "Notes", ReadOnly = true });
 
         var entries = _pullLists.GetForCustomer(_selectedCustomer.Id);
 
@@ -590,8 +585,32 @@ public class CustomerControl : UserControl
             var row = grid.Rows[rowIndex];
             row.Cells["Series"].Value = $"{entry.Series.Name} ({entry.Series.StartYear})";
             row.Cells["Cover"].Value = entry.PreferredCoverLetter;
+            row.Cells["Qty"].Value = entry.Quantity;
+            row.Cells["Notes"].Value = entry.Notes ?? "";
             row.Tag = entry.Id;
         }
+    }
+
+    private void EditPullListEntry(int entryId, string seriesLabel, string currentCover, object? qtyCellValue, string? currentNotes)
+    {
+        var currentQty = 1;
+        if (qtyCellValue != null) int.TryParse(qtyCellValue.ToString(), out currentQty);
+        if (currentQty < 1) currentQty = 1;
+
+        using var form = new PullListEntryForm(seriesLabel, currentCover, currentQty, currentNotes, isEditingExisting: true);
+        var result = form.ShowDialog(this);
+
+        if (result == DialogResult.Abort) // "Remove from Pull List" inside the dialog
+        {
+            _pullLists.RemoveFromPullList(entryId);
+            RefreshPullListGrid();
+            return;
+        }
+
+        if (result != DialogResult.OK) return;
+
+        _pullLists.UpdatePullListEntry(entryId, form.CoverLetter, form.Quantity, form.Notes);
+        RefreshPullListGrid();
     }
 
     private void PullSeriesSearch_TextChanged(object? sender, EventArgs e)
@@ -619,14 +638,15 @@ public class CustomerControl : UserControl
             return;
         }
 
-        var coverLetter = string.IsNullOrWhiteSpace(txtPullCoverLetter.Text) ? "A" : txtPullCoverLetter.Text.Trim().ToUpper();
+        var seriesLabel = $"{_selectedSeriesForPullList.Name} ({_selectedSeriesForPullList.StartYear})";
+        using var form = new PullListEntryForm(seriesLabel, "A", 1, null, isEditingExisting: false);
+        if (form.ShowDialog(this) != DialogResult.OK) return;
 
-        _pullLists.AddToPullList(_selectedCustomer.Id, _selectedSeriesForPullList.Id, coverLetter);
+        _pullLists.AddToPullList(_selectedCustomer.Id, _selectedSeriesForPullList.Id, form.CoverLetter, form.Quantity, form.Notes);
 
         txtPullSeriesSearch.Clear();
         lstPullSeriesResults.Items.Clear();
         _selectedSeriesForPullList = null;
-        txtPullCoverLetter.Clear();
 
         RefreshPullListGrid();
     }
@@ -666,12 +686,7 @@ public class CustomerControl : UserControl
             case Screen.PullList:
                 if (row.Tag is int entryId)
                 {
-                    var confirm = MessageBox.Show("Remove this series from the pull list?", "Remove", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-                    if (confirm == DialogResult.Yes)
-                    {
-                        _pullLists.RemoveFromPullList(entryId);
-                        RefreshPullListGrid();
-                    }
+                    EditPullListEntry(entryId, row.Cells["Series"].Value?.ToString() ?? "", row.Cells["Cover"].Value?.ToString() ?? "A", row.Cells["Qty"].Value, row.Cells["Notes"].Value?.ToString());
                 }
                 break;
         }
