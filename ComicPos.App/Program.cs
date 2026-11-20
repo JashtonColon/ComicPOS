@@ -50,8 +50,9 @@ static class Program
         var backupService = new BackupService(db);
         var comicVine = new ComicVineService(storeSettings);
         var comicList = new ComicListService();
+        var comicadeFoc = new ComicadeFocService();
         var gcd = new GcdService();
-        var autoFetch = new AutoFetchService(db, comicVine, comicList, gcd, storeSettings);
+        var autoFetch = new AutoFetchService(db, comicVine, comicList, comicadeFoc, gcd, storeSettings);
 
         Application.Run(new MainForm(inventory, checkout, history, customers, pullLists, import, focReport, email, emailSettings, dashboard, storeSettings, backupService, autoFetch));
     }
