@@ -9,14 +9,16 @@ public class AutoFetchService : IAutoFetchService
     private readonly ComicDbContext _db;
     private readonly IComicVineService _comicVine;
     private readonly IComicListService _comicList;
+    private readonly IComicadeFocService _comicadeFoc;
     private readonly IGcdService _gcd;
     private readonly IStoreSettingsService _storeSettings;
 
-    public AutoFetchService(ComicDbContext db, IComicVineService comicVine, IComicListService comicList, IGcdService gcd, IStoreSettingsService storeSettings)
+    public AutoFetchService(ComicDbContext db, IComicVineService comicVine, IComicListService comicList, IComicadeFocService comicadeFoc, IGcdService gcd, IStoreSettingsService storeSettings)
     {
         _db = db;
         _comicVine = comicVine;
         _comicList = comicList;
+        _comicadeFoc = comicadeFoc;
         _gcd = gcd;
         _storeSettings = storeSettings;
     }
@@ -65,58 +67,122 @@ public class AutoFetchService : IAutoFetchService
         }
     }
 
+    // How long a successfully-checked series is left alone before it's
+    // worth hitting Comic Vine for it again. Street dates for an ongoing
+    // series don't change minute to minute, so re-checking every single
+    // series on every single Check Now click - manual testing included -
+    // used to burn through Comic Vine's free-tier hourly quota for zero
+    // new information, which is exactly what was producing the repeated
+    // "rate limit hit too many times in a row" errors. A series that
+    // errored (couldn't be checked at all) has no LastCheckedForNewIssues
+    // update, so it's never skipped by this and keeps retrying every run.
+    private static readonly TimeSpan RecheckCooldown = TimeSpan.FromHours(3);
+
+    // A separate, longer cooldown specifically for FAILED auto-link
+    // attempts. ComicList/Extended Forecast create a Series for every
+    // trade paperback, hardcover, graphic novel, and one-shot they find
+    // (see ComicListService) - none of those will ever match a Comic Vine
+    // "volume" (Comic Vine only tracks ongoing single-issue series), so
+    // without this cooldown, every single one of them would get a fresh,
+    // doomed-to-fail Comic Vine search on every single Check Now run,
+    // forever - exactly the kind of wasted-quota pattern RecheckCooldown
+    // above was built to stop, just on the "never going to link" side
+    // instead of the "already linked" side. 24h still gives a genuinely
+    // new ongoing series a same-day-ish chance to link once Comic Vine's
+    // catalog catches up, without hammering it for TP/GN noise meanwhile.
+    private static readonly TimeSpan AutoLinkRetryCooldown = TimeSpan.FromHours(24);
+
     private void RunCheckForNewIssues(AutoFetchResult result, System.Text.StringBuilder trace)
     {
-        var allSeries = _db.AllSeries.Include(s => s.Issues).ToList();
+        // ThenInclude(Covers) matters now, not just for display - CheckOneSeries'
+        // cover-image backfill (BackfillCoverImage, below) reads issue.Covers,
+        // and without this EF Core would hand back an empty collection for
+        // every issue (no lazy-loading proxies are configured), silently
+        // making the backfill a no-op.
+        var allSeries = _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers).ToList();
         trace.AppendLine($"Rechecking {allSeries.Count} series already in inventory...");
 
+        var skippedCooldown = 0;
+        var skippedAutoLinkCooldown = 0;
         foreach (var series in allSeries)
         {
             if (series.ComicVineVolumeId == null)
             {
-                if (!TryAutoLink(series, result)) continue; // no confident match - leave unlinked, try again next time
+                if (series.LastAutoLinkAttempt != null &&
+                    DateTime.Now - series.LastAutoLinkAttempt.Value < AutoLinkRetryCooldown)
+                {
+                    skippedAutoLinkCooldown++;
+                    continue; // tried to link this one recently and it didn't match - don't retry yet
+                }
+                if (!TryAutoLink(series, result)) continue; // no confident match - leave unlinked, try again after the cooldown
+            }
+            else if (series.LastCheckedForNewIssues != null &&
+                     DateTime.Now - series.LastCheckedForNewIssues.Value < RecheckCooldown)
+            {
+                skippedCooldown++;
+                continue; // checked too recently to be worth another Comic Vine call
             }
 
             CheckOneSeries(series, result);
         }
-        trace.AppendLine($"  done - linked {result.SeriesAutoLinked}, {result.NewIssuesAdded} issue(s) so far from existing series.");
+        if (skippedAutoLinkCooldown > 0)
+            trace.AppendLine($"  ({skippedAutoLinkCooldown} unlinked series skipped - auto-link attempted within the last {AutoLinkRetryCooldown.TotalHours:0}h and didn't match, e.g. TPs/GNs that can never match a Comic Vine volume.)");
+        trace.AppendLine($"  done - linked {result.SeriesAutoLinked}, {result.NewIssuesAdded} issue(s) so far from existing series" +
+            (skippedCooldown > 0 ? $" ({skippedCooldown} skipped - checked within the last {RecheckCooldown.TotalHours:0}h)." : "."));
 
         // allSeries only covers books the store already carries. A series
         // that has never been carried has no row here at all, so it would
         // never be found by the loop above - this is what misses brand-new
-        // #1 launches. Two sources fill that gap, run in order:
+        // #1 launches and future solicitations. Three sources fill that
+        // gap, run in order:
         //
-        //  1. DiscoverFromComicList - the real weekly shipping list from
-        //     comiclist.info (see ComicListService). This is the primary,
-        //     most comprehensive source when it's reachable: real titles,
-        //     real prices, real variant covers, for the actual week. Any
-        //     Series it creates gets added into allSeries here so step 2
-        //     below sees them as already-known and doesn't duplicate them.
-        //  2. DiscoverFromGcd - the Grand Comics Database's official API
-        //     (comics.org), as a second, independent cross-check. Weaker
-        //     per-entry data than ComicList (no exact ship date, and
-        //     publisher name costs extra lookups - see GcdService), so it
-        //     mainly catches anything ComicList's parse missed, same role
-        //     as step 3 below.
-        //  3. DiscoverNewNumberOnes - Comic Vine-based discovery (either
+        //  1. DiscoverFromComicList - the real WEEKLY shipping list from
+        //     comiclist.info (see ComicListService.GetThisWeeksMasterList).
+        //     What's physically shipping THIS Wednesday: real titles,
+        //     real prices, real variant covers. By the time something
+        //     shows up here, its FOC already passed 3 weeks ago - this
+        //     step is about catching current inventory, not FOC buying.
+        //     Any Series it creates gets added into allSeries here so the
+        //     later steps see it as already-known and don't duplicate it.
+        //  2. DiscoverFromExtendedForecast - comiclist.info's per-publisher
+        //     forward SOLICITATION data, ~10 months out (see
+        //     ComicListService.GetExtendedForecastEntries). This is the
+        //     one that actually matters for FOC buying decisions, since
+        //     it's the only source that knows about a book before its FOC
+        //     date arrives.
+        //  3. DiscoverFromComicadeFoc - comicade.com's FOC-cutoff catalogue
+        //     (see ComicadeFocService). Shorter horizon than Extended
+        //     Forecast (a couple of months, not ~10) but exact rather than
+        //     estimated: a real FOC date, real UPC, real price and a real
+        //     cover image per issue, not a guess. Entries from this source
+        //     already carry a real cover image, so they never need the
+        //     Comic Vine cover-backfill pass (BackfillCoverImage) the way
+        //     ComicList/Extended Forecast entries do.
+        //  4. DiscoverNewNumberOnes - Comic Vine-based discovery (either
         //     targeted by Tracked Publishers or a global #1 scan). Runs
-        //     regardless, both to catch anything the other two missed and
-        //     as the sole source if they're ever both unreachable (every
-        //     source here fails soft - null/empty, not an exception - so
-        //     one breaking never breaks the others).
+        //     regardless, both to catch anything the other sources missed
+        //     and as the sole source if they're ever all unreachable
+        //     (every source here fails soft per-call - an error is caught
+        //     and reported, not thrown - so one breaking never breaks the
+        //     others).
+        //
+        // GCD (comics.org) discovery used to be a source here too but is
+        // now disabled: ComicList's scraper covers the whole week on its
+        // own, which made GCD purely redundant and its only contribution
+        // was noisy 429 rate-limit errors. DiscoverFromGcd/GcdService are
+        // left in the codebase, unused, in case ComicList ever needs a
+        // second source again.
         var beforeComicList = result.NewIssuesAdded;
         DiscoverFromComicList(allSeries, result);
         trace.AppendLine($"ComicList: +{result.NewIssuesAdded - beforeComicList} issue(s).");
 
-        // GCD (comics.org) discovery is disabled here: now that
-        // ComicList's scraper actually works (confirmed parsing the full
-        // weekly list - see DiscoverFromComicList above), it already
-        // covers the whole week comprehensively, which makes GCD purely
-        // redundant. All GCD ever added was noisy "429 Too Many Requests"
-        // errors on repeated Check Now runs (its per-IP rate limit), with
-        // no real upside since ComicList already found every new issue.
-        // DiscoverFromGcd/GcdService are left in the codebase, unused, in
-        // case ComicList ever needs a second source again.
+        var beforeForecast = result.NewIssuesAdded;
+        DiscoverFromExtendedForecast(allSeries, result);
+        trace.AppendLine($"Extended Forecast: +{result.NewIssuesAdded - beforeForecast} issue(s).");
+
+        var beforeComicadeFoc = result.NewIssuesAdded;
+        DiscoverFromComicadeFoc(allSeries, result);
+        trace.AppendLine($"Comicade FOC: +{result.NewIssuesAdded - beforeComicadeFoc} issue(s).");
 
         var beforeComicVine = result.NewIssuesAdded;
         DiscoverNewNumberOnes(allSeries, result);
@@ -162,6 +228,11 @@ public class AutoFetchService : IAutoFetchService
     // this run instead of guessing - it's retried on the next check.
     private bool TryAutoLink(Series series, AutoFetchResult result)
     {
+        // Stamped on every attempt - success, no-match, or exception alike
+        // (see AutoLinkRetryCooldown above) - so a series that doesn't
+        // match isn't retried again until the cooldown passes.
+        series.LastAutoLinkAttempt = DateTime.Now;
+
         List<ComicVineVolumeMatch> matches;
         try
         {
@@ -207,10 +278,54 @@ public class AutoFetchService : IAutoFetchService
 
         foreach (var cvIssue in cvIssues)
         {
-            AddIssueIfNew(series, cvIssue, knownNumbers, result);
+            if (knownNumbers.Contains(cvIssue.IssueNumber))
+                BackfillCoverImage(series, cvIssue, result);
+            else
+                AddIssueIfNew(series, cvIssue, knownNumbers, result);
         }
 
         series.LastCheckedForNewIssues = DateTime.Now;
+    }
+
+    // ComicList/Extended Forecast-sourced issues (AddEntriesAsIssues) are
+    // created with no cover image at all - those scraped pages have no
+    // image URLs to give one (the weekly list is plain text, and Extended
+    // Forecast titles only link to an Amazon affiliate page). That's most
+    // issues in the store, since Comic Vine discovery is only a small
+    // slice of what gets added. Once a series is linked to Comic Vine and
+    // this same issue number turns up here, that's the first real chance
+    // to fill the gap - so instead of only adding brand-new numbers, an
+    // already-known one with a still-blank cover gets backfilled from the
+    // same Comic Vine image data AddIssueIfNew already uses for new ones.
+    // Comic Vine gives one image per issue, not one per cover letter, so
+    // every cover on the issue (A, B, C...) ends up sharing that same
+    // downloaded file - a real cover beats a blank one for every variant.
+    private void BackfillCoverImage(Series series, ComicVineNewIssue cvIssue, AutoFetchResult result)
+    {
+        if (string.IsNullOrWhiteSpace(cvIssue.ImageUrl)) return;
+
+        var issue = series.Issues.FirstOrDefault(i => i.IssueNumber == cvIssue.IssueNumber);
+        if (issue == null) return;
+
+        var missingCovers = issue.Covers.Where(c => string.IsNullOrWhiteSpace(c.CoverImagePath)).ToList();
+        if (missingCovers.Count == 0) return;
+
+        string? imagePath;
+        try
+        {
+            var hint = $"{series.Name}_{cvIssue.IssueNumber:0.##}_{Guid.NewGuid():N}".Replace(" ", "_");
+            imagePath = _comicVine.DownloadCoverImage(cvIssue.ImageUrl, hint);
+        }
+        catch (Exception ex)
+        {
+            result.Errors.Add($"{series.Name} #{cvIssue.IssueNumber:0.##}: cover image download failed: {ex.Message}");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(imagePath)) return;
+
+        foreach (var cover in missingCovers)
+            cover.CoverImagePath = imagePath;
     }
 
     private static (DateOnly since, DateOnly until) DiscoveryWindow() =>
@@ -311,6 +426,56 @@ public class AutoFetchService : IAutoFetchService
         AddEntriesAsIssues(allSeries, week.Entries, week.ReleaseDate, "CL", result);
     }
 
+    // comiclist.info's per-publisher "Extended Forecast" posts - real
+    // forward-looking solicitation data (roughly 10 months out), unlike
+    // the weekly master list above which only shows what's shipping THIS
+    // week (by which point FOC already passed 3 weeks ago). This is what
+    // actually makes an FOC buy report useful instead of always-too-late.
+    // See ComicListService.GetExtendedForecastEntries.
+    private void DiscoverFromExtendedForecast(List<Series> allSeries, AutoFetchResult result)
+    {
+        List<ComicListEntry> entries;
+        try
+        {
+            entries = _comicList.GetExtendedForecastEntries();
+        }
+        catch (Exception ex)
+        {
+            result.Errors.Add($"Extended Forecast: {ex.Message}");
+            return;
+        }
+
+        // The "default" date here is only a fallback AddEntriesAsIssues
+        // would use if an entry were somehow missing its own ReleaseDate -
+        // shouldn't happen for this source, since every Extended Forecast
+        // entry carries one (see ParseExtendedForecastEntries).
+        AddEntriesAsIssues(allSeries, entries, DateOnly.FromDateTime(DateTime.Today), "CLF", result);
+    }
+
+    // comicade.com's FOC-cutoff catalogue - see ComicadeFocService and
+    // IComicadeFocService for what makes this worth a separate source from
+    // ComicList: every entry here carries an exact FOC date, real UPC,
+    // real price and a real cover image URL already, instead of the
+    // estimates/placeholders AddEntriesAsIssues otherwise falls back to.
+    private void DiscoverFromComicadeFoc(List<Series> allSeries, AutoFetchResult result)
+    {
+        List<ComicListEntry> entries;
+        try
+        {
+            entries = _comicadeFoc.GetUpcomingFocEntries();
+        }
+        catch (Exception ex)
+        {
+            result.Errors.Add($"Comicade FOC: {ex.Message}");
+            return;
+        }
+
+        // Same fallback-date caveat as Extended Forecast above - every
+        // entry from this source carries its own ReleaseDate, so this
+        // default is never actually used in practice.
+        AddEntriesAsIssues(allSeries, entries, DateOnly.FromDateTime(DateTime.Today), "CFC", result);
+    }
+
     // Grand Comics Database (comics.org) - see GcdService and IGcdService
     // for what this can and can't give us. Shares the same grouping/
     // creation logic as ComicList via AddEntriesAsIssues below, since both
@@ -374,17 +539,53 @@ public class AutoFetchService : IAutoFetchService
 
             if (series.Issues.Any(i => i.IssueNumber == issueNumber)) continue; // already carried
 
-            var covers = group.Select(e => new Cover
+            // A plain LINQ projection won't do here - downloading a cover
+            // image (comicade.com entries only) is a side effect, and a
+            // failed download for one variant shouldn't lose the others.
+            var covers = new List<Cover>();
+            foreach (var e in group)
             {
-                CoverLetter = e.CoverLetter,
-                // Not a real UPC, same convention as Comic Vine-sourced
-                // covers (see AddIssueIfNew) - the store sets the real
-                // barcode once the book physically arrives (Inventory's
-                // cover-detail grid).
-                Barcode = $"{barcodePrefix}-{Guid.NewGuid():N}",
-                Price = e.Price ?? 0,
-                StockQuantity = 0
-            }).ToList();
+                string? coverImagePath = null;
+                if (!string.IsNullOrWhiteSpace(e.CoverImageUrl))
+                {
+                    try
+                    {
+                        var hint = $"{seriesName}_{issueNumber:0.##}_{e.CoverLetter}_{Guid.NewGuid():N}".Replace(" ", "_");
+                        coverImagePath = _comicVine.DownloadCoverImage(e.CoverImageUrl, hint);
+                    }
+                    catch (Exception ex)
+                    {
+                        result.Errors.Add($"{seriesName} #{issueNumber:0.##} ({e.CoverLetter}): cover image download failed: {ex.Message}");
+                    }
+                }
+
+                covers.Add(new Cover
+                {
+                    CoverLetter = e.CoverLetter,
+                    // A real UPC when the source gives one (comicade.com) -
+                    // the same generated placeholder as every other source
+                    // otherwise. The store sets the real barcode once the
+                    // book physically arrives either way (Inventory's
+                    // cover-detail grid), so this only matters until then.
+                    Barcode = !string.IsNullOrWhiteSpace(e.Upc) ? e.Upc : $"{barcodePrefix}-{Guid.NewGuid():N}",
+                    Price = e.Price ?? 0,
+                    StockQuantity = 0,
+                    CoverImagePath = coverImagePath
+                });
+            }
+
+            // Extended Forecast/Comicade FOC entries each carry their own
+            // ship date (they span weeks to months, not one shared week) -
+            // use it when present, falling back to the shared week-level
+            // date for sources that don't set it (the weekly master list,
+            // GCD).
+            var entryReleaseDate = group.First().ReleaseDate ?? releaseDate;
+
+            // A real FOC date when the source gives one (comicade.com) -
+            // the same "release minus 3 weeks" rule of thumb used
+            // everywhere else otherwise (Comic Vine-sourced issues
+            // included - see AddIssueIfNew).
+            var entryFocDate = group.First().FocDate ?? entryReleaseDate.AddDays(-21);
 
             var issue = new Issue
             {
@@ -392,17 +593,15 @@ public class AutoFetchService : IAutoFetchService
                 IssueNumber = issueNumber,
                 Publisher = group.First().Publisher,
                 Type = IssueType.SingleIssue,
-                ReleaseDate = releaseDate,
-                // Neither source gives a real FOC date - same 3-week rule
-                // of thumb used for Comic Vine-sourced issues.
-                FocDate = releaseDate.AddDays(-21),
+                ReleaseDate = entryReleaseDate,
+                FocDate = entryFocDate,
                 Covers = covers
             };
 
             _db.Issues.Add(issue);
 
             result.NewIssuesAdded++;
-            result.Added.Add($"{seriesName} #{issueNumber:0.##} ({covers.Count} cover(s), {releaseDate:MM/dd/yyyy})");
+            result.Added.Add($"{seriesName} #{issueNumber:0.##} ({covers.Count} cover(s), {entryReleaseDate:MM/dd/yyyy})");
         }
     }
 
