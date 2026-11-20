@@ -266,22 +266,55 @@ public class ComicVineService : IComicVineService
     // Resolves a publisher name to its Comic Vine id. Shared by every
     // publisher-scoped lookup so the resolution logic (and its exact-name
     // match rule) lives in one place.
-    private static int? ResolvePublisherId(string apiKey, string publisherName)
+    // candidateNames carries back every name Comic Vine's own search
+    // actually returned, matched or not - so a caller whose lookup fails
+    // can tell the person what Comic Vine really calls that publisher
+    // instead of guessing at an example spelling that might itself be
+    // wrong (this used to just return null with nothing to go on).
+    private static int? ResolvePublisherId(string apiKey, string publisherName, out List<string> candidateNames)
     {
-        var url = "https://comicvine.gamespot.com/api/publishers/" +
+        candidateNames = new List<string>();
+
+        // Comic Vine's /publishers/ list resource does not mark "name"
+        // (or anything else) as a filterable field - filtering it by name
+        // silently returns zero rows every time, for every publisher, not
+        // just a misspelled one. /search/ with resources=publisher is Comic
+        // Vine's own documented way to resolve a free-text name to an id.
+        var url = "https://comicvine.gamespot.com/api/search/" +
                    $"?api_key={Uri.EscapeDataString(apiKey)}&format=json" +
-                   $"&filter={Uri.EscapeDataString($"name:{publisherName}")}" +
-                   "&field_list=id,name&limit=5";
+                   $"&query={Uri.EscapeDataString(publisherName)}&resources=publisher" +
+                   "&field_list=id,name&limit=10";
 
         var json = FetchString(url);
         using var doc = JsonDocument.Parse(json);
+
+        // Comic Vine returns HTTP 200 even when the request itself failed
+        // (bad API key, malformed filter, etc.) - the real outcome is in
+        // status_code (1 = OK), not the HTTP status. Nothing else in this
+        // file checked this, so an API-level error and a genuine "no such
+        // publisher" both looked identical: an empty results array. That
+        // made "Image Comics returned no results at all" ambiguous - is
+        // Comic Vine saying "no such publisher", or did the call itself
+        // fail for an unrelated reason? This tells the two apart.
+        if (doc.RootElement.TryGetProperty("status_code", out var statusCode) &&
+            statusCode.ValueKind == JsonValueKind.Number && statusCode.GetInt32() != 1)
+        {
+            var errorText = doc.RootElement.TryGetProperty("error", out var errEl) ? errEl.GetString() : null;
+            throw new InvalidOperationException(
+                $"Comic Vine's publisher search for \"{publisherName}\" failed (status_code {statusCode.GetInt32()}" +
+                (string.IsNullOrWhiteSpace(errorText) ? ")" : $": {errorText})") +
+                " - this isn't \"no such publisher\", the request itself failed.");
+        }
 
         if (!doc.RootElement.TryGetProperty("results", out var results) || results.ValueKind != JsonValueKind.Array)
             return null;
 
         foreach (var p in results.EnumerateArray())
         {
-            if (string.Equals(GetString(p, "name"), publisherName, StringComparison.OrdinalIgnoreCase) &&
+            var name = GetString(p, "name");
+            if (!string.IsNullOrWhiteSpace(name)) candidateNames.Add(name);
+
+            if (string.Equals(name, publisherName, StringComparison.OrdinalIgnoreCase) &&
                 p.TryGetProperty("id", out var pid) && pid.ValueKind == JsonValueKind.Number)
                 return pid.GetInt32();
         }
@@ -302,12 +335,27 @@ public class ComicVineService : IComicVineService
     {
         var apiKey = RequireApiKey();
 
-        var publisherId = ResolvePublisherId(apiKey, publisherName);
-        if (publisherId == null) return new List<ComicVineVolumeMatch>(); // publisher name didn't resolve - nothing to search
+        // Used to silently return an empty list here when the publisher
+        // name didn't resolve - which meant a typo'd or non-exact Tracked
+        // Publishers entry produced a permanent, invisible "Comic Vine
+        // discovery: +0 issue(s)" every single run, with no error and no
+        // way to tell why. Throwing instead means DiscoverByTrackedPublishers's
+        // existing per-publisher try/catch reports it in the Check Now
+        // result, same as any other lookup failure - and it reports back
+        // Comic Vine's OWN actual candidate names (see ResolvePublisherId)
+        // rather than a guessed example that might itself be wrong.
+        var publisherId = ResolvePublisherId(apiKey, publisherName, out var candidateNames);
+        if (publisherId == null)
+        {
+            var hint = candidateNames.Count > 0
+                ? $"Comic Vine's closest match(es) for \"{publisherName}\": {string.Join(", ", candidateNames.Select(c => $"\"{c}\""))} - use one of those exact spellings in Settings > Tracked Publishers."
+                : $"Comic Vine's publisher search for \"{publisherName}\" returned no results at all - double-check the spelling in Settings > Tracked Publishers.";
+            throw new InvalidOperationException($"Comic Vine has no publisher named exactly \"{publisherName}\". {hint}");
+        }
 
         var volumeUrl = "https://comicvine.gamespot.com/api/volumes/" +
                          $"?api_key={Uri.EscapeDataString(apiKey)}&format=json" +
-                         $"&filter={Uri.EscapeDataString($"publisher:{publisherId}")}" +
+                         $"&filter=publisher:{publisherId}" +
                          $"&sort=date_last_updated:desc&limit={limit}" +
                          "&field_list=id,name,start_year,publisher,count_of_issues";
 
