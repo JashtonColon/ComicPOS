@@ -19,6 +19,7 @@ public class FocReportService : IFocReportService
 
         var issues = _db.Issues
             .Include(i => i.Series)
+            .Include(i => i.Covers)
             .Where(i => i.FocDate != null && i.FocDate >= today && i.FocDate <= through)
             .ToList();
 
@@ -26,13 +27,26 @@ public class FocReportService : IFocReportService
 
         foreach (var issue in issues)
         {
+            var availableCovers = issue.Covers
+                .Select(c => c.CoverLetter.Trim().ToUpperInvariant())
+                .Distinct()
+                .OrderBy(c => c)
+                .ToList();
+
             var subscribers = _db.PullListEntries
                 .Include(p => p.Customer)
                 .Where(p => p.IsActive && p.SeriesId == issue.SeriesId)
+                .ToList()
                 .Select(p => new FocReportSubscriber
                 {
                     CustomerName = p.Customer.Name,
-                    PreferredCover = p.PreferredCoverLetter
+                    PreferredCover = p.PreferredCoverLetter,
+                    Quantity = p.Quantity,
+                    // No covers on file at all (not received/entered yet)
+                    // isn't a real mismatch - nothing to compare against -
+                    // so only flag it once this issue actually has covers.
+                    CoverIsAvailable = availableCovers.Count == 0
+                        || availableCovers.Contains(p.PreferredCoverLetter.Trim().ToUpperInvariant())
                 })
                 .ToList();
 
@@ -44,7 +58,8 @@ public class FocReportService : IFocReportService
                 StartYear = issue.Series.StartYear,
                 IssueNumber = issue.IssueNumber,
                 FocDate = issue.FocDate,
-                Subscribers = subscribers
+                Subscribers = subscribers,
+                AvailableCoverLetters = availableCovers
             });
         }
 
