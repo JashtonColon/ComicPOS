@@ -90,7 +90,7 @@ public class FocReportControl : UserControl
             row.Cells["FocDate"].Value = entry.FocDate?.ToString("MM/dd/yyyy") ?? "";
             row.Cells["Series"].Value = $"{entry.SeriesName} ({entry.StartYear})";
             row.Cells["Issue"].Value = entry.IssueNumber.ToString("0.##");
-            row.Cells["Buy"].Value = entry.Subscribers.Count;
+            row.Cells["Buy"].Value = entry.TotalQuantity;
             row.Tag = entry;
         }
     }
@@ -100,8 +100,17 @@ public class FocReportControl : UserControl
         if (e.RowIndex < 0) return;
         if (grid.Rows[e.RowIndex].Tag is not FocReportEntry entry) return;
 
-        var names = string.Join("\n", entry.Subscribers.Select(s => $"{s.CustomerName}  [Cover {s.PreferredCover}]"));
-        MessageBox.Show(names, $"{entry.SeriesName} #{entry.IssueNumber:0.##} - Subscribers", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        var lines = entry.Subscribers.Select(s =>
+        {
+            var qtyPart = s.Quantity > 1 ? $" x{s.Quantity}" : "";
+            var flag = s.CoverIsAvailable ? "" : "  (cover not on file!)";
+            return $"{s.CustomerName}  [Cover {s.PreferredCover}]{qtyPart}{flag}";
+        });
+        var available = entry.AvailableCoverLetters.Count > 0
+            ? string.Join(", ", entry.AvailableCoverLetters)
+            : "(none on file yet)";
+        var body = $"Covers on file for this issue: {available}\n\n" + string.Join("\n", lines);
+        MessageBox.Show(body, $"{entry.SeriesName} #{entry.IssueNumber:0.##} - {entry.TotalQuantity} to buy", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     private void BtnSendEmail_Click(object? sender, EventArgs e)
