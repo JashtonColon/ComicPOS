@@ -147,9 +147,15 @@ namespace ComicPos.Data.Migrations
                     b.Property<bool>("IsActive")
                         .HasColumnType("INTEGER");
 
+                    b.Property<string>("Notes")
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("PreferredCoverLetter")
                         .IsRequired()
                         .HasColumnType("TEXT");
+
+                    b.Property<int>("Quantity")
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("SeriesId")
                         .HasColumnType("INTEGER");
@@ -223,6 +229,9 @@ namespace ComicPos.Data.Migrations
 
                     b.Property<int?>("ComicVineVolumeId")
                         .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("LastAutoLinkAttempt")
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime?>("LastCheckedForNewIssues")
                         .HasColumnType("TEXT");
