@@ -57,9 +57,23 @@ public class EmailService : IEmailService
                 lastDate = entry.FocDate;
             }
 
-            sb.AppendLine($"{entry.SeriesName} ({entry.StartYear}) #{entry.IssueNumber:0.##} - {entry.Subscribers.Count} to buy");
+            sb.AppendLine($"{entry.SeriesName} ({entry.StartYear}) #{entry.IssueNumber:0.##} - {entry.TotalQuantity} to buy");
+
+            // Compact per-cover breakdown - this is the part meant to be
+            // read in a glance before placing the order ("2x A, 1x B"),
+            // not just a raw subscriber count.
+            var coverTotals = entry.Subscribers
+                .GroupBy(s => s.PreferredCover)
+                .OrderBy(g => g.Key)
+                .Select(g => $"{g.Sum(s => s.Quantity)}x {g.Key}");
+            sb.AppendLine($"    Covers needed: {string.Join(", ", coverTotals)}");
+
             foreach (var sub in entry.Subscribers)
-                sb.AppendLine($"    - {sub.CustomerName} [Cover {sub.PreferredCover}]");
+            {
+                var qtyPart = sub.Quantity > 1 ? $" x{sub.Quantity}" : "";
+                var flag = sub.CoverIsAvailable ? "" : "  *** cover not on file for this printing - check with customer ***";
+                sb.AppendLine($"    - {sub.CustomerName} [Cover {sub.PreferredCover}]{qtyPart}{flag}");
+            }
         }
 
         return sb.ToString();
