@@ -32,10 +32,31 @@ public interface IGcdService
     // "/series/name/.../issue/..." endpoint, picks the base (non-variant)
     // printing when more than one comes back, fetches that specific
     // issue for its real cover scan URL, downloads it, and saves it the
-    // same way ComicVineService.DownloadCoverImage does. Returns null -
-    // never throws - when GCD simply doesn't have this issue either or
-    // has no cover scan on file for it; that is a normal outcome here,
-    // not a failure, so AutoFetchService treats it exactly like "still
-    // missing" rather than logging it as an error.
-    string? FindAndDownloadCover(string seriesName, float issueNumber, int? startYear, string fileNameHint);
+    // same way ComicVineService.DownloadCoverImage does. Never throws -
+    // GCD simply not having this issue, or having no cover scan on file
+    // for it, is a normal outcome here, not a failure. Unlike the old
+    // bool-returning version, the result always says WHY it didn't find
+    // anything (a real "GCD doesn't have it" vs. a request that failed
+    // outright) - that distinction is the only way a "0 covers backfilled
+    // from GCD" run can be told apart from "GCD just doesn't carry any of
+    // these" instead of staying a total mystery.
+    GcdCoverLookupResult FindAndDownloadCover(string seriesName, float issueNumber, int? startYear, string fileNameHint);
+}
+
+public class GcdCoverLookupResult
+{
+    public string? ImagePath { get; set; }
+
+    // A short, FIXED category string (no interpolated specifics) so many
+    // results can be grouped and counted - e.g. "no match in GCD",
+    // "GCD request failed: TaskCanceledException". Always set, success or
+    // failure.
+    public string Reason { get; set; } = "";
+
+    // Optional, per-call specific text (an exception message, the actual
+    // URL tried) - too varied to group by, but useful as a handful of
+    // concrete examples alongside the grouped counts above.
+    public string? Detail { get; set; }
+
+    public bool Success => !string.IsNullOrWhiteSpace(ImagePath);
 }
