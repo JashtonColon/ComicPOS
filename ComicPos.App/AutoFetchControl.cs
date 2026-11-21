@@ -32,6 +32,22 @@ public class AutoFetchControl : UserControl
     // difference (it's the same tile every time either way).
     private static readonly Image NoCoverThumbnail = UiTheme.BuildNoCoverPlaceholder(44, 60);
 
+    // Group-header rows ("September 2026", etc.) never set a Cover value
+    // at all - there's no book to show a cover for. Left at the column's
+    // default, DataGridViewImageColumn draws its own built-in broken-image
+    // icon for a null cell, which is exactly the stray gray X that showed
+    // up next to every month header. A fully transparent 1x1 as the
+    // column's NullValue renders as nothing instead.
+    private static readonly Image BlankCoverCell = CreateBlankCoverCell();
+
+    private static Bitmap CreateBlankCoverCell()
+    {
+        var bmp = new Bitmap(1, 1, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        using var g = Graphics.FromImage(bmp);
+        g.Clear(Color.Transparent);
+        return bmp;
+    }
+
     private const string SortTitle = "Title";
     private const string SortPublisher = "Publisher";
     private const string SortFoc = "FOC Date";
@@ -113,7 +129,14 @@ public class AutoFetchControl : UserControl
         grid.MultiSelect = false;
         grid.RowTemplate.Height = 64;
         grid.AutoGenerateColumns = false;
-        grid.Columns.Add(new DataGridViewImageColumn { Name = "Cover", HeaderText = "", Width = 48, ImageLayout = DataGridViewImageCellLayout.Zoom });
+        grid.Columns.Add(new DataGridViewImageColumn
+        {
+            Name = "Cover",
+            HeaderText = "",
+            Width = 48,
+            ImageLayout = DataGridViewImageCellLayout.Zoom,
+            DefaultCellStyle = { NullValue = BlankCoverCell }
+        });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Series", HeaderText = "Series", ReadOnly = true });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Issue", HeaderText = "Issue #", ReadOnly = true });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Publisher", HeaderText = "Publisher", ReadOnly = true });
