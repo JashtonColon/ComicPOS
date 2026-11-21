@@ -53,7 +53,8 @@ static class Program
         var comicList = new ComicListService();
         var comicadeFoc = new ComicadeFocService();
         var gcd = new GcdService();
-        var autoFetch = new AutoFetchService(db, comicVine, comicList, comicadeFoc, gcd, storeSettings);
+        var metron = new MetronService(storeSettings);
+        var autoFetch = new AutoFetchService(db, comicVine, comicList, comicadeFoc, gcd, metron, storeSettings);
 
         Application.Run(new MainForm(inventory, checkout, history, customers, pullLists, issueHolds, import, focReport, email, emailSettings, dashboard, storeSettings, backupService, autoFetch));
     }
