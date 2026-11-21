@@ -1,0 +1,41 @@
+@namespace ComicPos.Web.Components.Shared
+@using ComicPos.Core.Models
+
+<Modal Show="Show" Title="Who's Pulling This?" OnBackdropClick="Close" ExtraClass="modal-wide">
+    <p class="help-text">
+        @(Entries.Count == 0
+            ? "Nobody has this series on their pull list."
+            : $"{Entries.Count} customer(s) pulling this series - sort stock into these folders:")
+    </p>
+
+    @if (Entries.Count > 0)
+    {
+        <table class="pos-table">
+            <thead><tr><th>Customer</th><th>Cover</th><th>Qty</th><th>Phone</th><th>Notes</th></tr></thead>
+            <tbody>
+                @foreach (var e in Entries.OrderBy(e => e.Customer.Name))
+                {
+                    <tr>
+                        <td>@e.Customer.Name</td>
+                        <td>@e.PreferredCoverLetter</td>
+                        <td>@e.Quantity</td>
+                        <td>@(e.Customer.Phone ?? "")</td>
+                        <td>@(e.Notes ?? "")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+
+    <div class="form-actions">
+        <button class="btn-ghost" @onclick="Close">Close</button>
+    </div>
+</Modal>
+
+@code {
+    [Parameter] public bool Show { get; set; }
+    [Parameter] public List<PullListEntry> Entries { get; set; } = new();
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    private async Task Close() => await OnClose.InvokeAsync();
+}
