@@ -29,17 +29,22 @@ public class ImportControl : UserControl
             "Required columns: Series, IssueNumber, Barcode. Optional: StartYear, Publisher, CoverLetter, Price, FocDate, ReleaseDate, Type (SingleIssue/CollectedEdition), ReceivedQty.\r\n" +
             "ReceivedQty adds to stock (0 if omitted - solicited but not arrived yet). Re-importing the same file is safe - existing series/issues/covers are matched and updated, never duplicated.";
 
-        topPanel = new Panel { Dock = DockStyle.Top, Height = 40 };
+        // Grown from 40 - the now-taller, rounded buttons (UiTheme.StyleButton's
+        // MinButtonHeight + padding) didn't fit in the old fixed height, and
+        // "Choose File..." is wide enough at the new bold font that its
+        // AutoSize/GrowOnly width could exceed a too-tight hardcoded Width,
+        // so both button widths got a bit of headroom too.
+        topPanel = new Panel { Dock = DockStyle.Top, Height = 56, Padding = new Padding(0, 8, 0, 8) };
 
         btnRunImport.Dock = DockStyle.Right;
-        btnRunImport.Width = 110;
+        btnRunImport.Width = 130;
         btnRunImport.Text = "Run Import";
         btnRunImport.Enabled = false;
         btnRunImport.Click += BtnRunImport_Click;
         btnRunImport.Tag = "primary";
 
         btnChooseFile.Dock = DockStyle.Right;
-        btnChooseFile.Width = 110;
+        btnChooseFile.Width = 140;
         btnChooseFile.Text = "Choose File...";
         btnChooseFile.Click += BtnChooseFile_Click;
 
