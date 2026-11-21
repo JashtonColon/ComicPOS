@@ -1,0 +1,94 @@
+@page "/"
+@using ComicPos.Core.Services
+@inject IDashboardService DashboardService
+@rendermode InteractiveServer
+
+<PageTitle>Dashboard - Comic POS</PageTitle>
+
+<div class="page-header">
+    <h1>Dashboard</h1>
+    <button class="btn-ghost" @onclick="Load">Refresh</button>
+</div>
+
+<div class="stat-row">
+    <div class="stat-card">
+        <div class="stat-label">Today</div>
+        <div class="stat-value">@_today.ToString("C")</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">This Week</div>
+        <div class="stat-value">@_week.ToString("C")</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">This Month</div>
+        <div class="stat-value">@_month.ToString("C")</div>
+    </div>
+</div>
+
+<div class="panel-row">
+    <section class="panel">
+        <h2>Top Sellers <span class="panel-sub">last 30 days</span></h2>
+        <table class="pos-table">
+            <thead><tr><th>Series</th><th>Units Sold</th></tr></thead>
+            <tbody>
+                @foreach (var entry in _topSellers)
+                {
+                    <tr>
+                        <td>@entry.SeriesName</td>
+                        <td>@entry.QuantitySold</td>
+                    </tr>
+                }
+                @if (_topSellers.Count == 0)
+                {
+                    <tr><td colspan="2" class="pos-table-empty">No sales in this window yet.</td></tr>
+                }
+            </tbody>
+        </table>
+    </section>
+
+    <section class="panel">
+        <h2>Low Stock <span class="panel-sub">2 or fewer</span></h2>
+        <table class="pos-table">
+            <thead><tr><th>Series</th><th>Issue #</th><th>Cover</th><th>Stock</th></tr></thead>
+            <tbody>
+                @foreach (var entry in _lowStock)
+                {
+                    <tr>
+                        <td>@entry.SeriesName (@entry.StartYear)</td>
+                        <td>@entry.IssueNumber.ToString("0.##")</td>
+                        <td>@entry.CoverLetter</td>
+                        <td>@entry.StockQuantity</td>
+                    </tr>
+                }
+                @if (_lowStock.Count == 0)
+                {
+                    <tr><td colspan="4" class="pos-table-empty">Nothing is running low.</td></tr>
+                }
+            </tbody>
+        </table>
+    </section>
+</div>
+
+@code {
+    private decimal _today;
+    private decimal _week;
+    private decimal _month;
+    private List<TopSellerEntry> _topSellers = new();
+    private List<LowStockEntry> _lowStock = new();
+
+    protected override void OnInitialized() => Load();
+
+    private void Load()
+    {
+        var now = DateTime.Now;
+        var startOfToday = now.Date;
+        var startOfWeek = now.Date.AddDays(-(int)now.DayOfWeek);
+        var startOfMonth = new DateTime(now.Year, now.Month, 1);
+
+        _today = DashboardService.GetRevenue(startOfToday, now);
+        _week = DashboardService.GetRevenue(startOfWeek, now);
+        _month = DashboardService.GetRevenue(startOfMonth, now);
+        _topSellers = DashboardService.GetTopSellingSeries(30, 10);
+        _lowStock = DashboardService.GetLowStock(2);
+    }
+}
