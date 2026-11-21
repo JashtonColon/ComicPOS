@@ -48,6 +48,7 @@ builder.Services.AddSingleton<IComicVineService, ComicVineService>();
 builder.Services.AddSingleton<IComicListService, ComicListService>();
 builder.Services.AddSingleton<IComicadeFocService, ComicadeFocService>();
 builder.Services.AddSingleton<IGcdService, GcdService>();
+builder.Services.AddSingleton<IMetronService, MetronService>();
 
 // Web equivalent of MainForm's hourly maintenance timer - see
 // BackgroundJobsService's own header comment for why this runs in its own
