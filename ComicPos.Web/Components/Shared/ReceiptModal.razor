@@ -1,0 +1,46 @@
+@* Shown after a sale completes - web port of ReceiptForm.cs. The card
+   below (.receipt-print-root) is the ONLY thing visible when printing
+   (see the @media print rules in app.css): window.print() on a page
+   that also has the sidebar/nav/etc would otherwise print all of that
+   too, so everything else gets visibility:hidden and only this card is
+   flipped back to visible, positioned at the top of the printed page. *@
+@namespace ComicPos.Web.Components.Shared
+@inject IJSRuntime JS
+
+<Modal Show="Show" Title="Receipt" OnBackdropClick="Close">
+    <div class="receipt-card receipt-print-root">
+        @if (HasLogo)
+        {
+            <img class="receipt-logo" src="/api/store-logo" alt="" onerror="this.style.display='none';" />
+        }
+        <p class="receipt-store-name">@(string.IsNullOrWhiteSpace(StoreName) ? "Comic POS" : StoreName)</p>
+        @if (!string.IsNullOrWhiteSpace(Address))
+        {
+            <p class="receipt-sub">@Address</p>
+        }
+        @if (!string.IsNullOrWhiteSpace(Phone))
+        {
+            <p class="receipt-sub">@Phone</p>
+        }
+        <div class="receipt-body">@Body</div>
+        <p class="receipt-footer">Thank you for shopping with us!</p>
+    </div>
+    <div class="receipt-actions">
+        <button class="btn-ghost" @onclick="Close">Close</button>
+        <button class="btn-primary" @onclick="Print">Print Receipt</button>
+    </div>
+</Modal>
+
+@code {
+    [Parameter] public bool Show { get; set; }
+    [Parameter] public string Body { get; set; } = "";
+    [Parameter] public string StoreName { get; set; } = "";
+    [Parameter] public string Address { get; set; } = "";
+    [Parameter] public string Phone { get; set; } = "";
+    [Parameter] public bool HasLogo { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    private async Task Close() => await OnClose.InvokeAsync();
+
+    private async Task Print() => await JS.InvokeVoidAsync("print");
+}
