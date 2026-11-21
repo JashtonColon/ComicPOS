@@ -25,6 +25,14 @@ public class StoreSettings
     // for brand-new series launches. Blank/null = no filter, include all.
     public string? TrackedPublishers { get; set; }
 
+    // Free account at metron.cloud - a third, independent cover-art
+    // source (see MetronService) tried during Re-scan Existing when
+    // Comic Vine and GCD both come up empty for an issue. Unlike Comic
+    // Vine and GCD, Metron has no anonymous tier at all - without these,
+    // Metron is simply skipped rather than attempted anonymously.
+    public string? MetronUsername { get; set; }
+    public string? MetronPassword { get; set; }
+
     // On by default, unlike the FOC auto-email opt-in - a background
     // database backup has no outside-facing side effect to ask permission
     // for first (nothing sent anywhere, no email, no cost), so the safer
