@@ -1,0 +1,294 @@
+@page "/new-books"
+@using System.Globalization
+@using ComicPos.Core.Models
+@using ComicPos.Core.Services
+@inject IAutoFetchService AutoFetch
+@rendermode InteractiveServer
+
+<PageTitle>New Books - Comic POS</PageTitle>
+
+<div class="page-header">
+    <h1>New Books</h1>
+</div>
+
+<div class="toolbar">
+    <input type="text" class="search-box" placeholder="Search New Books by series or publisher..." value="@_search" @oninput="OnSearchInput" />
+    <div style="display:flex;gap:10px;align-items:center">
+        <select value="@_sortBy" @onchange="OnSortChanged">
+            <option value="@SortRelease">Release Date</option>
+            <option value="@SortFoc">FOC Date</option>
+            <option value="@SortPublisher">Publisher</option>
+            <option value="@SortTitle">Title</option>
+        </select>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRescan">Re-scan Existing</button>
+        <button class="btn-primary btn-sm" disabled="@_checking" @onclick="RunCheckNow">Check Now</button>
+    </div>
+</div>
+
+<p class="help-text">@_status</p>
+
+@if (_resultMessage != null)
+{
+    <p class="help-text" style="background:var(--accent-soft);padding:8px 12px;border-radius:8px">@_resultMessage</p>
+}
+
+@if (_showMonthTabs)
+{
+    <div class="month-pills">
+        <span class="month-pill @(_selectedMonthLabel == null ? "active" : "")" @onclick="@(() => SelectMonth(null))">All</span>
+        @foreach (var month in _monthTabs)
+        {
+            <span class="month-pill @(_selectedMonthLabel == month ? "active" : "")" @onclick="@(() => SelectMonth(month))">@month</span>
+        }
+    </div>
+}
+
+@if (_displayRows.Count == 0)
+{
+    <p class="empty-state">No new books found in the current window.</p>
+}
+else
+{
+    <table class="pos-table">
+        <thead><tr><th></th><th>Series</th><th>Issue #</th><th>Publisher</th><th>FOC Date</th><th>Release Date</th></tr></thead>
+        <tbody>
+            @foreach (var row in _displayRows)
+            {
+                @if (row.IsHeader)
+                {
+                    <tr style="background:var(--accent-soft);font-weight:700;color:var(--accent)">
+                        <td colspan="6">@row.HeaderText</td>
+                    </tr>
+                }
+                else if (row.Issue != null)
+                {
+                    <tr style="cursor:pointer" @onclick="@(() => OpenDetail(row.Issue))">
+                        <td>
+                            <img class="cover-thumb" alt=""
+                                 src="@(ThumbnailSrc(row.Issue))"
+                                 onerror="this.onerror=null;this.src='/img/no-cover.svg';" />
+                        </td>
+                        <td>@row.Issue.Series.Name (@row.Issue.Series.StartYear)</td>
+                        <td>@row.Issue.IssueNumber.ToString("0.##")</td>
+                        <td>@(string.IsNullOrWhiteSpace(row.Issue.Publisher) ? "" : row.Issue.Publisher)</td>
+                        <td>@(row.Issue.FocDate?.ToString("MM/dd/yyyy") ?? "")</td>
+                        <td>@(row.Issue.ReleaseDate?.ToString("MM/dd/yyyy") ?? "")</td>
+                    </tr>
+                }
+            }
+        </tbody>
+    </table>
+}
+
+<NewBookDetailModal Show="_showDetail" Issue="_detailIssue" OnClose="@(() => _showDetail = false)" />
+
+@code {
+    private const string SortTitle = "Title";
+    private const string SortPublisher = "Publisher";
+    private const string SortFoc = "FOC Date";
+    private const string SortRelease = "Release Date";
+
+    private string _sortBy = SortRelease;
+    private string _search = "";
+    private string _status = "";
+    private string? _resultMessage;
+    private bool _checking;
+
+    private bool _showMonthTabs;
+    private List<string> _monthTabs = new();
+    private string? _selectedMonthLabel;
+
+    private List<DisplayRow> _displayRows = new();
+
+    private bool _showDetail;
+    private Issue? _detailIssue;
+
+    private class DisplayRow
+    {
+        public bool IsHeader { get; set; }
+        public string? HeaderText { get; set; }
+        public Issue? Issue { get; set; }
+    }
+
+    protected override void OnInitialized() => RefreshGrid();
+
+    private void OnSearchInput(ChangeEventArgs e)
+    {
+        _search = e.Value?.ToString() ?? "";
+        RefreshGrid();
+    }
+
+    private void OnSortChanged(ChangeEventArgs e)
+    {
+        // A month label from one sort (e.g. a FOC month) has no meaning
+        // under another (e.g. sorted by Publisher) - drop back to "All".
+        _sortBy = e.Value?.ToString() ?? SortRelease;
+        _selectedMonthLabel = null;
+        RefreshGrid();
+    }
+
+    private void SelectMonth(string? label)
+    {
+        _selectedMonthLabel = label;
+        RefreshGrid();
+    }
+
+    private void OpenDetail(Issue issue)
+    {
+        _detailIssue = issue;
+        _showDetail = true;
+    }
+
+    private static string ThumbnailSrc(Issue issue)
+    {
+        var coverWithImage = issue.Covers.FirstOrDefault(c => !string.IsNullOrWhiteSpace(c.CoverImagePath) && File.Exists(c.CoverImagePath));
+        return coverWithImage != null ? $"/api/cover-image/{coverWithImage.Id}" : "/img/no-cover.svg";
+    }
+
+    private void UpdateStatusLabel()
+    {
+        var last = AutoFetch.LastCheckedAt();
+        _status = last != null
+            ? $"Last checked: {last:g}  •  checks automatically about once a week"
+            : "Never checked yet  •  checks automatically about once a week";
+    }
+
+    private static string GroupLabelFor(Issue issue, string sortKey) => sortKey switch
+    {
+        SortPublisher => string.IsNullOrWhiteSpace(issue.Publisher) ? "(Unknown Publisher)" : issue.Publisher,
+        SortFoc => issue.FocDate?.ToString("MMMM yyyy") ?? "(No FOC Date)",
+        SortTitle => issue.Series.Name,
+        _ => issue.ReleaseDate?.ToString("MMMM yyyy") ?? "(No Release Date)"
+    };
+
+    private void RefreshGrid()
+    {
+        UpdateStatusLabel();
+
+        IEnumerable<Issue> issues = AutoFetch.GetNewBooks();
+
+        var searchText = _search.Trim();
+        if (searchText.Length > 0)
+        {
+            issues = issues.Where(i =>
+                i.Series.Name.Contains(searchText, StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrWhiteSpace(i.Publisher) && i.Publisher.Contains(searchText, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        IEnumerable<Issue> ordered = _sortBy switch
+        {
+            SortPublisher => issues.OrderBy(i => i.Publisher).ThenBy(i => i.Series.Name).ThenBy(i => i.IssueNumber),
+            SortFoc => issues.OrderBy(i => i.FocDate ?? DateOnly.MaxValue).ThenBy(i => i.Series.Name),
+            SortTitle => issues.OrderBy(i => i.Series.Name).ThenBy(i => i.IssueNumber),
+            _ => issues.OrderBy(i => i.ReleaseDate ?? DateOnly.MaxValue).ThenBy(i => i.Series.Name)
+        };
+
+        var orderedList = ordered.ToList();
+
+        var monthCapableSort = _sortBy == SortRelease || _sortBy == SortFoc;
+        _showMonthTabs = monthCapableSort;
+
+        if (monthCapableSort)
+        {
+            var months = orderedList.Select(i => GroupLabelFor(i, _sortBy)).Distinct().ToList();
+            _monthTabs = months
+                .OrderBy(label => DateTime.TryParseExact(label, "MMMM yyyy", CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt) ? dt : DateTime.MaxValue)
+                .ToList();
+
+            if (_selectedMonthLabel != null && !_monthTabs.Contains(_selectedMonthLabel))
+                _selectedMonthLabel = null;
+
+            if (_selectedMonthLabel != null)
+                orderedList = orderedList.Where(i => GroupLabelFor(i, _sortBy) == _selectedMonthLabel).ToList();
+        }
+        else
+        {
+            _monthTabs = new List<string>();
+        }
+
+        _displayRows = new List<DisplayRow>();
+        string? lastGroupValue = null;
+        var showInlineHeader = _sortBy != SortTitle && !(monthCapableSort && _selectedMonthLabel != null);
+
+        foreach (var issue in orderedList)
+        {
+            var groupValue = GroupLabelFor(issue, _sortBy);
+            if (showInlineHeader && groupValue != lastGroupValue)
+            {
+                _displayRows.Add(new DisplayRow { IsHeader = true, HeaderText = groupValue });
+                lastGroupValue = groupValue;
+            }
+            _displayRows.Add(new DisplayRow { IsHeader = false, Issue = issue });
+        }
+    }
+
+    private async Task RunCheckNow()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _status = "Checking for new issues... this can take a minute.";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.CheckForNewIssues());
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Check failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Checked {result.SeriesChecked} series, linked {result.SeriesAutoLinked} new one(s), added {result.NewIssuesAdded} new issue(s).";
+            if (result.Errors.Count > 0)
+                summary += " Some series had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+        }
+
+        RefreshGrid();
+    }
+
+    private async Task RunRescan()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _status = "Re-scanning existing books for better volume links and missing covers... this can take a while for a large catalog.";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.RescanExistingBooks());
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Re-scan failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Checked {result.SeriesChecked} series, re-linked {result.SeriesAutoLinked}, backfilled {result.CoversBackfilled} cover(s).";
+            if (result.Errors.Count > 0)
+                summary += " Some series had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+        }
+
+        RefreshGrid();
+    }
+}
