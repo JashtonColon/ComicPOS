@@ -10,6 +10,7 @@ public class MainForm : Form
         ISalesHistoryService history,
         ICustomerService customers,
         IPullListService pullLists,
+        IIssueHoldService issueHolds,
         IImportService import,
         IFocReportService focReport,
         IEmailService email,
@@ -33,7 +34,7 @@ public class MainForm : Form
         };
 
         var inventoryTab = new TabPage("Inventory");
-        InventoryControl inventoryControl = new InventoryControl(inventory);
+        InventoryControl inventoryControl = new InventoryControl(inventory, pullLists, issueHolds, customers);
         inventoryTab.Controls.Add(inventoryControl);
 
         var checkoutTab = new TabPage("Checkout");
@@ -90,6 +91,33 @@ public class MainForm : Form
                 autoFetchControl.RefreshAll();
         };
 
+        // Clicking the tab you're ALREADY on fires no SelectedIndexChanged
+        // at all (the selection never changes), so without this there was
+        // no way to back out of a drilled-down screen (a series's issues,
+        // a customer's detail/history) except digging back out through its
+        // own Back button. Hit-test the click against each tab header and,
+        // only when it's the tab already showing, send that screen back to
+        // its top-level view. Checkout/Import/FOC Report/Settings are
+        // single-level screens with nothing to reset - Checkout especially
+        // is deliberately left alone here, since "resetting" it could look
+        // like it wiped an in-progress sale.
+        tabs.MouseClick += (s, e) =>
+        {
+            for (var i = 0; i < tabs.TabPages.Count; i++)
+            {
+                if (!tabs.GetTabRect(i).Contains(e.Location)) continue;
+                if (i != tabs.SelectedIndex) break;
+
+                var tab = tabs.TabPages[i];
+                if (tab == inventoryTab) inventoryControl.ResetToTop();
+                else if (tab == customerTab) customerControl.ResetToTop();
+                else if (tab == historyTab) historyControl.ResetToTop();
+                else if (tab == dashboardTab) dashboardControl.RefreshAll();
+                else if (tab == newBooksTab) autoFetchControl.RefreshAll();
+                break;
+            }
+        };
+
         // New Books checks itself on startup if a week has passed (see
         // AutoFetchControl's constructor). This timer covers the case where
         // the app is just left open across a Sunday: about once an hour,
@@ -116,6 +144,7 @@ public class MainForm : Form
             {
                 autoFetchControl.RunWeeklyCheckIfDue();
                 TrySendAutoFocReport();
+                TryAutoBackup();
             }
         };
         hourlyMaintenanceTimer.Start();
@@ -123,7 +152,10 @@ public class MainForm : Form
         // Also try once at startup, in case the app is only ever opened
         // briefly and the hourly tick would rarely get a chance to fire.
         if (!autoFetchControl.IsCheckRunning)
+        {
             TrySendAutoFocReport();
+            TryAutoBackup();
+        }
 
         // Opt-in (see Settings > Email > "Auto-email FOC report daily").
         // Sends the same compact buy report the "Send Email to Admin"
@@ -158,6 +190,31 @@ public class MainForm : Form
                 // status bar or log on this form to surface the failure
                 // to, and a scheduled background email is not worth a
                 // pop-up dialog interrupting whatever the person is doing.
+            }
+        }
+
+        // Opt-out (see Settings > "Automatically back up daily"). Mirrors
+        // TrySendAutoFocReport's own "is it time yet?" shape exactly, just
+        // against BackupService/LastAutoBackupAt instead of the email side.
+        void TryAutoBackup()
+        {
+            var settings = storeSettings.Load();
+            if (!settings.AutoBackupEnabled) return;
+            if (settings.LastAutoBackupAt.HasValue &&
+                (DateTime.Now - settings.LastAutoBackupAt.Value).TotalHours < 20)
+                return;
+
+            try
+            {
+                backupService.BackupNow();
+                settings.LastAutoBackupAt = DateTime.Now;
+                storeSettings.Save(settings);
+            }
+            catch
+            {
+                // Leave LastAutoBackupAt untouched so the next hourly tick
+                // retries - e.g. the disk was briefly full or the backups
+                // folder was locked by another process.
             }
         }
     }
