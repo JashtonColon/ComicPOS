@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using ComicPos.Core.Models;
 using ComicPos.Core.Services;
 using Microsoft.EntityFrameworkCore;
@@ -102,39 +103,24 @@ public class AutoFetchService : IAutoFetchService
         var allSeries = _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers).ToList();
         trace.AppendLine($"Rechecking {allSeries.Count} series already in inventory...");
 
-        var skippedCooldown = 0;
-        var skippedAutoLinkCooldown = 0;
-        foreach (var series in allSeries)
-        {
-            if (series.ComicVineVolumeId == null)
-            {
-                if (series.LastAutoLinkAttempt != null &&
-                    DateTime.Now - series.LastAutoLinkAttempt.Value < AutoLinkRetryCooldown)
-                {
-                    skippedAutoLinkCooldown++;
-                    continue; // tried to link this one recently and it didn't match - don't retry yet
-                }
-                if (!TryAutoLink(series, result)) continue; // no confident match - leave unlinked, try again after the cooldown
-            }
-            else if (series.LastCheckedForNewIssues != null &&
-                     DateTime.Now - series.LastCheckedForNewIssues.Value < RecheckCooldown)
-            {
-                skippedCooldown++;
-                continue; // checked too recently to be worth another Comic Vine call
-            }
-
-            CheckOneSeries(series, result);
-        }
-        if (skippedAutoLinkCooldown > 0)
-            trace.AppendLine($"  ({skippedAutoLinkCooldown} unlinked series skipped - auto-link attempted within the last {AutoLinkRetryCooldown.TotalHours:0}h and didn't match, e.g. TPs/GNs that can never match a Comic Vine volume.)");
-        trace.AppendLine($"  done - linked {result.SeriesAutoLinked}, {result.NewIssuesAdded} issue(s) so far from existing series" +
-            (skippedCooldown > 0 ? $" ({skippedCooldown} skipped - checked within the last {RecheckCooldown.TotalHours:0}h)." : "."));
+        // A snapshot of what the store already carried BEFORE this run's
+        // discovery steps touch anything - the per-series auto-link/recheck
+        // loop further down iterates THIS, not the live allSeries list, so
+        // a series a discovery step creates moments from now doesn't also
+        // immediately eat a second round of Comic Vine calls in the very
+        // same run. It gets its own first look on the next run instead,
+        // same as always. allSeries itself keeps growing as discovery
+        // runs - DiscoverFromComicList/ExtendedForecast/ComicadeFoc/
+        // NewNumberOnes still need the full, growing list to dedupe
+        // against each other and against what's already in inventory.
+        var existingSeries = allSeries.ToList();
 
         // allSeries only covers books the store already carries. A series
         // that has never been carried has no row here at all, so it would
-        // never be found by the loop above - this is what misses brand-new
-        // #1 launches and future solicitations. Three sources fill that
-        // gap, run in order:
+        // never be found by the per-series loop below - this is what
+        // misses brand-new #1 launches and future solicitations. Four
+        // sources fill that gap, run in order, and run BEFORE the
+        // per-series loop below:
         //
         //  1. DiscoverFromComicList - the real WEEKLY shipping list from
         //     comiclist.info (see ComicListService.GetThisWeeksMasterList).
@@ -166,6 +152,19 @@ public class AutoFetchService : IAutoFetchService
         //     and reported, not thrown - so one breaking never breaks the
         //     others).
         //
+        // This whole block is now deliberately placed BEFORE the
+        // per-series loop, not after it. Comic Vine's free-tier rate
+        // limit is one shared, finite budget for the WHOLE run, and a
+        // store with hundreds of already-carried series can easily burn
+        // through all of it just rechecking/backfilling books it already
+        // has - which used to leave nothing left for this step, the one
+        // that actually finds brand-new launches and solicitations from
+        // the publishers the store told Settings > Tracked Publishers it
+        // cares about. Missing a new launch is a bigger loss for a
+        // buy-before-FOC report than a slightly stale recheck of a book
+        // already in the system, so discovery goes first and gets first
+        // claim on the budget.
+        //
         // GCD (comics.org) discovery used to be a source here too but is
         // now disabled: ComicList's scraper covers the whole week on its
         // own, which made GCD purely redundant and its only contribution
@@ -187,6 +186,51 @@ public class AutoFetchService : IAutoFetchService
         var beforeComicVine = result.NewIssuesAdded;
         DiscoverNewNumberOnes(allSeries, result);
         trace.AppendLine($"Comic Vine discovery: +{result.NewIssuesAdded - beforeComicVine} issue(s).");
+
+        var skippedCooldown = 0;
+        var skippedAutoLinkCooldown = 0;
+        foreach (var series in existingSeries)
+        {
+            try
+            {
+                if (series.ComicVineVolumeId == null)
+                {
+                    if (series.LastAutoLinkAttempt != null &&
+                        DateTime.Now - series.LastAutoLinkAttempt.Value < AutoLinkRetryCooldown)
+                    {
+                        skippedAutoLinkCooldown++;
+                        continue; // tried to link this one recently and it didn't match - don't retry yet
+                    }
+                    if (!TryAutoLink(series, result)) continue; // no confident match - leave unlinked, try again after the cooldown
+                }
+                else if (series.LastCheckedForNewIssues != null &&
+                         DateTime.Now - series.LastCheckedForNewIssues.Value < RecheckCooldown)
+                {
+                    skippedCooldown++;
+                    continue; // checked too recently to be worth another Comic Vine call
+                }
+
+                CheckOneSeries(series, result);
+            }
+            catch (Exception ex) when (IsRateLimitError(ex))
+            {
+                // Comic Vine was already saturated by the discovery steps
+                // above (or by an earlier series this same loop) - every
+                // remaining series would just fail the exact same way, one
+                // at a time, for no new information. Stopping here instead
+                // of grinding through the rest leaves them completely
+                // untouched (no cooldown stamped), so they get a full,
+                // fair attempt on the next Check Now instead of one that
+                // was doomed before it started.
+                result.Errors.Add("Comic Vine's rate limit is still active - stopped rechecking the rest of this run's already-known series early; they'll get a full look on the next Check Now (or the next scheduled weekly check).");
+                break;
+            }
+        }
+        if (skippedAutoLinkCooldown > 0)
+            trace.AppendLine($"  ({skippedAutoLinkCooldown} unlinked series skipped - auto-link attempted within the last {AutoLinkRetryCooldown.TotalHours:0}h and didn't match, e.g. TPs/GNs that can never match a Comic Vine volume.)");
+        trace.AppendLine($"  done - linked {result.SeriesAutoLinked}, {result.NewIssuesAdded} issue(s) so far from existing series" +
+            (skippedCooldown > 0 ? $" ({skippedCooldown} skipped - checked within the last {RecheckCooldown.TotalHours:0}h)." : "."));
+
 
         var saved = true;
         try
@@ -220,19 +264,27 @@ public class AutoFetchService : IAutoFetchService
         }
     }
 
+    // A rate-limit failure (see ComicVineService) never got a real answer
+    // from Comic Vine either way - not "this series doesn't match", just
+    // "couldn't ask right now". Checked by every Comic Vine call site in
+    // this file that needs to tell the two apart: a genuine no-match is
+    // worth remembering (so a TP/GN that will never link isn't retried
+    // every single run), a rate limit is not (penalizing a series with a
+    // whole cooldown for a question that was never actually asked just
+    // delays finding out the real answer).
+    private static bool IsRateLimitError(Exception ex) =>
+        ex.Message.Contains("rate limit", StringComparison.OrdinalIgnoreCase);
+
     // Picks the best Comic Vine match for a series with no human in the
-    // loop: an exact (case-insensitive) name match is required, and if more
+    // loop: an exact (case-insensitive) name match is required. If more
     // than one volume shares that exact name, the one whose start year
-    // matches the series wins; otherwise the first exact match is used. A
-    // series with no confident name match is left unlinked and just skipped
-    // this run instead of guessing - it's retried on the next check.
+    // matches the series wins when the series' StartYear is trustworthy;
+    // otherwise (see the comment below) the volume whose issue count best
+    // fits what's already on file wins. A series with no confident name
+    // match is left unlinked and just skipped this run instead of
+    // guessing - it's retried on the next check.
     private bool TryAutoLink(Series series, AutoFetchResult result)
     {
-        // Stamped on every attempt - success, no-match, or exception alike
-        // (see AutoLinkRetryCooldown above) - so a series that doesn't
-        // match isn't retried again until the cooldown passes.
-        series.LastAutoLinkAttempt = DateTime.Now;
-
         List<ComicVineVolumeMatch> matches;
         try
         {
@@ -241,17 +293,147 @@ public class AutoFetchService : IAutoFetchService
         catch (Exception ex)
         {
             result.Errors.Add($"{series.Name}: {ex.Message}");
+            // A rate-limited attempt isn't a genuine "no match" - see
+            // IsRateLimitError - so LastAutoLinkAttempt is deliberately
+            // left unstamped here and the exception is rethrown so the
+            // circuit breaker in RunCheckForNewIssues's per-series loop
+            // can stop early instead of grinding through every remaining
+            // series the exact same losing way.
+            if (IsRateLimitError(ex)) throw;
+            series.LastAutoLinkAttempt = DateTime.Now;
             return false;
         }
 
-        var exact = matches.Where(m => string.Equals(m.Name, series.Name, StringComparison.OrdinalIgnoreCase)).ToList();
-        if (exact.Count == 0) return false;
+        // A genuine attempt that got a real answer from Comic Vine (a
+        // match or a confident non-match) - stamped here, once we know
+        // this wasn't just a rate limit.
+        series.LastAutoLinkAttempt = DateTime.Now;
 
-        var best = exact.FirstOrDefault(m => m.StartYear == series.StartYear) ?? exact[0];
+        var best = PickBestVolumeMatch(matches, series.Name, series.StartYear, series.Issues);
+
+        // A huge share of the store's "never linked, still showing a
+        // blank cover" series turned out to be TPs/HCs/Omnibuses - their
+        // scraped name carries a format suffix ("Giant Days Volume 1 TP",
+        // "...Omnibus Volume 1 HC (Cover A...)") that Comic Vine never
+        // puts in a real volume's name, so the exact-name search above
+        // almost always comes back with nothing at all to match against -
+        // not because Comic Vine doesn't know the book, but because it
+        // was never asked about it by a name Comic Vine would recognize.
+        if (best == null)
+            best = TryLinkAsCollectedEdition(series, result);
+
+        if (best == null) return false;
 
         series.ComicVineVolumeId = best.Id;
         result.SeriesAutoLinked++;
         return true;
+    }
+
+    // Comic Vine catalogs the underlying property under its own plain
+    // name, never with a scraped collected-edition's format baked in -
+    // see TryAutoLink. Strips a known format marker (Omnibus, Volume N,
+    // TP, HC, GN, a "(Cover A ...)" printing) and retries the search
+    // against whatever's left, keeping the same trailing "(YYYY)"
+    // disambiguator every other series here already relies on (see
+    // PickBestVolumeMatch) so this doesn't throw away the one piece of
+    // information meant to tell same-named relaunches apart.
+    //
+    // Gated purely on whether the NAME carries one of those format
+    // markers (StripCollectedEditionSuffix returning non-null), not on
+    // Issue.Type - every scraped source (AddEntriesAsIssues/
+    // AddIssueIfNew) stamps every issue IssueType.SingleIssue regardless
+    // of real format, so a TP/HC/Omnibus from any automated source would
+    // never actually carry IssueType.CollectedEdition to check against. A
+    // series whose name doesn't look like a collected edition at all
+    // falls through untouched - a failed match on an ordinary single-
+    // issue/mixed series' exact scraped name means something else is
+    // wrong (a real typo, a genuinely obscure/unlisted series), not this,
+    // and guessing at a stripped name there would risk exactly the kind
+    // of wrong-volume mislink that caused the "Superman (1939)" bug
+    // earlier - this only ever widens the search for a case that was
+    // otherwise guaranteed to never link at all.
+    private ComicVineVolumeMatch? TryLinkAsCollectedEdition(Series series, AutoFetchResult result)
+    {
+        if (series.Issues.Count == 0) return null;
+
+        var stripped = StripCollectedEditionSuffix(series.Name);
+        if (stripped == null) return null;
+
+        List<ComicVineVolumeMatch> matches;
+        try
+        {
+            matches = _comicVine.SearchVolumes(stripped);
+        }
+        catch (Exception ex)
+        {
+            result.Errors.Add($"{series.Name}: {ex.Message}");
+            if (IsRateLimitError(ex)) throw;
+            return null;
+        }
+
+        return PickBestVolumeMatch(matches, stripped, series.StartYear, series.Issues);
+    }
+
+    private static readonly Regex CollectedEditionMarker = new(
+        @"\b(Omnibus|Volume\s+\d+|Vol\.?\s*\d+|TP|HC|GN)\b|\(Cover\s+[A-Za-z]",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex TrailingYear = new(@"\((\d{4})\)\s*$", RegexOptions.Compiled);
+
+    // Returns a cleaned-up title to retry the search with, or null if
+    // this name doesn't look like a collected edition at all (nothing to
+    // strip, so there's no point retrying with an identical query).
+    private static string? StripCollectedEditionSuffix(string seriesName)
+    {
+        var marker = CollectedEditionMarker.Match(seriesName);
+        if (!marker.Success) return null;
+
+        var yearMatch = TrailingYear.Match(seriesName);
+        var baseTitle = seriesName.Substring(0, marker.Index).Trim().TrimEnd(':', '-', ',').Trim();
+        if (string.IsNullOrWhiteSpace(baseTitle)) return null;
+
+        var stripped = yearMatch.Success ? $"{baseTitle} ({yearMatch.Groups[1].Value})" : baseTitle;
+        return string.Equals(stripped, seriesName, StringComparison.OrdinalIgnoreCase) ? null : stripped;
+    }
+
+    // Shared by TryAutoLink (a not-yet-linked series) and ReverifyVolumeLink
+    // (re-checking an already-linked one during RescanExistingBooks) so the
+    // matching rule lives in exactly one place: an exact (case-insensitive)
+    // name match is required; among those, the one whose start year
+    // matches the series wins when the series' StartYear is trustworthy.
+    private static ComicVineVolumeMatch? PickBestVolumeMatch(List<ComicVineVolumeMatch> matches, string seriesName, int seriesStartYear, List<Issue> knownIssues)
+    {
+        var exact = matches.Where(m => string.Equals(m.Name, seriesName, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (exact.Count == 0) return null;
+
+        var best = exact.FirstOrDefault(m => m.StartYear == seriesStartYear);
+
+        if (best == null && knownIssues.Count > 0)
+        {
+            // seriesStartYear is often just a creation-time placeholder
+            // (the real-world year the row was first created, not Comic
+            // Vine's actual start year) for anything first discovered from
+            // a scraped new-release source rather than Comic Vine itself -
+            // see AddEntriesAsIssues. When that placeholder doesn't match
+            // any candidate, blindly taking Comic Vine's first search
+            // result tends to grab the oldest/highest-profile volume with
+            // the same name (e.g. the original 1939 Superman run) instead
+            // of whichever one is actually publishing the issue number
+            // already on file (e.g. the current Superman relaunch, issue
+            // #46). Comic Vine's count_of_issues is a much better signal
+            // here: prefer a volume whose issue count already covers the
+            // highest issue number this series carries, and among those,
+            // the one whose count is closest to it (a volume still being
+            // published should have at least that many issues catalogued,
+            // not drastically more from decades of unrelated history).
+            var maxKnownIssue = knownIssues.Max(i => i.IssueNumber);
+            best = exact
+                .OrderByDescending(m => m.IssueCount >= maxKnownIssue)
+                .ThenBy(m => Math.Abs(m.IssueCount - maxKnownIssue))
+                .First();
+        }
+
+        return best ?? exact[0];
     }
 
     // Current + last 3 months + next 3 months of street dates - a rolling
@@ -271,6 +453,11 @@ public class AutoFetchService : IAutoFetchService
         catch (Exception ex)
         {
             result.Errors.Add($"{series.Name}: {ex.Message}");
+            // Let the circuit breaker in the caller's loop stop the whole
+            // run early instead of grinding through every remaining
+            // series one at a time against a rate limit that isn't going
+            // away mid-run - see IsRateLimitError.
+            if (IsRateLimitError(ex)) throw;
             return;
         }
 
@@ -330,6 +517,269 @@ public class AutoFetchService : IAutoFetchService
 
     private static (DateOnly since, DateOnly until) DiscoveryWindow() =>
         (DateOnly.FromDateTime(DateTime.Today.AddMonths(-3)), DateOnly.FromDateTime(DateTime.Today.AddMonths(3)));
+
+    // A manual, explicit "fix my existing data" action (see
+    // IAutoFetchService.RescanExistingBooks) - never run automatically,
+    // and deliberately ignores the normal recheck/auto-link cooldowns so
+    // it actually revisits everything instead of skipping most of the
+    // catalog the way a normal Check Now would.
+    public AutoFetchResult RescanExistingBooks()
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Re-scan existing books run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
+
+        // Local-only, no Comic Vine calls - safe to always run first,
+        // rate limit or not, and it changes which issues actually count
+        // as "missing a cover" below (a placeholder graphic masqueraded
+        // as a real one until just now).
+        var placeholdersCleared = ClearPlaceholderCovers();
+        if (placeholdersCleared > 0)
+            trace.AppendLine($"Found {placeholdersCleared} cover(s) that were actually a source's generic \"not ready yet\" placeholder graphic, not real art - cleared so they're re-fetched below instead of staying stuck.");
+
+        var allSeries = _db.AllSeries
+            .Include(s => s.Issues).ThenInclude(i => i.Covers)
+            .Where(s => s.ComicVineVolumeId != null)
+            .ToList();
+
+        // This can run out of Comic Vine budget partway through (the
+        // store's current rate limit situation makes that the normal
+        // case, not the exception right now) - processing series that
+        // actually have a missing cover FIRST means a run that gets cut
+        // short still did the most useful work it could, instead of
+        // possibly spending its whole budget re-verifying volume links on
+        // series that were already perfectly fine before ever reaching
+        // the ones that actually needed fixing.
+        allSeries = allSeries
+            .OrderByDescending(s => s.Issues.Any(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath))))
+            .ToList();
+        trace.AppendLine($"Re-checking {allSeries.Count} already-linked series for a better volume match and missing cover art...");
+
+        foreach (var series in allSeries)
+        {
+            result.SeriesChecked++;
+            try
+            {
+                ReverifyVolumeLink(series, result);
+                RescanSeriesCovers(series, result);
+            }
+            catch (Exception ex) when (IsRateLimitError(ex))
+            {
+                result.Errors.Add("Comic Vine's rate limit is still active - stopped the re-scan early; run it again later to pick up where this left off.");
+                break;
+            }
+        }
+
+        try
+        {
+            _db.SaveChanges();
+            trace.AppendLine("SaveChanges: OK.");
+        }
+        catch (Exception ex)
+        {
+            result.Errors.Add($"Some changes could not be saved: {ex.Message}");
+            trace.AppendLine($"SaveChanges: FAILED - {ex.Message}");
+            _db.ChangeTracker.Clear();
+        }
+
+        trace.AppendLine();
+        trace.AppendLine(new string('=', 60));
+        trace.AppendLine($"Final: checked {result.SeriesChecked} series, re-linked {result.SeriesAutoLinked}, backfilled {result.CoversBackfilled} cover(s).");
+        if (result.Added.Count > 0)
+        {
+            trace.AppendLine();
+            trace.AppendLine("Re-linked:");
+            foreach (var line in result.Added) trace.AppendLine("  " + line);
+        }
+        if (result.Errors.Count > 0)
+        {
+            trace.AppendLine();
+            trace.AppendLine("Errors:");
+            foreach (var line in result.Errors) trace.AppendLine("  " + line);
+        }
+        DebugLog.WriteCheckNowLog(trace.ToString());
+
+        return result;
+    }
+
+    // Scans every cover image already on file, groups them by the
+    // downloaded file's own byte content (SHA256), and clears
+    // CoverImagePath back to null for any cover whose image matches a
+    // hash that turns up across too many DIFFERENT issues to plausibly
+    // be real, unique art - a source's own generic "cover not ready yet"
+    // stock graphic, not something a null/empty CoverImagePath check
+    // could ever catch (confirmed live: a real, non-blank image file,
+    // just the wrong one - a "Cover Coming Soon" graphic baked into the
+    // picture itself). Purely local file reads - no Comic Vine calls, no
+    // rate-limit exposure - so this is cheap enough to run at the start
+    // of every RescanExistingBooks, not something that needs its own
+    // separate button or schedule.
+    //
+    // A newly-confirmed hash is remembered in PlaceholderImageRegistry so
+    // ComicVineService.DownloadCoverImage can reject it immediately on
+    // every future download, before ever saving it as if it were real -
+    // this scan only has to catch each distinct placeholder graphic
+    // once, not every single run.
+    public int ClearPlaceholderCovers()
+    {
+        // Real art repeating across this many DIFFERENT issues is
+        // implausible outside a few known legitimate cases (a reprint
+        // reusing an old cover, a handful of variants sharing art) - a
+        // generic "not ready yet" stock graphic repeating this often is
+        // the common, expected case for a source that serves one.
+        const int placeholderThreshold = 5;
+
+        var coversWithImages = _db.Covers
+            .Include(c => c.Issue)
+            .Where(c => c.CoverImagePath != null && c.CoverImagePath != "")
+            .ToList();
+
+        var coversByHash = new Dictionary<string, List<Cover>>();
+        var issueIdsByHash = new Dictionary<string, HashSet<int>>();
+
+        foreach (var cover in coversWithImages)
+        {
+            string hash;
+            try
+            {
+                if (!File.Exists(cover.CoverImagePath)) continue;
+                using var stream = File.OpenRead(cover.CoverImagePath);
+                hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(stream));
+            }
+            catch
+            {
+                continue; // unreadable file - leave it alone rather than guess
+            }
+
+            if (!coversByHash.TryGetValue(hash, out var coverList))
+            {
+                coverList = new List<Cover>();
+                coversByHash[hash] = coverList;
+            }
+            coverList.Add(cover);
+
+            if (!issueIdsByHash.TryGetValue(hash, out var issueIds))
+            {
+                issueIds = new HashSet<int>();
+                issueIdsByHash[hash] = issueIds;
+            }
+            issueIds.Add(cover.IssueId);
+        }
+
+        var cleared = 0;
+        foreach (var (hash, issueIds) in issueIdsByHash)
+        {
+            if (issueIds.Count < placeholderThreshold) continue;
+
+            PlaceholderImageRegistry.Add(hash);
+            foreach (var cover in coversByHash[hash])
+            {
+                cover.CoverImagePath = null;
+                cleared++;
+            }
+        }
+
+        if (cleared > 0) _db.SaveChanges();
+        return cleared;
+    }
+
+    // Only ever called from RescanExistingBooks, never the normal Check Now
+    // flow - re-running a full name search for every already-linked series
+    // on every ordinary check would waste Comic Vine's budget and risk
+    // flipping a correct link for no reason. This exists specifically to
+    // undo damage from a link made before PickBestVolumeMatch's
+    // issue-count-based matching existed (the "Superman (1939)" bug).
+    private void ReverifyVolumeLink(Series series, AutoFetchResult result)
+    {
+        if (series.Issues.Count == 0) return; // nothing to judge a better match against
+
+        List<ComicVineVolumeMatch> matches;
+        try
+        {
+            matches = _comicVine.SearchVolumes(series.Name);
+        }
+        catch (Exception ex)
+        {
+            result.Errors.Add($"{series.Name}: {ex.Message}");
+            if (IsRateLimitError(ex)) throw;
+            return;
+        }
+
+        var best = PickBestVolumeMatch(matches, series.Name, series.StartYear, series.Issues);
+        if (best == null || best.Id == series.ComicVineVolumeId) return; // no match, or already linked to the right one
+
+        var maxKnownIssue = series.Issues.Max(i => i.IssueNumber);
+        var current = matches.FirstOrDefault(m => m.Id == series.ComicVineVolumeId);
+
+        // Only swap when the new candidate is a clearly better numeric fit.
+        // Comic Vine's own search doesn't always include the currently-
+        // linked volume among its results (a volume can drop out of a name
+        // search for reasons that have nothing to do with being wrong), so
+        // "the current link wasn't found in this search" is never treated
+        // as "the current link is wrong" on its own - only a genuinely
+        // better-fitting alternative is.
+        var currentFits = current != null && current.IssueCount >= maxKnownIssue;
+        var bestFits = best.IssueCount >= maxKnownIssue;
+        if (currentFits || !bestFits) return;
+
+        result.Added.Add($"{series.Name}: re-linked from Comic Vine volume {series.ComicVineVolumeId} to {best.Id} (\"{best.Name}\", {best.IssueCount} issue(s) on file - a better fit for issue #{maxKnownIssue:0.##} than the previous link).");
+        series.ComicVineVolumeId = best.Id;
+        // Forces a full GetIssuesInRange re-check against the corrected
+        // volume on the very next normal Check Now, instead of waiting out
+        // RecheckCooldown against what was, until a moment ago, the wrong
+        // volume entirely.
+        series.LastCheckedForNewIssues = null;
+        result.SeriesAutoLinked++;
+    }
+
+    // Only ever called from RescanExistingBooks. Looks up every issue
+    // number already on file for this series - not just whatever falls
+    // inside CheckOneSeries' normal rolling few-months discovery window -
+    // and backfills any that are still missing cover art.
+    private void RescanSeriesCovers(Series series, AutoFetchResult result)
+    {
+        var missingBefore = series.Issues.Count(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath)));
+        if (missingBefore == 0) return;
+
+        // GetIssuesInRange needs a date range - widened here to cover the
+        // earliest to latest release date already on file for this
+        // series (falling back to a generous 5-year window if none of its
+        // issues have a release date at all), instead of reusing
+        // DiscoveryWindow()'s narrow current-quarter slice.
+        var knownDates = series.Issues.Where(i => i.ReleaseDate != null).Select(i => i.ReleaseDate!.Value).ToList();
+        var since = knownDates.Count > 0 ? knownDates.Min().AddDays(-7) : DateOnly.FromDateTime(DateTime.Today.AddYears(-5));
+        var until = DateOnly.FromDateTime(DateTime.Today.AddMonths(3));
+
+        List<ComicVineNewIssue> cvIssues;
+        try
+        {
+            cvIssues = _comicVine.GetIssuesInRange(series.ComicVineVolumeId!.Value, since, until);
+        }
+        catch (Exception ex)
+        {
+            result.Errors.Add($"{series.Name}: {ex.Message}");
+            if (IsRateLimitError(ex)) throw;
+            return;
+        }
+
+        foreach (var cvIssue in cvIssues)
+            BackfillCoverImage(series, cvIssue, result);
+
+        var missingAfter = series.Issues.Count(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath)));
+        var backfilledThisSeries = Math.Max(0, missingBefore - missingAfter);
+        result.CoversBackfilled += backfilledThisSeries;
+
+        // Logged per-series (not just the one run-wide total) so a future
+        // run's log can actually answer "did THIS series get fixed?"
+        // instead of only "something, somewhere, got fixed" - this is
+        // exactly the question that came up over Catwoman not visibly
+        // updating even after a run reported backfilling covers overall.
+        if (backfilledThisSeries > 0)
+            result.Added.Add($"{series.Name}: backfilled {backfilledThisSeries} cover(s) ({missingAfter} still missing).");
+        else if (missingAfter > 0)
+            result.Errors.Add($"{series.Name}: still missing {missingAfter} cover(s) after checking {cvIssues.Count} issue(s) from Comic Vine in range {since:yyyy-MM-dd} to {until:yyyy-MM-dd} - Comic Vine may not have cover art for these issues yet, or they may not be numbered the way this store has them on file.");
+    }
 
     // Builds and saves the Issue+Cover for one Comic Vine issue, if its
     // issue number isn't already known for this series. Shared by the
@@ -537,42 +987,29 @@ public class AutoFetchService : IAutoFetchService
                 allSeries.Add(series); // so later discovery steps see it as already-known
             }
 
-            if (series.Issues.Any(i => i.IssueNumber == issueNumber)) continue; // already carried
+            // Used to just skip the whole group here whenever the issue
+            // number was already known - but a later week's scrape of the
+            // SAME issue can know about MORE variant covers than an
+            // earlier one did (incentive/retailer-exclusive covers in
+            // particular often get announced after the initial solicit),
+            // and skipping silently discarded those instead of adding
+            // them. AddMissingCoverVariants adds whatever cover letters
+            // aren't already on file for an issue that's already known;
+            // only a genuinely brand-new issue number falls through to
+            // the "create a new Issue" path below.
+            var existingIssue = series.Issues.FirstOrDefault(i => i.IssueNumber == issueNumber);
+            if (existingIssue != null)
+            {
+                AddMissingCoverVariants(existingIssue, group, seriesName, barcodePrefix, result);
+                continue;
+            }
 
             // A plain LINQ projection won't do here - downloading a cover
             // image (comicade.com entries only) is a side effect, and a
             // failed download for one variant shouldn't lose the others.
             var covers = new List<Cover>();
             foreach (var e in group)
-            {
-                string? coverImagePath = null;
-                if (!string.IsNullOrWhiteSpace(e.CoverImageUrl))
-                {
-                    try
-                    {
-                        var hint = $"{seriesName}_{issueNumber:0.##}_{e.CoverLetter}_{Guid.NewGuid():N}".Replace(" ", "_");
-                        coverImagePath = _comicVine.DownloadCoverImage(e.CoverImageUrl, hint);
-                    }
-                    catch (Exception ex)
-                    {
-                        result.Errors.Add($"{seriesName} #{issueNumber:0.##} ({e.CoverLetter}): cover image download failed: {ex.Message}");
-                    }
-                }
-
-                covers.Add(new Cover
-                {
-                    CoverLetter = e.CoverLetter,
-                    // A real UPC when the source gives one (comicade.com) -
-                    // the same generated placeholder as every other source
-                    // otherwise. The store sets the real barcode once the
-                    // book physically arrives either way (Inventory's
-                    // cover-detail grid), so this only matters until then.
-                    Barcode = !string.IsNullOrWhiteSpace(e.Upc) ? e.Upc : $"{barcodePrefix}-{Guid.NewGuid():N}",
-                    Price = e.Price ?? 0,
-                    StockQuantity = 0,
-                    CoverImagePath = coverImagePath
-                });
-            }
+                covers.Add(BuildCoverFromEntry(e, seriesName, issueNumber, barcodePrefix, result));
 
             // Extended Forecast/Comicade FOC entries each carry their own
             // ship date (they span weeks to months, not one shared week) -
@@ -592,7 +1029,15 @@ public class AutoFetchService : IAutoFetchService
                 Series = series,
                 IssueNumber = issueNumber,
                 Publisher = group.First().Publisher,
-                Type = IssueType.SingleIssue,
+                // Used to be hardcoded SingleIssue regardless of what the
+                // scraped title actually is - a "Giant Days Volume 1 TP"
+                // or "...Omnibus Volume 1 HC" solicitation got filed under
+                // Single Issues in Inventory's browse-by-type screen right
+                // alongside genuine single issues, which is wrong on its
+                // own and is also exactly the same name pattern
+                // TryLinkAsCollectedEdition now checks for auto-linking -
+                // this keeps both reading the format off the same signal.
+                Type = StripCollectedEditionSuffix(seriesName) != null ? IssueType.CollectedEdition : IssueType.SingleIssue,
                 ReleaseDate = entryReleaseDate,
                 FocDate = entryFocDate,
                 Covers = covers
@@ -603,6 +1048,75 @@ public class AutoFetchService : IAutoFetchService
             result.NewIssuesAdded++;
             result.Added.Add($"{seriesName} #{issueNumber:0.##} ({covers.Count} cover(s), {entryReleaseDate:MM/dd/yyyy})");
         }
+    }
+
+    // Shared by both the "brand-new issue" path and the "issue already
+    // known, just add any missing cover variants" path in
+    // AddEntriesAsIssues - downloading a cover image (comicade.com
+    // entries only) is a side effect that can fail independently per
+    // variant, so this is its own method rather than inline in either
+    // caller.
+    private Cover BuildCoverFromEntry(ComicListEntry e, string seriesName, float issueNumber, string barcodePrefix, AutoFetchResult result)
+    {
+        string? coverImagePath = null;
+        if (!string.IsNullOrWhiteSpace(e.CoverImageUrl))
+        {
+            try
+            {
+                var hint = $"{seriesName}_{issueNumber:0.##}_{e.CoverLetter}_{Guid.NewGuid():N}".Replace(" ", "_");
+                coverImagePath = _comicVine.DownloadCoverImage(e.CoverImageUrl, hint);
+            }
+            catch (Exception ex)
+            {
+                result.Errors.Add($"{seriesName} #{issueNumber:0.##} ({e.CoverLetter}): cover image download failed: {ex.Message}");
+            }
+        }
+
+        return new Cover
+        {
+            CoverLetter = e.CoverLetter,
+            // A real UPC when the source gives one (comicade.com) - the
+            // same generated placeholder as every other source
+            // otherwise. The store sets the real barcode once the book
+            // physically arrives either way (Inventory's cover-detail
+            // grid), so this only matters until then.
+            Barcode = !string.IsNullOrWhiteSpace(e.Upc) ? e.Upc : $"{barcodePrefix}-{Guid.NewGuid():N}",
+            Price = e.Price ?? 0,
+            StockQuantity = 0,
+            CoverImagePath = coverImagePath,
+            // comicade.com's solicit blurb (the only source that has
+            // one) - this is what the New Books detail popup shows as
+            // the issue's description. Null for every other source,
+            // same as every other Comicade-only field on ComicListEntry.
+            Description = string.IsNullOrWhiteSpace(e.Description) ? null : e.Description
+        };
+    }
+
+    // An issue we already carry can still be missing cover variants that
+    // a later week's scrape now knows about - a retailer-exclusive or
+    // incentive cover in particular is often announced well after the
+    // issue's initial solicit. This adds whatever cover letters aren't
+    // already on the existing issue instead of the old behavior of
+    // skipping the whole group just because the issue number itself was
+    // already known.
+    private void AddMissingCoverVariants(Issue existingIssue, IEnumerable<ComicListEntry> group, string seriesName, string barcodePrefix, AutoFetchResult result)
+    {
+        var knownLetters = existingIssue.Covers
+            .Select(c => c.CoverLetter)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var added = 0;
+        foreach (var e in group)
+        {
+            if (knownLetters.Contains(e.CoverLetter)) continue;
+
+            existingIssue.Covers.Add(BuildCoverFromEntry(e, seriesName, existingIssue.IssueNumber, barcodePrefix, result));
+            knownLetters.Add(e.CoverLetter);
+            added++;
+        }
+
+        if (added > 0)
+            result.Added.Add($"{seriesName} #{existingIssue.IssueNumber:0.##}: +{added} new cover variant(s) found on a later scrape.");
     }
 
     private void DiscoverNewNumberOnes(List<Series> allSeries, AutoFetchResult result)
@@ -643,6 +1157,10 @@ public class AutoFetchService : IAutoFetchService
             catch (Exception ex)
             {
                 result.Errors.Add($"{publisher}: {ex.Message}");
+                // Every other tracked publisher would hit the exact same
+                // wall right now - stop instead of burning through the
+                // rest of the list one losing call at a time.
+                if (IsRateLimitError(ex)) break;
                 continue;
             }
 
@@ -659,6 +1177,10 @@ public class AutoFetchService : IAutoFetchService
                 catch (Exception ex)
                 {
                     result.Errors.Add($"{vol.Name}: {ex.Message}");
+                    // Same reasoning as the publisher-level catch above -
+                    // a rate limit here means every remaining volume for
+                    // every remaining publisher would fail the same way.
+                    if (IsRateLimitError(ex)) return;
                     continue;
                 }
                 if (cvIssues.Count == 0) continue; // nothing from this volume ships in the window - skip it, don't create an empty Series
@@ -731,6 +1253,9 @@ public class AutoFetchService : IAutoFetchService
             catch (Exception ex)
             {
                 result.Errors.Add($"{cv.VolumeName}: {ex.Message}");
+                // Every remaining candidate would hit the same rate limit
+                // right now - stop instead of grinding through the rest.
+                if (IsRateLimitError(ex)) break;
                 continue;
             }
 
