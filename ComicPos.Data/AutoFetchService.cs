@@ -64,7 +64,9 @@ public class AutoFetchService : IAutoFetchService
                 trace.AppendLine("Errors:");
                 foreach (var line in result.Errors) trace.AppendLine("  " + line);
             }
-            DebugLog.WriteCheckNowLog(trace.ToString());
+            var traceText = trace.ToString();
+            result.Trace = traceText;
+            DebugLog.WriteCheckNowLog(traceText);
         }
     }
 
@@ -598,7 +600,9 @@ public class AutoFetchService : IAutoFetchService
             trace.AppendLine("Errors:");
             foreach (var line in result.Errors) trace.AppendLine("  " + line);
         }
-        DebugLog.WriteCheckNowLog(trace.ToString());
+        var rescanTraceText = trace.ToString();
+        result.Trace = rescanTraceText;
+        DebugLog.WriteCheckNowLog(rescanTraceText);
 
         return result;
     }
@@ -766,6 +770,22 @@ public class AutoFetchService : IAutoFetchService
         foreach (var cvIssue in cvIssues)
             BackfillCoverImage(series, cvIssue, result);
 
+        // Comic Vine's own catalog for this volume doesn't necessarily
+        // list every issue number this store has on file (an incomplete
+        // or slightly-off volume link, or very old back-catalog Comic
+        // Vine just never got around to) - those issues never even show
+        // up in cvIssues above, so BackfillCoverImage is never called for
+        // them at all. GCD is tried next, issue by issue, for whatever's
+        // still missing after the Comic Vine pass - a second, independent
+        // catalog instead of giving up on anything Comic Vine didn't list.
+        var stillMissing = series.Issues.Where(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath))).ToList();
+        var backfilledFromGcd = 0;
+        foreach (var issue in stillMissing)
+        {
+            if (BackfillCoverFromGcd(series, issue))
+                backfilledFromGcd++;
+        }
+
         var missingAfter = series.Issues.Count(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath)));
         var backfilledThisSeries = Math.Max(0, missingBefore - missingAfter);
         result.CoversBackfilled += backfilledThisSeries;
@@ -776,9 +796,32 @@ public class AutoFetchService : IAutoFetchService
         // exactly the question that came up over Catwoman not visibly
         // updating even after a run reported backfilling covers overall.
         if (backfilledThisSeries > 0)
-            result.Added.Add($"{series.Name}: backfilled {backfilledThisSeries} cover(s) ({missingAfter} still missing).");
+        {
+            var source = backfilledFromGcd > 0
+                ? $" ({backfilledFromGcd} of those from GCD, the rest from Comic Vine)"
+                : "";
+            result.Added.Add($"{series.Name}: backfilled {backfilledThisSeries} cover(s){source} ({missingAfter} still missing).");
+        }
         else if (missingAfter > 0)
-            result.Errors.Add($"{series.Name}: still missing {missingAfter} cover(s) after checking {cvIssues.Count} issue(s) from Comic Vine in range {since:yyyy-MM-dd} to {until:yyyy-MM-dd} - Comic Vine may not have cover art for these issues yet, or they may not be numbered the way this store has them on file.");
+            result.Errors.Add($"{series.Name}: still missing {missingAfter} cover(s) after checking {cvIssues.Count} issue(s) from Comic Vine in range {since:yyyy-MM-dd} to {until:yyyy-MM-dd} and {stillMissing.Count} issue(s) against GCD - neither has cover art for these issues yet, or they may not be numbered the way this store has them on file.");
+    }
+
+    // One issue at a time - GCD is a free, unauthenticated, rate-limited
+    // API (see GcdService's own header comment), so this is only ever
+    // reached from the manual, deliberate Re-scan action, never the
+    // routine automatic Check Now.
+    private bool BackfillCoverFromGcd(Series series, Issue issue)
+    {
+        var missingCovers = issue.Covers.Where(c => string.IsNullOrWhiteSpace(c.CoverImagePath)).ToList();
+        if (missingCovers.Count == 0) return false;
+
+        var hint = $"{series.Name}_{issue.IssueNumber:0.##}_{Guid.NewGuid():N}".Replace(" ", "_");
+        var imagePath = _gcd.FindAndDownloadCover(series.Name, issue.IssueNumber, series.StartYear, hint);
+        if (string.IsNullOrWhiteSpace(imagePath)) return false;
+
+        foreach (var cover in missingCovers)
+            cover.CoverImagePath = imagePath;
+        return true;
     }
 
     // Builds and saves the Issue+Cover for one Comic Vine issue, if its
