@@ -78,7 +78,10 @@ if (!app.Environment.IsDevelopment())
     app.UseExceptionHandler("/Error");
 }
 
-app.UseStaticFiles();
+// MapStaticAssets() below fully replaces UseStaticFiles() in a Blazor
+// Web App - having both registered at once is what just corrupted every
+// static response (200/500 with an empty body): two middleware/endpoint
+// layers both trying to write the same response.
 app.UseAntiforgery();
 
 // Cover art lives on disk as plain files (Cover.CoverImagePath), same as
@@ -110,6 +113,14 @@ app.MapGet("/api/store-logo", async (IStoreSettingsService storeSettings) =>
     var contentType = path.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ? "image/png" : "image/jpeg";
     return Results.File(bytes, contentType);
 });
+
+// .NET 10's Static Web Assets are served as endpoints from the
+// generated manifest (compression/fingerprinting included) - this is
+// what serves framework files like _framework/blazor.web.js, plus
+// everything under wwwroot (css/app.css, images, etc). Without this,
+// blazor.web.js 404s and every @onclick/@oninput in the app silently
+// does nothing (no circuit ever connects).
+app.MapStaticAssets();
 
 app.MapRazorComponents<App>()
     .AddInteractiveServerRenderMode();
