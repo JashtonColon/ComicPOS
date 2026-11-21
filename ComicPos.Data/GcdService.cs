@@ -108,49 +108,97 @@ public class GcdService : IGcdService
             return new ComicListWeek { ReleaseDate = DateOnly.FromDateTime(releaseDate), Entries = entries };
     }
 
-    // See IGcdService for the full contract (returns null, never throws).
-    // Two-step lookup because GCD's list endpoints return a slimmer shape
-    // than the per-issue detail endpoint - confirmed live: a
-    // /series/name/.../issue/N/ result has no "cover" field at all, only
-    // its own api_url, which has to be fetched separately to get the
-    // actual cover scan URL.
-    public string? FindAndDownloadCover(string seriesName, float issueNumber, int? startYear, string fileNameHint)
+    // See IGcdService for the full contract. Two-step lookup because
+    // GCD's list endpoints return a slimmer shape than the per-issue
+    // detail endpoint - confirmed live: a /series/name/.../issue/N/
+    // result has no "cover" field at all, only its own api_url, which has
+    // to be fetched separately to get the actual cover scan URL. Every
+    // exit point returns a Reason, success or failure, so a run that
+    // backfills nothing says exactly why instead of just "0."
+    public GcdCoverLookupResult FindAndDownloadCover(string seriesName, float issueNumber, int? startYear, string fileNameHint)
     {
+        var numberText = issueNumber == Math.Floor(issueNumber)
+            ? ((int)issueNumber).ToString(CultureInfo.InvariantCulture)
+            : issueNumber.ToString(CultureInfo.InvariantCulture);
+
+        // Path-segment API (no query-string filters - confirmed live
+        // against comics.org, see GrandComicsDatabase/gcd-django wiki).
+        // Escape each segment separately: Uri.EscapeDataString would also
+        // escape a literal "/" in a series name (GCD issue #671 notes
+        // that breaks the match), and there shouldn't be one in an issue
+        // number or year anyway.
+        var encodedName = Uri.EscapeDataString(seriesName);
+        var url = startYear != null
+            ? $"{BaseUrl}/series/name/{encodedName}/issue/{numberText}/year/{startYear}/"
+            : $"{BaseUrl}/series/name/{encodedName}/issue/{numberText}/";
+
+        string listJson;
         try
         {
-            var numberText = issueNumber == Math.Floor(issueNumber)
-                ? ((int)issueNumber).ToString(CultureInfo.InvariantCulture)
-                : issueNumber.ToString(CultureInfo.InvariantCulture);
-
-            // Path-segment API (no query-string filters - confirmed live
-            // against comics.org, see GrandComicsDatabase/gcd-django wiki).
-            // Escape each segment separately: Uri.EscapeDataString would
-            // also escape a literal "/" in a series name (GCD issue #671
-            // notes that breaks the match), and there shouldn't be one in
-            // an issue number or year anyway.
-            var encodedName = Uri.EscapeDataString(seriesName);
-            var url = startYear != null
-                ? $"{BaseUrl}/series/name/{encodedName}/issue/{numberText}/year/{startYear}/"
-                : $"{BaseUrl}/series/name/{encodedName}/issue/{numberText}/";
-
             Thread.Sleep(RequestDelay);
-            var listJson = Http.GetStringAsync(url).GetAwaiter().GetResult();
-            var list = JsonSerializer.Deserialize<GcdIssueListResponse>(listJson, JsonOptions);
-            var matches = list?.results;
-            if (matches == null || matches.Count == 0) return null;
+            listJson = Http.GetStringAsync(url).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            return Fail($"GCD request failed: {ex.GetType().Name}", $"{ex.Message} ({url})");
+        }
 
-            // Prefer the base printing over a variant cover when GCD has
-            // both on file for this issue number.
-            var chosen = matches.FirstOrDefault(m => string.IsNullOrWhiteSpace(m.variant_of)) ?? matches[0];
-            if (string.IsNullOrWhiteSpace(chosen.api_url)) return null;
+        GcdIssueListResponse? list;
+        try
+        {
+            list = JsonSerializer.Deserialize<GcdIssueListResponse>(listJson, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return Fail("GCD returned unparseable data", $"{ex.Message} - response started with \"{Truncate(listJson, 80)}\"");
+        }
 
+        var matches = list?.results;
+        if (matches == null || matches.Count == 0)
+            return Fail("no match in GCD for this series/issue/year", $"{seriesName} #{numberText}" + (startYear != null ? $" ({startYear})" : " (no start year given)"));
+
+        // Prefer the base printing over a variant cover when GCD has both
+        // on file for this issue number.
+        var chosen = matches.FirstOrDefault(m => string.IsNullOrWhiteSpace(m.variant_of)) ?? matches[0];
+        if (string.IsNullOrWhiteSpace(chosen.api_url))
+            return Fail("GCD matched the issue but gave no detail link to follow", null);
+
+        string issueJson;
+        try
+        {
             Thread.Sleep(RequestDelay);
-            var issueJson = Http.GetStringAsync(chosen.api_url).GetAwaiter().GetResult();
-            var detail = JsonSerializer.Deserialize<GcdIssueDetailDto>(issueJson, JsonOptions);
-            if (string.IsNullOrWhiteSpace(detail?.cover)) return null;
+            issueJson = Http.GetStringAsync(chosen.api_url).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            return Fail($"GCD detail request failed: {ex.GetType().Name}", $"{ex.Message} ({chosen.api_url})");
+        }
 
-            var bytes = Http.GetByteArrayAsync(detail.cover).GetAwaiter().GetResult();
+        GcdIssueDetailDto? detail;
+        try
+        {
+            detail = JsonSerializer.Deserialize<GcdIssueDetailDto>(issueJson, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return Fail("GCD detail returned unparseable data", $"{ex.Message} - response started with \"{Truncate(issueJson, 80)}\"");
+        }
 
+        if (string.IsNullOrWhiteSpace(detail?.cover))
+            return Fail("GCD has this issue on file but no cover scan uploaded for it", chosen.api_url);
+
+        byte[] bytes;
+        try
+        {
+            bytes = Http.GetByteArrayAsync(detail.cover).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            return Fail($"GCD cover image download failed: {ex.GetType().Name}", $"{ex.Message} ({detail.cover})");
+        }
+
+        try
+        {
             var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ComicPos", "CoverImages");
             Directory.CreateDirectory(folder);
 
@@ -162,15 +210,21 @@ public class GcdService : IGcdService
             var path = Path.Combine(folder, $"{safeName}{ext}");
 
             File.WriteAllBytes(path, bytes);
-            return path;
+            return new GcdCoverLookupResult { ImagePath = path, Reason = "found via GCD" };
         }
-        catch
+        catch (Exception ex)
         {
-            // Best-effort fallback only - a GCD hiccup here should never
-            // fail the overall re-scan; this issue just stays without a
-            // cover, same as if GCD genuinely had no match.
-            return null;
+            return Fail($"couldn't save the downloaded cover: {ex.GetType().Name}", ex.Message);
         }
+    }
+
+    private static GcdCoverLookupResult Fail(string reason, string? detail) =>
+        new GcdCoverLookupResult { ImagePath = null, Reason = reason, Detail = detail };
+
+    private static string Truncate(string? s, int max)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        return s.Length <= max ? s : s.Substring(0, max) + "...";
     }
 
     private static List<GcdIssueDto> FetchOnSaleIssues(int year, int week)
