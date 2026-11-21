@@ -393,6 +393,7 @@ public class ComicVineService : IComicVineService
     private static int? ResolvePublisherId(string apiKey, string publisherName, out List<string> candidateNames, out string diagnostic)
     {
         candidateNames = new List<string>();
+        var candidateIds = new List<int>();
         diagnostic = "";
 
         var cache = LoadPublisherIdCache();
@@ -454,7 +455,10 @@ public class ComicVineService : IComicVineService
                 if (candidateNames.Count < 5 && !string.IsNullOrWhiteSpace(name) &&
                     (name.Contains(publisherName, StringComparison.OrdinalIgnoreCase) ||
                      publisherName.Contains(name, StringComparison.OrdinalIgnoreCase)))
+                {
                     candidateNames.Add(name);
+                    candidateIds.Add(p.TryGetProperty("id", out var cpid) && cpid.ValueKind == JsonValueKind.Number ? cpid.GetInt32() : -1);
+                }
             }
 
             if (foundId != null) break;
@@ -469,6 +473,22 @@ public class ComicVineService : IComicVineService
 
         if (offset >= hardCapRows && foundId == null)
             diagnostic = $"gave up after scanning {hardCapRows} publishers without an exact match";
+
+        // No exact (case-insensitive) match, but exactly one textually-
+        // related publisher turned up across the whole scan - e.g. this
+        // store's Tracked Publishers says "Image Comics" and Comic Vine's
+        // actual entry is just "Image". One candidate out of thousands of
+        // publishers scanned is confident enough to use automatically
+        // instead of making the store go fix Settings > Tracked
+        // Publishers by hand first and re-run. Two or more candidates
+        // stays an error (ambiguous - a person should pick), and zero
+        // candidates stays an error too (nothing to go on, like DSTLRY
+        // when Comic Vine genuinely has no textually-similar entry).
+        if (foundId == null && candidateNames.Count == 1 && candidateIds.Count == 1 && candidateIds[0] >= 0)
+        {
+            foundId = candidateIds[0];
+            diagnostic = $"no exact match for \"{publisherName}\" - auto-matched to Comic Vine's \"{candidateNames[0]}\" (the only textually-similar publisher found)";
+        }
 
         if (foundId != null)
         {
