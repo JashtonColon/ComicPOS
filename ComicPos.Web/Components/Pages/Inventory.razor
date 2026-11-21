@@ -39,6 +39,7 @@
 
 @if (_level == 3)
 {
+    <p class="help-text">Edit a field and click away to save. Set the real barcode here when a book from New Books arrives.</p>
     <p class="help-text">@_holdsLabel</p>
 }
 
@@ -119,10 +120,15 @@ else if (_level == 3)
                 {
                     <tr>
                         <td>
-                            <img class="cover-thumb" src="/api/cover-image/@row.Cover.Id" alt="cover"
+                            <img class="cover-thumb" src="/api/cover-image/@row.Cover.Id?v=@row.ImageVersion" alt="cover"
                                  style="cursor:pointer"
                                  onerror="this.onerror=null;this.src='/img/no-cover.svg';"
                                  @onclick="@(() => OpenZoom(row.Cover.Id))" />
+                            @if (string.IsNullOrWhiteSpace(row.Cover.CoverImagePath))
+                            {
+                                <p class="cover-missing-label">No cover art on file</p>
+                            }
+                            <InputFile OnChange="@(e => OnCoverImageSelected(row, e))" accept="image/*" class="cover-upload-input" />
                         </td>
                         <td>@row.Cover.CoverLetter</td>
                         <td><input type="text" value="@row.Barcode" @onchange="e => SaveBarcode(row, e.Value?.ToString() ?? string.Empty)" /></td>
@@ -178,6 +184,7 @@ else if (_level == 3)
         public string Price { get; set; } = "";
         public string Stock { get; set; } = "";
         public string Description { get; set; } = "";
+        public int ImageVersion { get; set; }
     }
 
     protected override void OnInitialized() => LoadSeriesList();
@@ -187,7 +194,7 @@ else if (_level == 3)
         0 => "All Series",
         1 => $"{_seriesName} — Choose Type",
         2 => $"{_seriesName} — {(_type == IssueType.SingleIssue ? "Single Issues" : "Collected Editions")}",
-        3 => $"{_seriesName} #{_issueNumber:0.##} — Covers (edit a field and click away to save; set the real Barcode here when a book from New Books arrives)",
+        3 => $"{_seriesName} #{_issueNumber:0.##} — Covers",
         _ => ""
     };
 
@@ -372,5 +379,40 @@ else if (_level == 3)
         }
 
         LoadCoverDetail();
+    }
+
+    // Lets a missing cover (common for back-catalog issues that were bulk
+    // imported without art - only Comic Vine auto-fetch for New Books
+    // downloads real cover images automatically) be filled in by hand
+    // instead of staying a blank placeholder forever.
+    private async Task OnCoverImageSelected(CoverRow row, InputFileChangeEventArgs e)
+    {
+        _saveError = null;
+        try
+        {
+            var file = e.File;
+            var ext = Path.GetExtension(file.Name);
+            if (string.IsNullOrWhiteSpace(ext)) ext = ".jpg";
+
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ComicPos", "CoverImages");
+            Directory.CreateDirectory(dir);
+
+            var invalid = Path.GetInvalidFileNameChars();
+            var safeSeries = new string((_seriesName ?? "series").Select(ch => invalid.Contains(ch) ? '_' : ch).ToArray());
+            var path = Path.Combine(dir, $"{safeSeries}_{_issueNumber:0.##}_{row.Cover.CoverLetter}_{Guid.NewGuid():N}{ext}");
+
+            await using (var stream = File.Create(path))
+            {
+                await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).CopyToAsync(stream);
+            }
+
+            row.Cover.CoverImagePath = path;
+            row.ImageVersion++;
+            SaveCover(row.Cover, false, row.Cover.Barcode);
+        }
+        catch (Exception ex)
+        {
+            _saveError = $"Couldn't save that cover image: {ex.Message}";
+        }
     }
 }
