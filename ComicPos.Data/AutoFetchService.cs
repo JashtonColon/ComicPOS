@@ -540,36 +540,99 @@ public class AutoFetchService : IAutoFetchService
         if (placeholdersCleared > 0)
             trace.AppendLine($"Found {placeholdersCleared} cover(s) that were actually a source's generic \"not ready yet\" placeholder graphic, not real art - cleared so they're re-fetched below instead of staying stuck.");
 
+        // Every series with at least one cover still missing art - not
+        // just the ones already linked to a Comic Vine volume (the old
+        // filter here). GCD (tried below for every series) looks an
+        // issue up directly by series name + issue number, so it needs
+        // no Comic Vine link at all - a series that could never
+        // auto-link (a TP/GN, or one Comic Vine simply doesn't carry)
+        // used to be skipped outright and now still gets a GCD attempt.
         var allSeries = _db.AllSeries
             .Include(s => s.Issues).ThenInclude(i => i.Covers)
-            .Where(s => s.ComicVineVolumeId != null)
+            .Where(s => s.Issues.Any(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath))))
             .ToList();
 
-        // This can run out of Comic Vine budget partway through (the
-        // store's current rate limit situation makes that the normal
-        // case, not the exception right now) - processing series that
-        // actually have a missing cover FIRST means a run that gets cut
-        // short still did the most useful work it could, instead of
-        // possibly spending its whole budget re-verifying volume links on
-        // series that were already perfectly fine before ever reaching
-        // the ones that actually needed fixing.
+        // Comic-Vine-linked series first, while its (shared, depletable)
+        // budget is freshest - GCD below runs for every series regardless
+        // of this ordering, since it has its own separate budget.
         allSeries = allSeries
-            .OrderByDescending(s => s.Issues.Any(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath))))
+            .OrderByDescending(s => s.ComicVineVolumeId != null)
             .ToList();
-        trace.AppendLine($"Re-checking {allSeries.Count} already-linked series for a better volume match and missing cover art...");
+        trace.AppendLine($"Re-checking {allSeries.Count} series with at least one missing cover (Comic Vine where linked, GCD for all of them)...");
+
+        // Once Comic Vine's rate limit trips, every further call to it
+        // this run will just fail the same way - so instead of the old
+        // behavior (one rate-limited series aborting the ENTIRE rest of
+        // the run, GCD included - the actual cause of "many covers still
+        // missing" even after a run that reported backfilling some),
+        // Comic Vine is simply skipped for whatever series are left while
+        // GCD, a separate and independent source, keeps going for all of
+        // them regardless.
+        var comicVineRateLimited = false;
+        var backfilledFromGcd = 0;
+        // Tallies WHY a GCD attempt didn't produce a cover, grouped by a
+        // fixed reason string (see GcdCoverLookupResult) - the only way
+        // to tell "GCD genuinely doesn't carry any of these" apart from
+        // "every GCD call is silently failing" instead of both looking
+        // like an identical "backfilled 0" result.
+        var gcdReasonCounts = new Dictionary<string, int>();
+        var gcdSampleDetails = new List<string>();
 
         foreach (var series in allSeries)
         {
             result.SeriesChecked++;
-            try
+            var missingBefore = series.Issues.Count(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath)));
+
+            if (series.ComicVineVolumeId != null && !comicVineRateLimited)
             {
-                ReverifyVolumeLink(series, result);
-                RescanSeriesCovers(series, result);
+                try
+                {
+                    ReverifyVolumeLink(series, result);
+                    BackfillFromComicVine(series, result);
+                }
+                catch (Exception ex) when (IsRateLimitError(ex))
+                {
+                    comicVineRateLimited = true;
+                    result.Errors.Add("Comic Vine's rate limit is active - skipping it for the rest of this run (GCD lookups still run for every remaining series). Run Re-scan again later to give Comic Vine another pass.");
+                }
             }
-            catch (Exception ex) when (IsRateLimitError(ex))
+
+            foreach (var issue in series.Issues.Where(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath))).ToList())
             {
-                result.Errors.Add("Comic Vine's rate limit is still active - stopped the re-scan early; run it again later to pick up where this left off.");
-                break;
+                var gcdResult = BackfillCoverFromGcd(series, issue);
+                if (gcdResult.Success)
+                {
+                    backfilledFromGcd++;
+                }
+                else
+                {
+                    gcdReasonCounts[gcdResult.Reason] = gcdReasonCounts.GetValueOrDefault(gcdResult.Reason) + 1;
+                    if (gcdSampleDetails.Count < 10 && !string.IsNullOrWhiteSpace(gcdResult.Detail))
+                        gcdSampleDetails.Add($"{series.Name} #{issue.IssueNumber:0.##}: {gcdResult.Reason} - {gcdResult.Detail}");
+                }
+            }
+
+            var missingAfter = series.Issues.Count(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath)));
+            var backfilledThisSeries = Math.Max(0, missingBefore - missingAfter);
+            result.CoversBackfilled += backfilledThisSeries;
+
+            // Logged per-series (not just the one run-wide total) so a
+            // future run's log can actually answer "did THIS series get
+            // fixed?" instead of only "something, somewhere, got fixed."
+            if (backfilledThisSeries > 0)
+                result.Added.Add($"{series.Name}: backfilled {backfilledThisSeries} cover(s) ({missingAfter} still missing).");
+        }
+
+        trace.AppendLine($"GCD backfilled {backfilledFromGcd} cover(s) across this run (on top of whatever Comic Vine backfilled above).");
+        if (gcdReasonCounts.Count > 0)
+        {
+            trace.AppendLine("GCD misses, by reason:");
+            foreach (var kv in gcdReasonCounts.OrderByDescending(kv => kv.Value))
+                trace.AppendLine($"  {kv.Value}x: {kv.Key}");
+            if (gcdSampleDetails.Count > 0)
+            {
+                trace.AppendLine("Sample GCD misses (with detail):");
+                foreach (var line in gcdSampleDetails) trace.AppendLine("  " + line);
             }
         }
 
@@ -587,11 +650,11 @@ public class AutoFetchService : IAutoFetchService
 
         trace.AppendLine();
         trace.AppendLine(new string('=', 60));
-        trace.AppendLine($"Final: checked {result.SeriesChecked} series, re-linked {result.SeriesAutoLinked}, backfilled {result.CoversBackfilled} cover(s).");
+        trace.AppendLine($"Final: checked {result.SeriesChecked} series, re-linked {result.SeriesAutoLinked}, backfilled {result.CoversBackfilled} cover(s) ({backfilledFromGcd} of those from GCD).");
         if (result.Added.Count > 0)
         {
             trace.AppendLine();
-            trace.AppendLine("Re-linked:");
+            trace.AppendLine("Re-linked / backfilled:");
             foreach (var line in result.Added) trace.AppendLine("  " + line);
         }
         if (result.Errors.Count > 0)
@@ -737,15 +800,15 @@ public class AutoFetchService : IAutoFetchService
         result.SeriesAutoLinked++;
     }
 
-    // Only ever called from RescanExistingBooks. Looks up every issue
-    // number already on file for this series - not just whatever falls
-    // inside CheckOneSeries' normal rolling few-months discovery window -
-    // and backfills any that are still missing cover art.
-    private void RescanSeriesCovers(Series series, AutoFetchResult result)
+    // Comic-Vine-only half of what RescanSeriesCovers used to do in one
+    // piece: looks up every issue number already on file for this series
+    // (not just whatever falls inside CheckOneSeries' normal rolling
+    // few-months discovery window) and backfills any that are still
+    // missing cover art. Can throw on a rate limit - RescanExistingBooks
+    // decides what that means for the rest of the run (skip Comic Vine
+    // from here on, keep going with GCD).
+    private void BackfillFromComicVine(Series series, AutoFetchResult result)
     {
-        var missingBefore = series.Issues.Count(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath)));
-        if (missingBefore == 0) return;
-
         // GetIssuesInRange needs a date range - widened here to cover the
         // earliest to latest release date already on file for this
         // series (falling back to a generous 5-year window if none of its
@@ -769,59 +832,27 @@ public class AutoFetchService : IAutoFetchService
 
         foreach (var cvIssue in cvIssues)
             BackfillCoverImage(series, cvIssue, result);
-
-        // Comic Vine's own catalog for this volume doesn't necessarily
-        // list every issue number this store has on file (an incomplete
-        // or slightly-off volume link, or very old back-catalog Comic
-        // Vine just never got around to) - those issues never even show
-        // up in cvIssues above, so BackfillCoverImage is never called for
-        // them at all. GCD is tried next, issue by issue, for whatever's
-        // still missing after the Comic Vine pass - a second, independent
-        // catalog instead of giving up on anything Comic Vine didn't list.
-        var stillMissing = series.Issues.Where(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath))).ToList();
-        var backfilledFromGcd = 0;
-        foreach (var issue in stillMissing)
-        {
-            if (BackfillCoverFromGcd(series, issue))
-                backfilledFromGcd++;
-        }
-
-        var missingAfter = series.Issues.Count(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath)));
-        var backfilledThisSeries = Math.Max(0, missingBefore - missingAfter);
-        result.CoversBackfilled += backfilledThisSeries;
-
-        // Logged per-series (not just the one run-wide total) so a future
-        // run's log can actually answer "did THIS series get fixed?"
-        // instead of only "something, somewhere, got fixed" - this is
-        // exactly the question that came up over Catwoman not visibly
-        // updating even after a run reported backfilling covers overall.
-        if (backfilledThisSeries > 0)
-        {
-            var source = backfilledFromGcd > 0
-                ? $" ({backfilledFromGcd} of those from GCD, the rest from Comic Vine)"
-                : "";
-            result.Added.Add($"{series.Name}: backfilled {backfilledThisSeries} cover(s){source} ({missingAfter} still missing).");
-        }
-        else if (missingAfter > 0)
-            result.Errors.Add($"{series.Name}: still missing {missingAfter} cover(s) after checking {cvIssues.Count} issue(s) from Comic Vine in range {since:yyyy-MM-dd} to {until:yyyy-MM-dd} and {stillMissing.Count} issue(s) against GCD - neither has cover art for these issues yet, or they may not be numbered the way this store has them on file.");
     }
 
     // One issue at a time - GCD is a free, unauthenticated, rate-limited
     // API (see GcdService's own header comment), so this is only ever
     // reached from the manual, deliberate Re-scan action, never the
-    // routine automatic Check Now.
-    private bool BackfillCoverFromGcd(Series series, Issue issue)
+    // routine automatic Check Now. Returns the full lookup result (not
+    // just success/fail) so the caller can tally WHY a miss happened.
+    private GcdCoverLookupResult BackfillCoverFromGcd(Series series, Issue issue)
     {
         var missingCovers = issue.Covers.Where(c => string.IsNullOrWhiteSpace(c.CoverImagePath)).ToList();
-        if (missingCovers.Count == 0) return false;
+        if (missingCovers.Count == 0)
+            return new GcdCoverLookupResult { Reason = "no missing cover to fill" };
 
         var hint = $"{series.Name}_{issue.IssueNumber:0.##}_{Guid.NewGuid():N}".Replace(" ", "_");
-        var imagePath = _gcd.FindAndDownloadCover(series.Name, issue.IssueNumber, series.StartYear, hint);
-        if (string.IsNullOrWhiteSpace(imagePath)) return false;
-
-        foreach (var cover in missingCovers)
-            cover.CoverImagePath = imagePath;
-        return true;
+        var result = _gcd.FindAndDownloadCover(series.Name, issue.IssueNumber, series.StartYear, hint);
+        if (result.Success)
+        {
+            foreach (var cover in missingCovers)
+                cover.CoverImagePath = result.ImagePath;
+        }
+        return result;
     }
 
     // Builds and saves the Issue+Cover for one Comic Vine issue, if its
