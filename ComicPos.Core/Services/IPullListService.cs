@@ -6,6 +6,11 @@ public interface IPullListService
 {
     List<PullListEntry> GetForCustomer(int customerId);
 
+    // Every active customer pulling a given series, for staff sorting
+    // stock into physical pull folders - who to put a copy aside for,
+    // their preferred cover, how many copies, and any notes on the pull.
+    List<PullListEntry> GetForSeries(int seriesId);
+
     // Idempotent: adding a series already on the customer's (active or
     // previously-removed) pull list updates the existing row in place
     // instead of creating a duplicate.
