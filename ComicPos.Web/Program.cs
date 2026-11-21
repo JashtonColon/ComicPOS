@@ -1,0 +1,117 @@
+using ComicPos.Core.Services;
+using ComicPos.Data;
+using ComicPos.Web.Components;
+using ComicPos.Web.Services;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.EntityFrameworkCore;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Local-only by default - this is a one-register shop POS, not a public
+// site. Pin Kestrel to localhost so it never ends up reachable on the
+// shop's Wi-Fi unless someone deliberately changes this later.
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.ListenLocalhost(5080);
+});
+
+builder.Services.AddRazorComponents()
+    .AddInteractiveServerComponents();
+
+// ComicDbContext.OnConfiguring already points at the same
+// %LocalAppData%\ComicPos\comic_pos.db file the WinForms app
+// (ComicPos.App) reads and writes, so nothing here needs its own
+// connection string - same data, either front end.
+// Scoped (one DbContext per request/circuit), not a single shared
+// instance like the desktop app used - WinForms only ever had one user
+// at a time, but a web app can have more than one browser tab/circuit
+// open, and EF Core's DbContext is not safe to share across those.
+builder.Services.AddDbContext<ComicDbContext>();
+
+builder.Services.AddScoped<IInventoryService, InventoryService>();
+builder.Services.AddScoped<ICheckoutService, CheckoutService>();
+builder.Services.AddScoped<ISalesHistoryService, SalesHistoryService>();
+builder.Services.AddScoped<ICustomerService, CustomerService>();
+builder.Services.AddScoped<IPullListService, PullListService>();
+builder.Services.AddScoped<IIssueHoldService, IssueHoldService>();
+builder.Services.AddScoped<IImportService, ImportService>();
+builder.Services.AddScoped<IFocReportService, FocReportService>();
+builder.Services.AddScoped<IDashboardService, DashboardService>();
+builder.Services.AddScoped<IBackupService, BackupService>();
+builder.Services.AddScoped<IAutoFetchService, AutoFetchService>();
+
+// No DbContext dependency - safe (and cheaper) as singletons.
+builder.Services.AddSingleton<IEmailService, EmailService>();
+builder.Services.AddSingleton<IEmailSettingsService, EmailSettingsService>();
+builder.Services.AddSingleton<IStoreSettingsService, StoreSettingsService>();
+builder.Services.AddSingleton<IComicVineService, ComicVineService>();
+builder.Services.AddSingleton<IComicListService, ComicListService>();
+builder.Services.AddSingleton<IComicadeFocService, ComicadeFocService>();
+builder.Services.AddSingleton<IGcdService, GcdService>();
+
+// Web equivalent of MainForm's hourly maintenance timer - see
+// BackgroundJobsService's own header comment for why this runs in its own
+// scope instead of borrowing a browser circuit's.
+builder.Services.AddHostedService<BackgroundJobsService>();
+
+var app = builder.Build();
+
+// Same auto-migrate-on-startup behavior as the WinForms app - a shop
+// running this for the first time should never have to know what
+// "dotnet ef database update" means.
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<ComicDbContext>();
+    try
+    {
+        db.Database.Migrate();
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Comic POS could not set up its database and cannot start: {ex.Message}");
+        return;
+    }
+}
+
+if (!app.Environment.IsDevelopment())
+{
+    app.UseExceptionHandler("/Error");
+}
+
+app.UseStaticFiles();
+app.UseAntiforgery();
+
+// Cover art lives on disk as plain files (Cover.CoverImagePath), same as
+// the desktop app reads them - this just streams that same file back as
+// an http response so a plain <img src="..."> tag in a Razor page can
+// show it. No caching headers yet; covers don't change often, but this
+// is the simple version first.
+app.MapGet("/api/cover-image/{coverId:int}", async (int coverId, ComicDbContext db) =>
+{
+    var cover = await db.Covers.FindAsync(coverId);
+    if (cover == null || string.IsNullOrWhiteSpace(cover.CoverImagePath) || !File.Exists(cover.CoverImagePath))
+        return Results.NotFound();
+
+    var bytes = await File.ReadAllBytesAsync(cover.CoverImagePath);
+    var contentType = cover.CoverImagePath.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ? "image/png" : "image/jpeg";
+    return Results.File(bytes, contentType);
+});
+
+// Same idea as the cover-image endpoint above, but for
+// StoreSettings.LogoPath - used on printed/on-screen receipts and
+// (later) the Settings page's logo preview.
+app.MapGet("/api/store-logo", async (IStoreSettingsService storeSettings) =>
+{
+    var path = storeSettings.Load().LogoPath;
+    if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        return Results.NotFound();
+
+    var bytes = await File.ReadAllBytesAsync(path);
+    var contentType = path.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ? "image/png" : "image/jpeg";
+    return Results.File(bytes, contentType);
+});
+
+app.MapRazorComponents<App>()
+    .AddInteractiveServerRenderMode();
+
+app.Run();
