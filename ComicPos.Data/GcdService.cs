@@ -108,6 +108,71 @@ public class GcdService : IGcdService
             return new ComicListWeek { ReleaseDate = DateOnly.FromDateTime(releaseDate), Entries = entries };
     }
 
+    // See IGcdService for the full contract (returns null, never throws).
+    // Two-step lookup because GCD's list endpoints return a slimmer shape
+    // than the per-issue detail endpoint - confirmed live: a
+    // /series/name/.../issue/N/ result has no "cover" field at all, only
+    // its own api_url, which has to be fetched separately to get the
+    // actual cover scan URL.
+    public string? FindAndDownloadCover(string seriesName, float issueNumber, int? startYear, string fileNameHint)
+    {
+        try
+        {
+            var numberText = issueNumber == Math.Floor(issueNumber)
+                ? ((int)issueNumber).ToString(CultureInfo.InvariantCulture)
+                : issueNumber.ToString(CultureInfo.InvariantCulture);
+
+            // Path-segment API (no query-string filters - confirmed live
+            // against comics.org, see GrandComicsDatabase/gcd-django wiki).
+            // Escape each segment separately: Uri.EscapeDataString would
+            // also escape a literal "/" in a series name (GCD issue #671
+            // notes that breaks the match), and there shouldn't be one in
+            // an issue number or year anyway.
+            var encodedName = Uri.EscapeDataString(seriesName);
+            var url = startYear != null
+                ? $"{BaseUrl}/series/name/{encodedName}/issue/{numberText}/year/{startYear}/"
+                : $"{BaseUrl}/series/name/{encodedName}/issue/{numberText}/";
+
+            Thread.Sleep(RequestDelay);
+            var listJson = Http.GetStringAsync(url).GetAwaiter().GetResult();
+            var list = JsonSerializer.Deserialize<GcdIssueListResponse>(listJson, JsonOptions);
+            var matches = list?.results;
+            if (matches == null || matches.Count == 0) return null;
+
+            // Prefer the base printing over a variant cover when GCD has
+            // both on file for this issue number.
+            var chosen = matches.FirstOrDefault(m => string.IsNullOrWhiteSpace(m.variant_of)) ?? matches[0];
+            if (string.IsNullOrWhiteSpace(chosen.api_url)) return null;
+
+            Thread.Sleep(RequestDelay);
+            var issueJson = Http.GetStringAsync(chosen.api_url).GetAwaiter().GetResult();
+            var detail = JsonSerializer.Deserialize<GcdIssueDetailDto>(issueJson, JsonOptions);
+            if (string.IsNullOrWhiteSpace(detail?.cover)) return null;
+
+            var bytes = Http.GetByteArrayAsync(detail.cover).GetAwaiter().GetResult();
+
+            var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ComicPos", "CoverImages");
+            Directory.CreateDirectory(folder);
+
+            var ext = Path.GetExtension(new Uri(detail.cover).LocalPath);
+            if (string.IsNullOrWhiteSpace(ext)) ext = ".jpg";
+
+            var invalid = Path.GetInvalidFileNameChars();
+            var safeName = new string(fileNameHint.Select(ch => invalid.Contains(ch) ? '_' : ch).ToArray());
+            var path = Path.Combine(folder, $"{safeName}{ext}");
+
+            File.WriteAllBytes(path, bytes);
+            return path;
+        }
+        catch
+        {
+            // Best-effort fallback only - a GCD hiccup here should never
+            // fail the overall re-scan; this issue just stays without a
+            // cover, same as if GCD genuinely had no match.
+            return null;
+        }
+    }
+
     private static List<GcdIssueDto> FetchOnSaleIssues(int year, int week)
     {
         var all = new List<GcdIssueDto>();
@@ -173,6 +238,14 @@ public class GcdService : IGcdService
         public string? price { get; set; }
         public string? variant_of { get; set; }
         public string? series { get; set; }
+        public string? api_url { get; set; }
+    }
+
+    // The detail view (by id) returns a richer shape than the list view
+    // used above - only the cover scan URL is needed here.
+    private class GcdIssueDetailDto
+    {
+        public string? cover { get; set; }
     }
 
     private class GcdSeriesDto
