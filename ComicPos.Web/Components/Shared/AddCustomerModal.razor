@@ -1,0 +1,73 @@
+@* Modal "add a customer" popup - web port of AddCustomerForm.cs.
+   Fields: Name (required), Email, Phone. On save, calls ICustomerService.AddCustomer
+   directly (same as the desktop form's caller used to do) and raises OnSaved so the
+   parent page can refresh its list. *@
+@namespace ComicPos.Web.Components.Shared
+@using ComicPos.Core.Services
+@inject ICustomerService Customers
+
+<Modal Show="Show" Title="New Customer" OnBackdropClick="Close">
+    <div class="form-row">
+        <label>Name:*</label>
+        <input type="text" value="@_name" @oninput="e => _name = e.Value?.ToString() ?? string.Empty" placeholder="Full name" />
+    </div>
+    <div class="form-row">
+        <label>Email:</label>
+        <input type="text" value="@_email" @oninput="e => _email = e.Value?.ToString() ?? string.Empty" placeholder="email@example.com" />
+    </div>
+    <div class="form-row">
+        <label>Phone:</label>
+        <input type="text" value="@_phone" @oninput="e => _phone = e.Value?.ToString() ?? string.Empty" placeholder="555-0100" />
+    </div>
+    @if (_error != null)
+    {
+        <p class="error-text">@_error</p>
+    }
+    <div class="form-actions">
+        <button class="btn-ghost" @onclick="Close">Cancel</button>
+        <button class="btn-primary" @onclick="Save">Add Customer</button>
+    </div>
+</Modal>
+
+@code {
+    [Parameter] public bool Show { get; set; }
+    [Parameter] public EventCallback OnSaved { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    private bool _wasShown;
+    private string _name = "";
+    private string _email = "";
+    private string _phone = "";
+    private string? _error;
+
+    protected override void OnParametersSet()
+    {
+        if (Show && !_wasShown)
+        {
+            _name = "";
+            _email = "";
+            _phone = "";
+            _error = null;
+        }
+        _wasShown = Show;
+    }
+
+    private async Task Close() => await OnClose.InvokeAsync();
+
+    private async Task Save()
+    {
+        _error = null;
+        var name = _name.Trim();
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            _error = "Name is required.";
+            return;
+        }
+
+        Customers.AddCustomer(name,
+            string.IsNullOrWhiteSpace(_email) ? null : _email.Trim(),
+            string.IsNullOrWhiteSpace(_phone) ? null : _phone.Trim());
+
+        await OnSaved.InvokeAsync();
+    }
+}
