@@ -19,10 +19,10 @@ public class CustomerControl : UserControl
     private readonly DataGridView grid = new();
     private readonly Panel addPanel;
 
-    // Customer list "add new" row
-    private readonly TextBox txtNewName = new();
-    private readonly TextBox txtNewEmail = new();
-    private readonly TextBox txtNewPhone = new();
+    // Customer list "add new" button - opens AddCustomerForm as a popup
+    // instead of a permanently-docked row of textboxes (that row's fixed
+    // Height=35 stopped being tall enough once buttons grew a taller
+    // minimum height, and the user asked for a popup instead anyway).
     private readonly Button btnAdd = new();
     private readonly Button btnVoidSale = new();
 
@@ -103,24 +103,12 @@ public class CustomerControl : UserControl
         grid.CellDoubleClick += Grid_CellDoubleClick;
 
         // --- add-customer row, List screen only ---
-        addPanel = new Panel { Dock = DockStyle.Bottom, Height = 35 };
-        txtNewPhone.Dock = DockStyle.Right;
-        txtNewPhone.Width = 120;
-        txtNewPhone.PlaceholderText = "Phone";
-        txtNewEmail.Dock = DockStyle.Right;
-        txtNewEmail.Width = 160;
-        txtNewEmail.PlaceholderText = "Email";
-        txtNewName.Dock = DockStyle.Fill;
-        txtNewName.PlaceholderText = "New customer name...";
-        btnAdd.Dock = DockStyle.Right;
-        btnAdd.Width = 80;
-        btnAdd.Text = "Add";
+        addPanel = new Panel { Dock = DockStyle.Bottom, Height = 56, Padding = new Padding(10) };
+        btnAdd.Dock = DockStyle.Fill;
+        btnAdd.Text = "+ Add Customer";
         btnAdd.Click += AddCustomer_Click;
         btnAdd.Tag = "primary";
 
-        addPanel.Controls.Add(txtNewName);
-        addPanel.Controls.Add(txtNewEmail);
-        addPanel.Controls.Add(txtNewPhone);
         addPanel.Controls.Add(btnAdd);
 
         // --- detail/edit panel (Fill, overlaps grid, toggled via Visible) ---
@@ -258,7 +246,9 @@ public class CustomerControl : UserControl
         // --- pull list "add a series" panel, Bottom, PullList screen only ---
         pullListAddPanel = new Panel { Dock = DockStyle.Bottom, Height = 150, Visible = false };
 
-        var pullTopRow = new Panel { Dock = DockStyle.Top, Height = 32 };
+        // Grown from 32 - same reason as addPanel/ImportControl/FocReportControl:
+        // not tall enough for the taller, rounded buttons from UiTheme.StyleButton.
+        var pullTopRow = new Panel { Dock = DockStyle.Top, Height = 48, Padding = new Padding(0, 6, 0, 6) };
         txtPullSeriesSearch.Dock = DockStyle.Fill;
         txtPullSeriesSearch.PlaceholderText = "Search a series to add...";
         txtPullSeriesSearch.TextChanged += PullSeriesSearch_TextChanged;
@@ -347,21 +337,10 @@ public class CustomerControl : UserControl
 
     private void AddCustomer_Click(object? sender, EventArgs e)
     {
-        var name = txtNewName.Text;
-        var email = string.IsNullOrWhiteSpace(txtNewEmail.Text) ? null : txtNewEmail.Text;
-        var phone = string.IsNullOrWhiteSpace(txtNewPhone.Text) ? null : txtNewPhone.Text;
+        using var form = new AddCustomerForm();
+        if (form.ShowDialog(FindForm()) != DialogResult.OK) return;
 
-        if (string.IsNullOrWhiteSpace(name))
-        {
-            MessageBox.Show("Name is required.", "Missing Name", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-
-        _customers.AddCustomer(name, email, phone);
-
-        txtNewName.Clear();
-        txtNewEmail.Clear();
-        txtNewPhone.Clear();
+        _customers.AddCustomer(form.CustomerName, form.Email, form.Phone);
 
         ShowList();
     }
@@ -767,4 +746,9 @@ public class CustomerControl : UserControl
                 break;
         }
     }
+
+    // Re-clicking the Customers tab while already on it (MainForm's
+    // tab strip) jumps back out to the customer list instead of leaving
+    // you stuck wherever you'd drilled into (detail, history, pull list).
+    public void ResetToTop() => ShowList();
 }
