@@ -40,9 +40,18 @@ public class DashboardService : IDashboardService
 
     public List<LowStockEntry> GetLowStock(int threshold)
     {
+        // Every issue AutoFetchService discovers (up to ~10 months ahead
+        // via the Extended Forecast/Comicade FOC sources) starts at
+        // StockQuantity 0 the moment it's added - long before it ever
+        // ships. Without the ReleaseDate filter below, those hundreds of
+        // not-yet-released covers all satisfy "<= threshold" and flood
+        // this list, burying the actual problem (something that sold out)
+        // under books nobody could possibly have restocked yet.
+        var today = DateOnly.FromDateTime(DateTime.Today);
+
         return _db.Covers
             .Include(c => c.Issue).ThenInclude(i => i.Series)
-            .Where(c => c.StockQuantity <= threshold)
+            .Where(c => c.StockQuantity <= threshold && c.Issue.ReleaseDate != null && c.Issue.ReleaseDate <= today)
             .ToList()
             .Select(c => new LowStockEntry
             {
