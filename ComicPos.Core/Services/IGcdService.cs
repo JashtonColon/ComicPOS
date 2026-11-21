@@ -58,5 +58,14 @@ public class GcdCoverLookupResult
     // concrete examples alongside the grouped counts above.
     public string? Detail { get; set; }
 
+    // Set when GCD itself returned 429 Too Many Requests - a hard stop,
+    // not a miss. Anonymous GCD access is capped at roughly 30
+    // requests/hour (confirmed on GCD's own mailing list), so once this
+    // trips, every further call this run will fail the exact same way;
+    // the caller should stop calling GCD at all for the rest of the run
+    // instead of burning through the whole remaining catalog re-hitting
+    // an already-tripped limit one issue at a time.
+    public bool IsRateLimited { get; set; }
+
     public bool Success => !string.IsNullOrWhiteSpace(ImagePath);
 }
