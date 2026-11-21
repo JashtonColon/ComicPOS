@@ -1,3 +1,4 @@
+using System.Globalization;
 using ComicPos.Core.Models;
 using ComicPos.Core.Services;
 
@@ -15,7 +16,21 @@ public class AutoFetchControl : UserControl
     private readonly Label lblStatus = new();
     private readonly ComboBox cboSortBy = new();
     private readonly Button btnCheckNow = new();
+    private readonly Button btnRescan = new();
+    private readonly TextBox txtSearch = new();
+    private readonly FlowLayoutPanel monthTabsPanel = new();
     private readonly DataGridView grid = new();
+
+    // null = "All" - the inline scrolling view with group headers, same as
+    // before month tabs existed. Set when a specific month tab is clicked.
+    private string? _selectedMonthLabel;
+    private List<string> _lastMonthTabLabels = new();
+
+    // Built once and reused for every row with no real cover art on file -
+    // RefreshGrid runs on every search-box keystroke, so regenerating this
+    // small bitmap per row per keystroke would be wasteful for no visual
+    // difference (it's the same tile every time either way).
+    private static readonly Image NoCoverThumbnail = UiTheme.BuildNoCoverPlaceholder(44, 60);
 
     private const string SortTitle = "Title";
     private const string SortPublisher = "Publisher";
@@ -36,6 +51,18 @@ public class AutoFetchControl : UserControl
         btnCheckNow.Tag = "primary";
         btnCheckNow.Click += (s, e) => RunCheck(showResultPopup: true);
 
+        // A manual, explicit "fix my existing data" action - re-verifies
+        // every already-linked series' Comic Vine volume link and
+        // backfills missing cover art for every issue on file, ignoring
+        // the normal recheck cooldown. Separate from "Check Now" (which
+        // only looks for brand-new issues/series) because this is a much
+        // heavier, occasional-use operation, not something to run on
+        // every click or every weekly background check.
+        btnRescan.Dock = DockStyle.Right;
+        btnRescan.Width = 160;
+        btnRescan.Text = "Re-scan Existing";
+        btnRescan.Click += (s, e) => RunRescan();
+
         cboSortBy.Dock = DockStyle.Right;
         cboSortBy.Width = 140;
         cboSortBy.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -44,7 +71,15 @@ public class AutoFetchControl : UserControl
         cboSortBy.Items.Add(SortPublisher);
         cboSortBy.Items.Add(SortTitle);
         cboSortBy.SelectedIndex = 0;
-        cboSortBy.SelectedIndexChanged += (s, e) => RefreshGrid();
+        cboSortBy.SelectedIndexChanged += (s, e) =>
+        {
+            // A month label from one sort (e.g. a FOC month) has no
+            // meaning under another (e.g. sorted by Publisher) - drop
+            // back to "All" instead of silently filtering to a month
+            // group that no longer means what the tab said it did.
+            _selectedMonthLabel = null;
+            RefreshGrid();
+        };
 
         var lblSortBy = new Label { Dock = DockStyle.Right, Width = 60, TextAlign = ContentAlignment.MiddleRight, Text = "Sort by:" };
 
@@ -57,6 +92,18 @@ public class AutoFetchControl : UserControl
         topPanel.Controls.Add(lblSortBy);
         topPanel.Controls.Add(cboSortBy);
         topPanel.Controls.Add(btnCheckNow);
+        topPanel.Controls.Add(btnRescan);
+
+        txtSearch.Dock = DockStyle.Top;
+        txtSearch.PlaceholderText = "Search New Books by series or publisher...";
+        txtSearch.TextChanged += (s, e) => RefreshGrid();
+
+        monthTabsPanel.Dock = DockStyle.Top;
+        monthTabsPanel.AutoSize = true;
+        monthTabsPanel.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        monthTabsPanel.FlowDirection = FlowDirection.LeftToRight;
+        monthTabsPanel.WrapContents = true;
+        monthTabsPanel.Padding = new Padding(4, 4, 4, 0);
 
         grid.Dock = DockStyle.Fill;
         grid.ReadOnly = true;
@@ -72,8 +119,11 @@ public class AutoFetchControl : UserControl
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Publisher", HeaderText = "Publisher", ReadOnly = true });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Foc", HeaderText = "FOC Date", ReadOnly = true });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Release", HeaderText = "Release Date", ReadOnly = true });
+        grid.CellDoubleClick += Grid_CellDoubleClick;
 
         Controls.Add(grid);
+        Controls.Add(monthTabsPanel);
+        Controls.Add(txtSearch);
         Controls.Add(topPanel);
 
         UiTheme.StyleForm(this);
@@ -125,6 +175,7 @@ public class AutoFetchControl : UserControl
         _checkRunning = true;
 
         btnCheckNow.Enabled = false;
+        btnRescan.Enabled = false; // shares the one DB connection with RunCheck - never let both run at once
         lblStatus.Text = "Checking for new issues... this can take a minute.";
 
         // The shared database connection isn't safe for two threads to use
@@ -160,6 +211,7 @@ public class AutoFetchControl : UserControl
     {
         _checkRunning = false;
         btnCheckNow.Enabled = true;
+        btnRescan.Enabled = true;
         if (ownerForm != null) ownerForm.Enabled = true;
         Cursor.Current = Cursors.Default;
 
@@ -179,6 +231,69 @@ public class AutoFetchControl : UserControl
             if (result.Errors.Count > 0)
                 summary += "\n\nSome series had errors:\n" + string.Join("\n", result.Errors.Take(10));
             MessageBox.Show(summary, "New Books Check", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+    }
+
+    // A manual, explicit "fix my existing data" action (see
+    // IAutoFetchService.RescanExistingBooks) - mirrors RunCheck's
+    // Task.Run/form-disable safety wrapper exactly, since this can also
+    // mean a lot of sequential Comic Vine calls (one per already-linked
+    // series) and would freeze the UI the same way if run directly on
+    // the UI thread.
+    private void RunRescan()
+    {
+        if (_checkRunning) return; // a check or another rescan is already running - ignore a second click
+        _checkRunning = true;
+
+        btnCheckNow.Enabled = false;
+        btnRescan.Enabled = false;
+        lblStatus.Text = "Re-scanning existing books for better volume links and missing covers... this can take a while for a large catalog.";
+
+        var ownerForm = FindForm();
+        if (ownerForm != null) ownerForm.Enabled = false;
+        Cursor.Current = Cursors.WaitCursor;
+
+        Task.Run(() =>
+        {
+            AutoFetchResult? result = null;
+            Exception? error = null;
+            try
+            {
+                result = _autoFetch.RescanExistingBooks();
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+            }
+
+            if (IsDisposed) return; // tab/control closed while the rescan was running
+            BeginInvoke(() => FinishRescan(result, error, ownerForm));
+        });
+    }
+
+    private void FinishRescan(AutoFetchResult? result, Exception? error, Form? ownerForm)
+    {
+        _checkRunning = false;
+        btnCheckNow.Enabled = true;
+        btnRescan.Enabled = true;
+        if (ownerForm != null) ownerForm.Enabled = true;
+        Cursor.Current = Cursors.Default;
+
+        if (error != null)
+        {
+            UpdateStatusLabel();
+            MessageBox.Show($"Re-scan failed: {error.Message}", "Re-scan Existing Books", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        RefreshGrid(); // also calls UpdateStatusLabel()
+
+        if (result != null)
+        {
+            var summary = $"Checked {result.SeriesChecked} series, re-linked {result.SeriesAutoLinked}, backfilled {result.CoversBackfilled} cover(s).";
+            if (result.Errors.Count > 0)
+                summary += "\n\nSome series had errors:\n" + string.Join("\n", result.Errors.Take(10));
+            MessageBox.Show(summary, "Re-scan Existing Books", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
     }
 
@@ -213,11 +328,28 @@ public class AutoFetchControl : UserControl
             RunCheck(showResultPopup: false);
     }
 
+    private string GroupLabelFor(Issue issue, string sortKey) => sortKey switch
+    {
+        SortPublisher => string.IsNullOrWhiteSpace(issue.Publisher) ? "(Unknown Publisher)" : issue.Publisher,
+        SortFoc => issue.FocDate?.ToString("MMMM yyyy") ?? "(No FOC Date)",
+        SortTitle => issue.Series.Name,
+        _ => issue.ReleaseDate?.ToString("MMMM yyyy") ?? "(No Release Date)"
+    };
+
     private void RefreshGrid()
     {
         UpdateStatusLabel();
 
-        var issues = _autoFetch.GetNewBooks();
+        IEnumerable<Issue> issues = _autoFetch.GetNewBooks();
+
+        var searchText = txtSearch.Text.Trim();
+        if (searchText.Length > 0)
+        {
+            issues = issues.Where(i =>
+                i.Series.Name.Contains(searchText, StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrWhiteSpace(i.Publisher) && i.Publisher.Contains(searchText, StringComparison.OrdinalIgnoreCase)));
+        }
+
         var sortKey = cboSortBy.SelectedItem as string ?? SortRelease;
 
         IEnumerable<Issue> ordered = sortKey switch
@@ -228,20 +360,38 @@ public class AutoFetchControl : UserControl
             _ => issues.OrderBy(i => i.ReleaseDate ?? DateOnly.MaxValue).ThenBy(i => i.Series.Name)
         };
 
+        var orderedList = ordered.ToList(); // enumerated once - reused below for the tabs and the rows
+
+        // Clickable month tabs only make sense for the two date-based
+        // sorts - a "month" isn't a meaningful grouping of Publisher or
+        // Title, so the tab row just hides there and the grid falls back
+        // to the plain scrolling list (no inline headers either, since
+        // Title/Publisher already group inline the same way they always did).
+        var monthCapableSort = sortKey == SortRelease || sortKey == SortFoc;
+        monthTabsPanel.Visible = monthCapableSort;
+
+        if (monthCapableSort)
+        {
+            var months = orderedList.Select(i => GroupLabelFor(i, sortKey)).Distinct().ToList();
+            RebuildMonthTabs(months);
+
+            if (_selectedMonthLabel != null)
+                orderedList = orderedList.Where(i => GroupLabelFor(i, sortKey) == _selectedMonthLabel).ToList();
+        }
+
         grid.Rows.Clear();
         string? lastGroupValue = null;
 
-        foreach (var issue in ordered)
+        foreach (var issue in orderedList)
         {
-            var groupValue = sortKey switch
-            {
-                SortPublisher => string.IsNullOrWhiteSpace(issue.Publisher) ? "(Unknown Publisher)" : issue.Publisher,
-                SortFoc => issue.FocDate?.ToString("MMMM yyyy") ?? "(No FOC Date)",
-                SortTitle => issue.Series.Name,
-                _ => issue.ReleaseDate?.ToString("MMMM yyyy") ?? "(No Release Date)"
-            };
+            var groupValue = GroupLabelFor(issue, sortKey);
 
-            if (sortKey != SortTitle && groupValue != lastGroupValue)
+            // Skip the inline group header once a single month tab has
+            // already narrowed the list to just that month - repeating
+            // the same label as a row above every single item would be
+            // pure noise.
+            var showInlineHeader = sortKey != SortTitle && !(monthCapableSort && _selectedMonthLabel != null);
+            if (showInlineHeader && groupValue != lastGroupValue)
             {
                 var headerIndex = grid.Rows.Add();
                 var headerRow = grid.Rows[headerIndex];
@@ -261,19 +411,94 @@ public class AutoFetchControl : UserControl
             row.Cells["Foc"].Value = issue.FocDate?.ToString("MM/dd/yyyy") ?? "";
             row.Cells["Release"].Value = issue.ReleaseDate?.ToString("MM/dd/yyyy") ?? "";
 
+            // The real Issue, not a re-parsed display string - double-click
+            // (Grid_CellDoubleClick) opens the detail popup straight off
+            // this, the same "row.Tag holds the real entity" pattern
+            // Inventory's drill-down grids already use.
+            row.Tag = issue;
+
+            Image? coverImage = null;
             var coverWithImage = issue.Covers.FirstOrDefault(c => !string.IsNullOrWhiteSpace(c.CoverImagePath) && File.Exists(c.CoverImagePath));
             if (coverWithImage != null)
             {
                 try
                 {
                     using var fs = new FileStream(coverWithImage.CoverImagePath!, FileMode.Open, FileAccess.Read);
-                    row.Cells["Cover"].Value = Image.FromStream(fs);
+                    coverImage = Image.FromStream(fs);
                 }
                 catch
                 {
-                    // Missing/corrupt cached image - just show no thumbnail for this row.
+                    // Missing/corrupt cached image - fall through to the placeholder below.
                 }
             }
+
+            // A plain "No Cover" tile instead of leaving the cell blank -
+            // DataGridViewImageColumn draws its own broken-image red X for
+            // a blank Image cell, which reads as a bug even when it just
+            // means "Comic Vine doesn't catalog this one" (true for most
+            // collected editions/TPs/HCs - there's no art to have here).
+            row.Cells["Cover"].Value = coverImage ?? NoCoverThumbnail;
         }
+    }
+
+    private void RebuildMonthTabs(List<string> monthLabels)
+    {
+        // Chronological, not alphabetical - "February 2027" would
+        // otherwise sort before "January 2027". Re-parsing "MMMM yyyy"
+        // back into a date is the simplest way to get that order from
+        // what's already just a display string.
+        var chronological = monthLabels
+            .OrderBy(label => DateTime.TryParseExact(label, "MMMM yyyy", CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt) ? dt : DateTime.MaxValue)
+            .ToList();
+
+        // Only rebuild the actual button controls when the set of months
+        // on offer changed (a fresh Check Now, or the search box narrowing
+        // what's visible) - rebuilding on every click just to re-highlight
+        // the selection would flicker and steal keyboard focus for no reason.
+        if (!chronological.SequenceEqual(_lastMonthTabLabels))
+        {
+            monthTabsPanel.Controls.Clear();
+            monthTabsPanel.Controls.Add(BuildMonthTabButton("All", null));
+            foreach (var label in chronological)
+                monthTabsPanel.Controls.Add(BuildMonthTabButton(label, label));
+            _lastMonthTabLabels = chronological;
+
+            // The previously-selected month might not be on offer anymore
+            // (it emptied out, or the search box just filtered it away) -
+            // fall back to "All" instead of silently showing zero rows.
+            if (_selectedMonthLabel != null && !chronological.Contains(_selectedMonthLabel))
+                _selectedMonthLabel = null;
+        }
+
+        foreach (Control c in monthTabsPanel.Controls)
+            if (c is Button btn) HighlightMonthTabButton(btn);
+    }
+
+    private Button BuildMonthTabButton(string text, string? monthLabel)
+    {
+        var btn = new Button { Text = text, AutoSize = true, Margin = new Padding(4, 4, 0, 4), Tag = monthLabel };
+        UiTheme.StyleButton(btn);
+        btn.Click += (s, e) =>
+        {
+            _selectedMonthLabel = monthLabel;
+            RefreshGrid();
+        };
+        return btn;
+    }
+
+    private void HighlightMonthTabButton(Button btn)
+    {
+        var isSelected = Equals(btn.Tag as string, _selectedMonthLabel);
+        btn.BackColor = isSelected ? UiTheme.PrimaryAccent : UiTheme.NeutralButton;
+        btn.ForeColor = isSelected ? Color.White : UiTheme.TextPrimary;
+    }
+
+    private void Grid_CellDoubleClick(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (e.RowIndex < 0) return;
+        if (grid.Rows[e.RowIndex].Tag is not Issue issue) return;
+
+        using var form = new NewBookDetailForm(issue);
+        form.ShowDialog(FindForm());
     }
 }
