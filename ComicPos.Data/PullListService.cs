@@ -22,6 +22,15 @@ public class PullListService : IPullListService
             .ToList();
     }
 
+    public List<PullListEntry> GetForSeries(int seriesId)
+    {
+        return _db.PullListEntries
+            .Include(p => p.Customer)
+            .Where(p => p.SeriesId == seriesId && p.IsActive)
+            .OrderBy(p => p.Customer.Name)
+            .ToList();
+    }
+
     // Normalizes whatever the UI sends into something that can't corrupt a
     // row: a blank/invalid cover always falls back to "A" rather than ever
     // being saved empty, and quantity can never go below 1 (a 0 or
