@@ -1,0 +1,67 @@
+@* Read-only "what is this book" popup - web port of NewBookDetailForm.cs.
+   Opened from a New Books row; editing covers/barcodes/stock happens on
+   the Inventory page once a book has actually arrived, same as desktop. *@
+@namespace ComicPos.Web.Components.Shared
+@using ComicPos.Core.Models
+
+<Modal Show="Show" Title="@Title" OnBackdropClick="Close" ExtraClass="modal-xwide">
+    @if (Issue != null)
+    {
+        <p class="help-text">@SubLine</p>
+        <p class="list-row-title">@(Issue.Covers.Count == 1 ? "Cover" : $"Covers ({Issue.Covers.Count})")</p>
+        <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px">
+            @foreach (var cover in Issue.Covers.OrderBy(c => c.CoverLetter))
+            {
+                <div class="panel" style="width:170px">
+                    <img src="@(HasImage(cover) ? $"/api/cover-image/{cover.Id}" : "/img/no-cover.svg")"
+                         class="cover-thumb-lg" style="cursor:pointer;width:100%;height:200px"
+                         onerror="this.onerror=null;this.src='/img/no-cover.svg';"
+                         @onclick="@(() => OpenZoom(cover))" />
+                    <p style="font-weight:600;margin:8px 0 2px">@(cover.CoverLetter == "A" ? "Cover A (main)" : $"Cover {cover.CoverLetter}")</p>
+                    <p class="help-text" style="margin:0 0 6px">@(cover.Price > 0 ? cover.Price.ToString("C") : "Price not set yet")</p>
+                    <p style="font-size:13px;color:var(--text-muted)">@(string.IsNullOrWhiteSpace(cover.Description) ? "No description available yet." : cover.Description)</p>
+                </div>
+            }
+        </div>
+    }
+    <div class="form-actions">
+        <button class="btn-ghost" @onclick="Close">Close</button>
+    </div>
+</Modal>
+
+<ImageZoomOverlay Src="@_zoomSrc" Title="@_zoomTitle" OnClose="@(() => _zoomSrc = null)" />
+
+@code {
+    [Parameter] public bool Show { get; set; }
+    [Parameter] public Issue? Issue { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    private string? _zoomSrc;
+    private string _zoomTitle = "";
+
+    private string Title => Issue == null ? "" : $"{Issue.Series.Name} #{Issue.IssueNumber:0.##}";
+
+    private string SubLine
+    {
+        get
+        {
+            if (Issue == null) return "";
+            var parts = new List<string>();
+            if (!string.IsNullOrWhiteSpace(Issue.Publisher)) parts.Add(Issue.Publisher);
+            parts.Add(Issue.Type == IssueType.CollectedEdition ? "Collected Edition" : "Single Issue");
+            if (Issue.FocDate != null) parts.Add($"FOC {Issue.FocDate:MM/dd/yyyy}");
+            if (Issue.ReleaseDate != null) parts.Add($"Street {Issue.ReleaseDate:MM/dd/yyyy}");
+            return string.Join("   •   ", parts);
+        }
+    }
+
+    private static bool HasImage(Cover cover) => !string.IsNullOrWhiteSpace(cover.CoverImagePath) && File.Exists(cover.CoverImagePath);
+
+    private async Task Close() => await OnClose.InvokeAsync();
+
+    private void OpenZoom(Cover cover)
+    {
+        _zoomSrc = HasImage(cover) ? $"/api/cover-image/{cover.Id}" : "/img/no-cover.svg";
+        _zoomTitle = cover.CoverLetter == "A" ? "Cover A (main)" : $"Cover {cover.CoverLetter}";
+    }
+}
