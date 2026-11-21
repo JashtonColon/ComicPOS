@@ -1,0 +1,117 @@
+@page "/import"
+@using ComicPos.Core.Services
+@inject IImportService ImportService
+@rendermode InteractiveServer
+
+<PageTitle>Import - Comic POS</PageTitle>
+
+<div class="page-header">
+    <h1>Import</h1>
+</div>
+
+<p class="help-text">
+    Import new comics from a solicitation CSV, or receive a shipment of comics already in the system.<br />
+    Required columns: Series, IssueNumber, Barcode. Optional: StartYear, Publisher, CoverLetter, Price, FocDate, ReleaseDate, Type (SingleIssue/CollectedEdition), ReceivedQty.<br />
+    ReceivedQty adds to stock (0 if omitted - solicited but not arrived yet). Re-importing the same file is safe - existing series/issues/covers are matched and updated, never duplicated.
+</p>
+
+<div class="toolbar">
+    <InputFile OnChange="OnFileSelected" accept=".csv" />
+    <button class="btn-primary" disabled="@(!_canImport)" @onclick="RunImport">Run Import</button>
+</div>
+
+@if (_error != null)
+{
+    <p class="error-text">@_error</p>
+}
+
+@if (_resultText != null)
+{
+    <pre class="receipt-body">@_resultText</pre>
+}
+
+@code {
+    private string? _selectedFileName;
+    private string? _tempFilePath;
+    private bool _canImport;
+    private string? _error;
+    private string? _resultText;
+
+    private async Task OnFileSelected(InputFileChangeEventArgs e)
+    {
+        _error = null;
+        _resultText = null;
+        _canImport = false;
+
+        try
+        {
+            var file = e.File;
+            _selectedFileName = file.Name;
+
+            var tempPath = Path.Combine(Path.GetTempPath(), $"comicpos-import-{Guid.NewGuid():N}.csv");
+            await using (var stream = File.Create(tempPath))
+            {
+                await file.OpenReadStream(maxAllowedSize: 20 * 1024 * 1024).CopyToAsync(stream);
+            }
+
+            _tempFilePath = tempPath;
+            _canImport = true;
+        }
+        catch (Exception ex)
+        {
+            _error = $"Couldn't read that file: {ex.Message}";
+        }
+    }
+
+    private void RunImport()
+    {
+        if (_tempFilePath == null) return;
+        _error = null;
+
+        try
+        {
+            var summary = ImportService.ImportFromCsv(_tempFilePath);
+
+            var lines = new List<string>
+            {
+                $"Imported: {_selectedFileName}",
+                "",
+                $"Series created:   {summary.SeriesCreated}",
+                $"Issues created:   {summary.IssuesCreated}",
+                $"Covers created:   {summary.CoversCreated}",
+                $"Covers updated:   {summary.CoversUpdated}",
+                ""
+            };
+
+            if (summary.Errors.Count > 0)
+            {
+                lines.Add($"Warnings/errors ({summary.Errors.Count}):");
+                lines.AddRange(summary.Errors);
+            }
+            else
+            {
+                lines.Add("No errors.");
+            }
+
+            _resultText = string.Join(Environment.NewLine, lines);
+        }
+        catch (Exception ex)
+        {
+            _error = $"Import failed: {ex.Message}";
+        }
+        finally
+        {
+            try
+            {
+                if (_tempFilePath != null) File.Delete(_tempFilePath);
+            }
+            catch
+            {
+                // Best-effort cleanup only - a leftover temp file here
+                // isn't worth surfacing an error over.
+            }
+            _tempFilePath = null;
+            _canImport = false;
+        }
+    }
+}
