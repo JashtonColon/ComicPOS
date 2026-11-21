@@ -24,4 +24,16 @@ public class StoreSettings
     // searches EVERY publisher on Comic Vine (including manga/small press)
     // for brand-new series launches. Blank/null = no filter, include all.
     public string? TrackedPublishers { get; set; }
+
+    // On by default, unlike the FOC auto-email opt-in - a background
+    // database backup has no outside-facing side effect to ask permission
+    // for first (nothing sent anywhere, no email, no cost), so the safer
+    // default is backups existing without anyone having to think to turn
+    // it on. See MainForm's hourly tick / BackupService.
+    public bool AutoBackupEnabled { get; set; } = true;
+
+    // When the app last backed up the database on its own - separate from
+    // a person clicking "Backup Database Now" in Settings, which always
+    // runs regardless of this timestamp.
+    public DateTime? LastAutoBackupAt { get; set; }
 }
