@@ -10,6 +10,18 @@ public interface IInventoryService
     List<Issue> GetIssuesForSeries(string seriesName, IssueType type);
     List<Series> GetAllSeriesForDisplay();
     List<Series> SearchSeriesForDisplay(string text);
+
+    // Exact-name lookup for when a screen already has a series' display
+    // name (e.g. from the Inventory drill-down) and needs its real Id -
+    // for example to look up who has it on their pull list.
+    Series? GetSeriesByName(string name);
+
+    // Every distinct cover letter seen across every issue this store has
+    // on file for a series (single issues and collected editions alike) -
+    // so a "which cover do you want" field can show real options instead
+    // of a blind free-text box with no idea what this series actually
+    // comes in.
+    List<string> GetKnownCoverLetters(int seriesId);
     void UpdateCover(Cover cover);
 
     // Call after UpdateCover (or any other save through this service)
