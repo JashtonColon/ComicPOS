@@ -1,0 +1,14 @@
+@namespace ComicPos.Web.Components.Shared
+
+@if (!string.IsNullOrWhiteSpace(Src))
+{
+    <div class="zoom-overlay" @onclick="@(() => OnClose.InvokeAsync())">
+        <img src="@Src" alt="@Title" />
+    </div>
+}
+
+@code {
+    [Parameter] public string? Src { get; set; }
+    [Parameter] public string Title { get; set; } = "";
+    [Parameter] public EventCallback OnClose { get; set; }
+}
