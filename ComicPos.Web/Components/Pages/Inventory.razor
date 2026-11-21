@@ -1,0 +1,376 @@
+@page "/inventory"
+@using ComicPos.Core.Models
+@using ComicPos.Core.Services
+@inject IInventoryService InventoryService
+@inject IPullListService PullLists
+@inject IIssueHoldService IssueHolds
+@rendermode InteractiveServer
+
+<PageTitle>Inventory - Comic POS</PageTitle>
+
+<div class="page-header">
+    <h1>Inventory</h1>
+</div>
+
+<div class="toolbar">
+    <input type="text" class="search-box" placeholder="Search series name..." value="@_search" @oninput="OnSearchInput" />
+    <button class="btn-primary" @onclick="OpenAddItem">+ Add New Item</button>
+</div>
+
+<div class="breadcrumb">
+    @if (_level > 0)
+    {
+        <button class="btn-ghost btn-sm" @onclick="GoBack">&larr; Back</button>
+    }
+    <h1>@BreadcrumbText</h1>
+</div>
+
+@if (_saveError != null)
+{
+    <p class="error-text">@_saveError</p>
+}
+
+@if (_level == 2)
+{
+    <div class="btn-row" style="margin-bottom:12px">
+        <button class="btn-ghost btn-sm" @onclick="OpenSubscribers">Who's Pulling This?</button>
+    </div>
+}
+
+@if (_level == 3)
+{
+    <p class="help-text">@_holdsLabel</p>
+}
+
+@if (_level == 0)
+{
+    @if (_seriesRows.Count == 0)
+    {
+        <p class="empty-state">No series found.</p>
+    }
+    else
+    {
+        <div class="list-rows">
+            @foreach (var s in _seriesRows)
+            {
+                <div class="list-row" style="cursor:pointer" @onclick="@(() => GoToTypeChoice(s.Name))">
+                    <div class="list-row-main">
+                        <span class="list-row-title">@s.Name</span>
+                        <span class="list-row-sub">@s.StartYear</span>
+                    </div>
+                </div>
+            }
+        </div>
+    }
+}
+else if (_level == 1)
+{
+    <div class="list-rows">
+        <div class="list-row" style="cursor:pointer" @onclick="@(() => GoToIssueList(IssueType.SingleIssue))">
+            <div class="list-row-main"><span class="list-row-title">Single Issues</span></div>
+        </div>
+        <div class="list-row" style="cursor:pointer" @onclick="@(() => GoToIssueList(IssueType.CollectedEdition))">
+            <div class="list-row-main"><span class="list-row-title">Collected Editions</span></div>
+        </div>
+    </div>
+}
+else if (_level == 2)
+{
+    @if (_issueRows.Count == 0)
+    {
+        <p class="empty-state">No issues on file for this series/type yet.</p>
+    }
+    else
+    {
+        <table class="pos-table">
+            <thead>
+                <tr><th>Issue #</th><th>Publisher</th><th>Release Date</th><th>FOC Date</th><th>Covers</th><th>Total Stock</th></tr>
+            </thead>
+            <tbody>
+                @foreach (var issue in _issueRows)
+                {
+                    <tr style="cursor:pointer" @onclick="@(() => GoToCoverDetail(issue))">
+                        <td>@issue.IssueNumber.ToString("0.##")</td>
+                        <td>@issue.Publisher</td>
+                        <td>@(issue.ReleaseDate?.ToString("MM/dd/yyyy") ?? "—")</td>
+                        <td>@(issue.FocDate?.ToString("MM/dd/yyyy") ?? "—")</td>
+                        <td>@issue.Covers.Count</td>
+                        <td>@issue.Covers.Sum(c => c.StockQuantity)</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+}
+else if (_level == 3)
+{
+    @if (_coverRows.Count == 0)
+    {
+        <p class="empty-state">No cover variants on file for this issue yet.</p>
+    }
+    else
+    {
+        <table class="pos-table">
+            <thead>
+                <tr><th></th><th>Cover</th><th>Barcode</th><th>Price</th><th>Stock</th><th>Description</th><th></th></tr>
+            </thead>
+            <tbody>
+                @foreach (var row in _coverRows)
+                {
+                    <tr>
+                        <td>
+                            <img class="cover-thumb" src="/api/cover-image/@row.Cover.Id" alt="cover"
+                                 style="cursor:pointer"
+                                 onerror="this.onerror=null;this.src='/img/no-cover.svg';"
+                                 @onclick="@(() => OpenZoom(row.Cover.Id))" />
+                        </td>
+                        <td>@row.Cover.CoverLetter</td>
+                        <td><input type="text" value="@row.Barcode" @onchange="e => SaveBarcode(row, e.Value?.ToString() ?? string.Empty)" /></td>
+                        <td><input type="text" style="width:70px" value="@row.Price" @onchange="e => SavePrice(row, e.Value?.ToString() ?? string.Empty)" /></td>
+                        <td><input type="text" style="width:60px" value="@row.Stock" @onchange="e => SaveStock(row, e.Value?.ToString() ?? string.Empty)" /></td>
+                        <td><input type="text" value="@row.Description" @onchange="e => SaveDescription(row, e.Value?.ToString() ?? string.Empty)" /></td>
+                        <td><button class="btn-ghost btn-sm" @onclick="@(() => OpenHoldCopy(row.Cover.CoverLetter))">Hold</button></td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+}
+
+<AddItemModal Show="_showAddItem" OnSaved="OnAddItemSaved" OnClose="@(() => _showAddItem = false)" />
+
+<HoldCopyModal Show="_showHold" IssueLabel="@HoldIssueLabel" KnownCoverLetters="_knownCoverLetters"
+               DefaultCoverLetter="@_holdDefaultCover" OnSave="OnHoldSave" OnClose="@(() => _showHold = false)" />
+
+<SubscribersModal Show="_showSubscribers" Entries="_subscriberEntries" OnClose="@(() => _showSubscribers = false)" />
+
+<ImageZoomOverlay Src="@_zoomSrc" Title="Cover" OnClose="@(() => _zoomSrc = null)" />
+
+@code {
+    // Drill-down depth, same four stops as the desktop InventoryControl:
+    // 0 = All Series, 1 = Choose Type, 2 = Issue List, 3 = Cover Detail.
+    private int _level;
+    private string _search = "";
+    private string? _seriesName;
+    private IssueType? _type;
+    private int? _issueId;
+    private float? _issueNumber;
+
+    private List<Series> _seriesRows = new();
+    private List<Issue> _issueRows = new();
+    private List<CoverRow> _coverRows = new();
+    private string _holdsLabel = "";
+    private string? _saveError;
+
+    private bool _showAddItem;
+    private bool _showHold;
+    private bool _showSubscribers;
+    private string? _zoomSrc;
+
+    private List<string> _knownCoverLetters = new();
+    private string _holdDefaultCover = "A";
+    private List<PullListEntry> _subscriberEntries = new();
+
+    private class CoverRow
+    {
+        public Cover Cover { get; set; } = null!;
+        public string Barcode { get; set; } = "";
+        public string Price { get; set; } = "";
+        public string Stock { get; set; } = "";
+        public string Description { get; set; } = "";
+    }
+
+    protected override void OnInitialized() => LoadSeriesList();
+
+    private string BreadcrumbText => _level switch
+    {
+        0 => "All Series",
+        1 => $"{_seriesName} — Choose Type",
+        2 => $"{_seriesName} — {(_type == IssueType.SingleIssue ? "Single Issues" : "Collected Editions")}",
+        3 => $"{_seriesName} #{_issueNumber:0.##} — Covers (edit a field and click away to save; set the real Barcode here when a book from New Books arrives)",
+        _ => ""
+    };
+
+    private string HoldIssueLabel => $"{_seriesName} #{_issueNumber:0.##}";
+
+    private void OnSearchInput(ChangeEventArgs e)
+    {
+        _search = e.Value?.ToString() ?? "";
+        LoadSeriesList();
+    }
+
+    private void LoadSeriesList()
+    {
+        _level = 0;
+        _seriesName = null;
+        _type = null;
+        _issueId = null;
+        _issueNumber = null;
+        _saveError = null;
+        _seriesRows = InventoryService.SearchSeriesForDisplay(_search);
+    }
+
+    private void GoToTypeChoice(string seriesName)
+    {
+        _level = 1;
+        _seriesName = seriesName;
+        _type = null;
+        _issueId = null;
+        _issueNumber = null;
+        _saveError = null;
+    }
+
+    private void GoToIssueList(IssueType type)
+    {
+        _level = 2;
+        _type = type;
+        _issueId = null;
+        _issueNumber = null;
+        _saveError = null;
+        _issueRows = InventoryService.GetIssuesForSeries(_seriesName!, type).OrderBy(i => i.IssueNumber).ToList();
+    }
+
+    private void GoToCoverDetail(Issue issue)
+    {
+        _level = 3;
+        _issueId = issue.Id;
+        _issueNumber = issue.IssueNumber;
+        _saveError = null;
+        LoadCoverDetail();
+    }
+
+    private void LoadCoverDetail()
+    {
+        var issues = InventoryService.GetIssuesForSeries(_seriesName!, _type!.Value);
+        var issue = issues.FirstOrDefault(i => i.Id == _issueId);
+        _coverRows = issue == null
+            ? new List<CoverRow>()
+            : issue.Covers.OrderBy(c => c.CoverLetter).Select(c => new CoverRow
+            {
+                Cover = c,
+                Barcode = c.Barcode,
+                Price = c.Price.ToString("0.00"),
+                Stock = c.StockQuantity.ToString(),
+                Description = c.Description ?? ""
+            }).ToList();
+
+        RefreshHoldsLabel();
+    }
+
+    private void RefreshHoldsLabel()
+    {
+        if (_issueId == null) { _holdsLabel = ""; return; }
+        var holds = IssueHolds.GetOutstandingForIssue(_issueId.Value);
+        _holdsLabel = holds.Count == 0
+            ? "No outstanding holds on this issue."
+            : "Held for: " + string.Join(", ", holds.Select(h => $"{h.Customer.Name} (x{h.Quantity}, cover {h.CoverLetter})"));
+    }
+
+    private void GoBack()
+    {
+        if (_level == 3) GoToIssueList(_type!.Value);
+        else if (_level == 2) GoToTypeChoice(_seriesName!);
+        else if (_level == 1) LoadSeriesList();
+    }
+
+    private void OpenAddItem() => _showAddItem = true;
+
+    private void OnAddItemSaved()
+    {
+        _showAddItem = false;
+        _search = "";
+        LoadSeriesList();
+    }
+
+    private void OpenSubscribers()
+    {
+        if (_seriesName == null) return;
+        var series = InventoryService.GetSeriesByName(_seriesName);
+        if (series == null) return;
+        _subscriberEntries = PullLists.GetForSeries(series.Id);
+        _showSubscribers = true;
+    }
+
+    private void OpenHoldCopy(string defaultCover)
+    {
+        if (_seriesName == null) return;
+        var series = InventoryService.GetSeriesByName(_seriesName);
+        _knownCoverLetters = series != null ? InventoryService.GetKnownCoverLetters(series.Id) : new List<string>();
+        _holdDefaultCover = defaultCover;
+        _showHold = true;
+    }
+
+    private void OnHoldSave((int CustomerId, string CoverLetter, int Quantity, string? Notes) result)
+    {
+        if (_issueId == null) return;
+        IssueHolds.CreateHold(result.CustomerId, _issueId.Value, result.CoverLetter, result.Quantity, result.Notes);
+        _showHold = false;
+        RefreshHoldsLabel();
+    }
+
+    private void OpenZoom(int coverId) => _zoomSrc = $"/api/cover-image/{coverId}";
+
+    private void SaveBarcode(CoverRow row, string newValue)
+    {
+        _saveError = null;
+        var trimmed = newValue.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            _saveError = "Barcode can't be blank.";
+            LoadCoverDetail();
+            return;
+        }
+
+        var previous = row.Cover.Barcode;
+        var changed = trimmed != previous;
+        row.Cover.Barcode = trimmed;
+        SaveCover(row.Cover, changed, previous);
+    }
+
+    private void SavePrice(CoverRow row, string newValue)
+    {
+        _saveError = null;
+        if (decimal.TryParse(newValue, out var price) && price >= 0)
+            row.Cover.Price = price;
+        SaveCover(row.Cover, false, row.Cover.Barcode);
+    }
+
+    private void SaveStock(CoverRow row, string newValue)
+    {
+        _saveError = null;
+        if (int.TryParse(newValue, out var stock) && stock >= 0)
+            row.Cover.StockQuantity = stock;
+        SaveCover(row.Cover, false, row.Cover.Barcode);
+    }
+
+    private void SaveDescription(CoverRow row, string newValue)
+    {
+        _saveError = null;
+        row.Cover.Description = string.IsNullOrWhiteSpace(newValue) ? null : newValue;
+        SaveCover(row.Cover, false, row.Cover.Barcode);
+    }
+
+    // Mirrors Grid_CellEndEdit's save-and-revert-on-duplicate-barcode
+    // logic from the desktop app, then always reloads the row list so the
+    // displayed text matches whatever actually ended up saved (including
+    // silently-ignored invalid Price/Stock input, which never touches the
+    // entity, and a reverted barcode after a save failure).
+    private void SaveCover(Cover cover, bool barcodeChanged, string previousBarcode)
+    {
+        try
+        {
+            InventoryService.UpdateCover(cover);
+        }
+        catch (Exception)
+        {
+            if (barcodeChanged)
+                cover.Barcode = previousBarcode;
+            InventoryService.ClearFailedChanges();
+            _saveError = barcodeChanged
+                ? "That barcode is already used by another item. Double-check the book and try again."
+                : "Couldn't save that change.";
+        }
+
+        LoadCoverDetail();
+    }
+}
