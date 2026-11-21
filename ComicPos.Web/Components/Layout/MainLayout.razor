@@ -1,0 +1,31 @@
+@namespace ComicPos.Web.Components.Layout
+@inherits LayoutComponentBase
+
+<div class="pos-shell">
+    <nav class="pos-sidebar">
+        <div class="pos-brand">Comic<span>POS</span></div>
+
+        <div class="pos-nav-group">
+            <NavLink href="" Match="NavLinkMatch.All" class="pos-nav-item">Dashboard</NavLink>
+            <NavLink href="inventory" class="pos-nav-item">Inventory</NavLink>
+            <NavLink href="checkout" class="pos-nav-item">Checkout</NavLink>
+            <NavLink href="history" class="pos-nav-item">History</NavLink>
+            <NavLink href="customers" class="pos-nav-item">Customers</NavLink>
+        </div>
+
+        <div class="pos-nav-group">
+            <div class="pos-nav-heading">Stock</div>
+            <NavLink href="import" class="pos-nav-item">Import</NavLink>
+            <NavLink href="new-books" class="pos-nav-item">New Books</NavLink>
+            <NavLink href="foc-report" class="pos-nav-item">FOC Report</NavLink>
+        </div>
+
+        <div class="pos-nav-group pos-nav-group-bottom">
+            <NavLink href="settings" class="pos-nav-item">Settings</NavLink>
+        </div>
+    </nav>
+
+    <main class="pos-main">
+        @Body
+    </main>
+</div>
