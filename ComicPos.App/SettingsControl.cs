@@ -31,6 +31,7 @@ public class SettingsControl : UserControl
     private readonly TextBox txtFocReportDaysAhead = new();
     private readonly TextBox txtComicVineApiKey = new();
     private readonly TextBox txtTrackedPublishers = new();
+    private readonly CheckBox chkAutoBackup = new();
     private readonly Button btnSave = new();
     private readonly Button btnBackup = new();
     private readonly Label lblStatus = new();
@@ -155,6 +156,19 @@ public class SettingsControl : UserControl
         layout.Controls.Add(tpHelp, 1, layout.RowStyles.Count);
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
 
+        AddSectionHeader("Backups");
+        AddRow("Automatically back up daily:", chkAutoBackup);
+        var backupHelp = new Label
+        {
+            Dock = DockStyle.Fill,
+            ForeColor = UiTheme.TextMuted,
+            TextAlign = ContentAlignment.TopLeft,
+            Text = "Saved to a Backups folder next to the database, keeping the most recent 30. \"Backup Database Now\" below always runs regardless of this setting."
+        };
+        layout.Controls.Add(new Label(), 0, layout.RowStyles.Count);
+        layout.Controls.Add(backupHelp, 1, layout.RowStyles.Count);
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+
         btnSave.Text = "Save Settings";
         btnSave.Width = 130;
         btnSave.Height = 34;
@@ -257,6 +271,7 @@ public class SettingsControl : UserControl
 
         txtComicVineApiKey.Text = store.ComicVineApiKey ?? "";
         txtTrackedPublishers.Text = store.TrackedPublishers ?? "";
+        chkAutoBackup.Checked = store.AutoBackupEnabled;
     }
 
     private void BtnSave_Click(object? sender, EventArgs e)
@@ -282,11 +297,15 @@ public class SettingsControl : UserControl
             LogoPath = _logoPath,
             ComicVineApiKey = string.IsNullOrWhiteSpace(txtComicVineApiKey.Text) ? null : txtComicVineApiKey.Text.Trim(),
             TrackedPublishers = string.IsNullOrWhiteSpace(txtTrackedPublishers.Text) ? null : txtTrackedPublishers.Text.Trim(),
-            // Preserve this - it's not editable here, and overwriting it with
-            // null on every settings save would make the weekly New Books
-            // check think it's never run, forcing an extra check on the next
-            // startup/Sunday tick (same bug class as LastFocReportSentAt below).
-            LastAutoFetchRun = _storeSettingsService.Load().LastAutoFetchRun
+            AutoBackupEnabled = chkAutoBackup.Checked,
+            // Preserve these - neither is editable here, and overwriting
+            // them with null/default on every settings save would make the
+            // weekly New Books check and the daily auto-backup both think
+            // they've never run, forcing an extra one on the very next
+            // startup/hourly tick (same bug class as LastFocReportSentAt
+            // a few lines down for the email side).
+            LastAutoFetchRun = _storeSettingsService.Load().LastAutoFetchRun,
+            LastAutoBackupAt = _storeSettingsService.Load().LastAutoBackupAt
         });
 
         _emailSettingsService.Save(new EmailSettings
