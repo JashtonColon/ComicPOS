@@ -137,6 +137,25 @@
 </div>
 
 <div class="panel" style="margin-top:16px">
+    <p class="list-row-title" style="margin-bottom:10px">Cover Art Fallback (Metron)</p>
+    <div class="form-row">
+        <label>Metron Username:</label>
+        <input type="text" value="@_metronUsername" @oninput="e => _metronUsername = e.Value?.ToString() ?? string.Empty" />
+    </div>
+    <div class="form-row">
+        <label>Metron Password:</label>
+        <input type="password" value="@_metronPassword" @oninput="e => _metronPassword = e.Value?.ToString() ?? string.Empty" />
+    </div>
+    <p class="help-text">
+        Free account at metron.cloud - a third, independent source "Re-scan Existing" tries for cover art when Comic
+        Vine and GCD both come up empty for an issue. Optional: leave blank to skip it entirely (GCD and Comic Vine
+        alone will still cover most of a typical catalog). Note: metron.cloud's own site has blocked automated
+        requests with bot-protection during our own testing - if Re-scan's log shows Metron failing for that reason,
+        it just means this source didn't work out, not that something here is broken.
+    </p>
+</div>
+
+<div class="panel" style="margin-top:16px">
     <p class="list-row-title" style="margin-bottom:10px">Backups</p>
     <div class="form-row">
         <label style="display:flex;align-items:center;gap:8px;font-weight:400">
@@ -187,6 +206,8 @@
 
     private string _comicVineApiKey = "";
     private string _trackedPublishers = "";
+    private string _metronUsername = "";
+    private string _metronPassword = "";
     private bool _autoBackup = true;
 
     private string? _error;
@@ -206,6 +227,8 @@
         _logoPath = store.LogoPath;
         _comicVineApiKey = store.ComicVineApiKey ?? "";
         _trackedPublishers = store.TrackedPublishers ?? "";
+        _metronUsername = store.MetronUsername ?? "";
+        _metronPassword = store.MetronPassword ?? "";
         _autoBackup = store.AutoBackupEnabled;
 
         var email = EmailSettingsService.Load();
@@ -288,6 +311,8 @@
             LogoPath = _logoPath,
             ComicVineApiKey = string.IsNullOrWhiteSpace(_comicVineApiKey) ? null : _comicVineApiKey.Trim(),
             TrackedPublishers = string.IsNullOrWhiteSpace(_trackedPublishers) ? null : _trackedPublishers.Trim(),
+            MetronUsername = string.IsNullOrWhiteSpace(_metronUsername) ? null : _metronUsername.Trim(),
+            MetronPassword = string.IsNullOrWhiteSpace(_metronPassword) ? null : _metronPassword,
             AutoBackupEnabled = _autoBackup,
             LastAutoFetchRun = currentStore.LastAutoFetchRun,
             LastAutoBackupAt = currentStore.LastAutoBackupAt
