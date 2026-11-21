@@ -24,10 +24,14 @@ public class FocReportControl : UserControl
 
         Dock = DockStyle.Fill;
 
-        topPanel = new Panel { Dock = DockStyle.Top, Height = 40 };
+        // Grown from 40, same reason as ImportControl's topPanel - the
+        // taller, rounded buttons (UiTheme.StyleButton) need more room,
+        // and "Send Email to Admin" is long enough at the new bold font
+        // to risk outgrowing a too-tight hardcoded Width.
+        topPanel = new Panel { Dock = DockStyle.Top, Height = 56, Padding = new Padding(0, 8, 0, 8) };
 
         btnSendEmail.Dock = DockStyle.Right;
-        btnSendEmail.Width = 150;
+        btnSendEmail.Width = 175;
         btnSendEmail.Text = "Send Email to Admin";
         btnSendEmail.Click += BtnSendEmail_Click;
         btnSendEmail.Tag = "primary";
