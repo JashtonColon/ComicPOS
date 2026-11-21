@@ -1,0 +1,136 @@
+@page "/foc-report"
+@using ComicPos.Core.Services
+@inject IFocReportService FocReportService
+@inject IEmailService Email
+@inject IEmailSettingsService EmailSettingsService
+@rendermode InteractiveServer
+
+<PageTitle>FOC Report - Comic POS</PageTitle>
+
+<div class="page-header">
+    <h1>FOC Report</h1>
+</div>
+
+<div class="toolbar">
+    <div style="display:flex;gap:10px;align-items:center">
+        <label style="font-size:13px;color:var(--text-muted)">Days ahead:</label>
+        <input type="text" style="width:60px;text-align:center" value="@_daysAhead" @oninput="e => _daysAhead = e.Value?.ToString() ?? string.Empty" />
+        <button class="btn-ghost btn-sm" @onclick="Generate">Generate</button>
+    </div>
+    <button class="btn-primary" @onclick="SendEmail">Send Email to Admin</button>
+</div>
+
+@if (_error != null)
+{
+    <p class="error-text">@_error</p>
+}
+@if (_message != null)
+{
+    <p class="help-text" style="background:var(--accent-soft);padding:8px 12px;border-radius:8px">@_message</p>
+}
+
+@if (_entries.Count == 0)
+{
+    <p class="empty-state">No subscribers waiting on anything in this window.</p>
+}
+else
+{
+    <table class="pos-table">
+        <thead><tr><th>FOC Date</th><th>Series</th><th>Issue #</th><th>Buy Qty</th></tr></thead>
+        <tbody>
+            @foreach (var entry in _entries)
+            {
+                <tr style="cursor:pointer" @onclick="@(() => OpenDetail(entry))">
+                    <td>@(entry.FocDate?.ToString("MM/dd/yyyy") ?? "")</td>
+                    <td>@entry.SeriesName (@entry.StartYear)</td>
+                    <td>@entry.IssueNumber.ToString("0.##")</td>
+                    <td>@entry.TotalQuantity</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@if (_detailEntry != null)
+{
+    <Modal Show="true" Title="@($"{_detailEntry.SeriesName} #{_detailEntry.IssueNumber:0.##} - {_detailEntry.TotalQuantity} to buy")"
+           OnBackdropClick="@(() => _detailEntry = null)" ExtraClass="modal-wide">
+        <p class="help-text">
+            Covers on file for this issue:
+            @(_detailEntry.AvailableCoverLetters.Count > 0 ? string.Join(", ", _detailEntry.AvailableCoverLetters) : "(none on file yet)")
+        </p>
+        <div class="list-rows">
+            @foreach (var s in _detailEntry.Subscribers)
+            {
+                <div class="list-row">
+                    <div class="list-row-main">
+                        <span class="list-row-title">@s.CustomerName</span>
+                        <span class="list-row-sub">@SubscriberSubtext(s)</span>
+                    </div>
+                    @if (!s.CoverIsAvailable)
+                    {
+                        <span class="badge badge-warn">check cover</span>
+                    }
+                </div>
+            }
+        </div>
+        <div class="form-actions">
+            <button class="btn-ghost" @onclick="@(() => _detailEntry = null)">Close</button>
+        </div>
+    </Modal>
+}
+
+@code {
+    private string _daysAhead = "30";
+    private List<FocReportEntry> _entries = new();
+    private string? _error;
+    private string? _message;
+    private FocReportEntry? _detailEntry;
+
+    protected override void OnInitialized() => Generate();
+
+    private void Generate()
+    {
+        _error = null;
+        if (!int.TryParse(_daysAhead, out var days) || days <= 0)
+        {
+            _error = "Days ahead must be a positive number.";
+            return;
+        }
+
+        _entries = FocReportService.GetUpcomingFocReport(days);
+    }
+
+    private void OpenDetail(FocReportEntry entry) => _detailEntry = entry;
+
+    private static string SubscriberSubtext(FocReportSubscriber s)
+    {
+        var text = $"Cover {s.PreferredCover}";
+        if (s.Quantity > 1) text += $" x{s.Quantity}";
+        if (!s.CoverIsAvailable) text += " — cover not on file!";
+        return text;
+    }
+
+    private void SendEmail()
+    {
+        _error = null;
+        _message = null;
+
+        var settings = EmailSettingsService.Load();
+        if (string.IsNullOrWhiteSpace(settings.SmtpHost) || string.IsNullOrWhiteSpace(settings.AdminEmail))
+        {
+            _error = "Email isn't configured yet. Go to the Settings page and fill in your SMTP details first.";
+            return;
+        }
+
+        try
+        {
+            Email.SendFocReport(_entries, settings);
+            _message = $"Report sent to {settings.AdminEmail}.";
+        }
+        catch (Exception ex)
+        {
+            _error = $"Failed to send email: {ex.Message}";
+        }
+    }
+}
