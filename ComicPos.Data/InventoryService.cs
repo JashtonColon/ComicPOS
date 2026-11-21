@@ -56,6 +56,23 @@ public class InventoryService : IInventoryService
             .ToList();
     }
 
+    public Series? GetSeriesByName(string name)
+    {
+        return _db.AllSeries.FirstOrDefault(s => s.Name == name);
+    }
+
+    public List<string> GetKnownCoverLetters(int seriesId)
+    {
+        return _db.Issues
+            .Include(i => i.Covers)
+            .Where(i => i.SeriesId == seriesId)
+            .SelectMany(i => i.Covers.Select(c => c.CoverLetter))
+            .Where(letter => !string.IsNullOrWhiteSpace(letter))
+            .Distinct()
+            .OrderBy(letter => letter)
+            .ToList();
+    }
+
     // Used when receiving a shipment (stock goes up) or correcting price/
     // description - the cover passed in is already the tracked EF entity
     // (fetched via GetIssuesForSeries), so this just persists the changes.
