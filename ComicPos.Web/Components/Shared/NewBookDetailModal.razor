@@ -3,11 +3,18 @@
    the Inventory page once a book has actually arrived, same as desktop. *@
 @namespace ComicPos.Web.Components.Shared
 @using ComicPos.Core.Models
+@using ComicPos.Core.Services
+@inject ICustomerService Customers
+@inject IPullListService PullLists
 
 <Modal Show="Show" Title="@Title" OnBackdropClick="Close" ExtraClass="modal-xwide">
     @if (Issue != null)
     {
         <p class="help-text">@SubLine</p>
+        @if (_pullListMessage != null)
+        {
+            <p class="help-text" style="background:var(--accent-soft);padding:8px 12px;border-radius:8px">&#10003; @_pullListMessage</p>
+        }
         <p class="list-row-title">@(Issue.Covers.Count == 1 ? "Cover" : $"Covers ({Issue.Covers.Count})")</p>
         <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px">
             @foreach (var cover in Issue.Covers.OrderBy(c => c.CoverLetter))
@@ -25,11 +32,20 @@
         </div>
     }
     <div class="form-actions">
+        <button class="btn-primary" @onclick="OpenAddToPullList" disabled="@(Issue == null)">Add to a Subscriber's Pull List</button>
         <button class="btn-ghost" @onclick="Close">Close</button>
     </div>
 </Modal>
 
 <ImageZoomOverlay Src="@_zoomSrc" Title="@_zoomTitle" OnClose="@(() => _zoomSrc = null)" />
+
+<AddToPullListModal Show="_showAddToPullList"
+                     SeriesId="@(Issue?.Series.Id ?? 0)"
+                     SeriesLabel="@(Issue == null ? "" : $"{Issue.Series.Name} ({Issue.Series.StartYear})")"
+                     KnownCoverLetters="@(Issue?.Covers.Select(c => c.CoverLetter).Distinct().OrderBy(x => x).ToList() ?? new())"
+                     DefaultCoverLetter="@(Issue != null && Issue.Covers.Count > 0 ? Issue.Covers.OrderBy(c => c.CoverLetter).First().CoverLetter : "A")"
+                     OnSave="OnPullListSave"
+                     OnClose="@(() => _showAddToPullList = false)" />
 
 @code {
     [Parameter] public bool Show { get; set; }
@@ -38,6 +54,8 @@
 
     private string? _zoomSrc;
     private string _zoomTitle = "";
+    private bool _showAddToPullList;
+    private string? _pullListMessage;
 
     private string Title => Issue == null ? "" : $"{Issue.Series.Name} #{Issue.IssueNumber:0.##}";
 
@@ -63,5 +81,21 @@
     {
         _zoomSrc = HasImage(cover) ? $"/api/cover-image/{cover.Id}" : "/img/no-cover.svg";
         _zoomTitle = cover.CoverLetter == "A" ? "Cover A (main)" : $"Cover {cover.CoverLetter}";
+    }
+
+    private void OpenAddToPullList()
+    {
+        _pullListMessage = null;
+        _showAddToPullList = true;
+    }
+
+    private void OnPullListSave((int CustomerId, string CoverLetter, int Quantity, string? Notes) result)
+    {
+        if (Issue == null) return;
+
+        PullLists.AddToPullList(result.CustomerId, Issue.Series.Id, result.CoverLetter, result.Quantity, result.Notes);
+        var customerName = Customers.FindById(result.CustomerId)?.Name ?? "that customer";
+        _pullListMessage = $"Added to {customerName}'s pull list - they'll get this issue and every future issue of {Issue.Series.Name} automatically.";
+        _showAddToPullList = false;
     }
 }
