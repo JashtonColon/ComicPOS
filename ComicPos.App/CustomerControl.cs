@@ -30,6 +30,7 @@ public class CustomerControl : UserControl
     private readonly Panel detailPanel;
     private readonly Panel viewPanel;
     private readonly Label lblDetailHeader = new();
+    private readonly Label lblPullListHeader = new();
     private readonly Label lblDetailEmail = new();
     private readonly Label lblDetailPhone = new();
     private readonly Button btnEdit = new();
@@ -128,7 +129,8 @@ public class CustomerControl : UserControl
         viewPanel = new Panel { Dock = DockStyle.Fill };
         lblDetailHeader.Dock = DockStyle.Top;
         lblDetailHeader.Height = 48;
-        lblDetailHeader.Font = new Font(lblDetailHeader.Font.FontFamily, 14, FontStyle.Bold);
+        lblDetailHeader.Font = UiTheme.HeaderFont;
+        lblDetailHeader.ForeColor = UiTheme.PrimaryDark;
         lblDetailHeader.Padding = new Padding(8, 8, 0, 0);
         lblDetailHeader.AutoSize = false;
         lblDetailHeader.TextAlign = ContentAlignment.MiddleLeft;
@@ -140,6 +142,21 @@ public class CustomerControl : UserControl
         lblDetailPhone.Dock = DockStyle.Top;
         lblDetailPhone.Height = 26;
         lblDetailPhone.Padding = new Padding(8, 0, 0, 0);
+
+        // The Pull List screen reuses the shared `grid` (just repopulated
+        // with pull-list columns) with detailPanel hidden, so none of
+        // the customer-detail header labels above are on screen there -
+        // nothing previously said whose pull list was even being looked
+        // at.
+        lblPullListHeader.Dock = DockStyle.Top;
+        // AutoSize, not a fixed Height - see InventoryControl's lblBreadcrumb
+        // for why a hardcoded pixel value here clipped the text.
+        lblPullListHeader.AutoSize = true;
+        lblPullListHeader.Font = UiTheme.HeaderFont;
+        lblPullListHeader.ForeColor = UiTheme.PrimaryDark;
+        lblPullListHeader.Padding = new Padding(8, 0, 0, 0);
+        lblPullListHeader.TextAlign = ContentAlignment.MiddleLeft;
+        lblPullListHeader.Visible = false;
 
         var actionFlow = new FlowLayoutPanel
         {
@@ -262,6 +279,28 @@ public class CustomerControl : UserControl
                 ? _pullSeriesResults[lstPullSeriesResults.SelectedIndex]
                 : null;
         };
+        // Double-clicking a result is the normal Windows way of saying
+        // "use this one" - fill the search box with it instead of leaving
+        // the box showing whatever partial text was typed, while keeping
+        // the result list exactly as-is (still showing this item picked)
+        // so the existing Add button still works right afterward. Swap
+        // the TextChanged handler off first so this doesn't re-trigger a
+        // fresh search against the full "Name (Year)" text and wipe the
+        // very selection it just set.
+        lstPullSeriesResults.DoubleClick += (s, e) =>
+        {
+            if (lstPullSeriesResults.SelectedIndex < 0 || lstPullSeriesResults.SelectedIndex >= _pullSeriesResults.Count) return;
+
+            var chosen = _pullSeriesResults[lstPullSeriesResults.SelectedIndex];
+            var label = $"{chosen.Name} ({chosen.StartYear})";
+
+            txtPullSeriesSearch.TextChanged -= PullSeriesSearch_TextChanged;
+            txtPullSeriesSearch.Text = label;
+            txtPullSeriesSearch.SelectionStart = label.Length;
+            txtPullSeriesSearch.TextChanged += PullSeriesSearch_TextChanged;
+
+            _selectedSeriesForPullList = chosen;
+        };
 
         pullListAddPanel.Controls.Add(lstPullSeriesResults);
         pullListAddPanel.Controls.Add(pullTopRow);
@@ -270,6 +309,7 @@ public class CustomerControl : UserControl
         Controls.Add(detailPanel);
         Controls.Add(addPanel);
         Controls.Add(pullListAddPanel);
+        Controls.Add(lblPullListHeader);
         Controls.Add(btnVoidSale);
         Controls.Add(btnBack);
         Controls.Add(txtSearch);
@@ -294,6 +334,7 @@ public class CustomerControl : UserControl
         btnVoidSale.Visible = false;
         grid.Visible = true;
         detailPanel.Visible = false;
+        lblPullListHeader.Visible = false;
 
         grid.DataSource = null;
         grid.Columns.Clear();
@@ -342,6 +383,7 @@ public class CustomerControl : UserControl
         detailPanel.Visible = true;
         viewPanel.Visible = true;
         editPanel.Visible = false;
+        lblPullListHeader.Visible = false;
 
         lblDetailHeader.Text = _selectedCustomer.Name;
         lblDetailEmail.Text = "Email: " + (_selectedCustomer.Email ?? "(none)");
@@ -556,6 +598,8 @@ public class CustomerControl : UserControl
         btnVoidSale.Visible = false;
         grid.Visible = true;
         detailPanel.Visible = false;
+        lblPullListHeader.Visible = true;
+        lblPullListHeader.Text = $"{_selectedCustomer.Name} — Pull List";
 
         txtPullSeriesSearch.Clear();
         lstPullSeriesResults.Items.Clear();
@@ -587,17 +631,18 @@ public class CustomerControl : UserControl
             row.Cells["Cover"].Value = entry.PreferredCoverLetter;
             row.Cells["Qty"].Value = entry.Quantity;
             row.Cells["Notes"].Value = entry.Notes ?? "";
-            row.Tag = entry.Id;
+            row.Tag = entry;
         }
     }
 
-    private void EditPullListEntry(int entryId, string seriesLabel, string currentCover, object? qtyCellValue, string? currentNotes)
+    private void EditPullListEntry(int entryId, int seriesId, string seriesLabel, string currentCover, object? qtyCellValue, string? currentNotes)
     {
         var currentQty = 1;
         if (qtyCellValue != null) int.TryParse(qtyCellValue.ToString(), out currentQty);
         if (currentQty < 1) currentQty = 1;
 
-        using var form = new PullListEntryForm(seriesLabel, currentCover, currentQty, currentNotes, isEditingExisting: true);
+        var knownCovers = _inventory.GetKnownCoverLetters(seriesId);
+        using var form = new PullListEntryForm(seriesLabel, currentCover, currentQty, currentNotes, isEditingExisting: true, knownCoverLetters: knownCovers);
         var result = form.ShowDialog(this);
 
         if (result == DialogResult.Abort) // "Remove from Pull List" inside the dialog
@@ -639,7 +684,8 @@ public class CustomerControl : UserControl
         }
 
         var seriesLabel = $"{_selectedSeriesForPullList.Name} ({_selectedSeriesForPullList.StartYear})";
-        using var form = new PullListEntryForm(seriesLabel, "A", 1, null, isEditingExisting: false);
+        var knownCovers = _inventory.GetKnownCoverLetters(_selectedSeriesForPullList.Id);
+        using var form = new PullListEntryForm(seriesLabel, knownCovers.Count > 0 ? knownCovers[0] : "A", 1, null, isEditingExisting: false, knownCoverLetters: knownCovers);
         if (form.ShowDialog(this) != DialogResult.OK) return;
 
         _pullLists.AddToPullList(_selectedCustomer.Id, _selectedSeriesForPullList.Id, form.CoverLetter, form.Quantity, form.Notes);
@@ -684,9 +730,9 @@ public class CustomerControl : UserControl
                 break;
 
             case Screen.PullList:
-                if (row.Tag is int entryId)
+                if (row.Tag is PullListEntry pullEntry)
                 {
-                    EditPullListEntry(entryId, row.Cells["Series"].Value?.ToString() ?? "", row.Cells["Cover"].Value?.ToString() ?? "A", row.Cells["Qty"].Value, row.Cells["Notes"].Value?.ToString());
+                    EditPullListEntry(pullEntry.Id, pullEntry.SeriesId, row.Cells["Series"].Value?.ToString() ?? "", row.Cells["Cover"].Value?.ToString() ?? "A", row.Cells["Qty"].Value, row.Cells["Notes"].Value?.ToString());
                 }
                 break;
         }
