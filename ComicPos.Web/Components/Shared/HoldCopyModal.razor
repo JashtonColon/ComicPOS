@@ -1,0 +1,123 @@
+@namespace ComicPos.Web.Components.Shared
+@using ComicPos.Core.Models
+@using ComicPos.Core.Services
+@inject ICustomerService Customers
+
+<Modal Show="Show" Title="Hold a Copy" OnBackdropClick="Close">
+    <p class="help-text" style="font-weight:600;color:var(--text)">@IssueLabel</p>
+
+    <div class="form-row">
+        <label>Hold for which customer?</label>
+        <input type="text" class="search-box" style="margin-bottom:6px" value="@_searchText" @oninput="OnSearchInput" placeholder="Search customer by name..." />
+    </div>
+
+    @if (_selectedCustomer == null && _results.Count > 0)
+    {
+        <div class="list-rows" style="max-height:160px;overflow-y:auto;margin-bottom:12px;">
+            @foreach (var c in _results)
+            {
+                <div class="list-row" style="cursor:pointer" @onclick="() => PickCustomer(c)">
+                    <div class="list-row-main"><div class="list-row-title">@c.Name</div></div>
+                </div>
+            }
+        </div>
+    }
+    else
+    {
+        <p class="help-text">@(_selectedCustomer == null ? "No customer selected yet." : $"Selected: {_selectedCustomer.Name}")</p>
+    }
+
+    <div class="form-row-split">
+        <div class="form-row">
+            <label>Cover:*</label>
+            <input list="hold-cover-letters" value="@_cover" @oninput="e => _cover = e.Value?.ToString() ?? string.Empty" maxlength="1" />
+            <datalist id="hold-cover-letters">
+                @foreach (var letter in KnownCoverLetters)
+                {
+                    <option value="@letter"></option>
+                }
+            </datalist>
+        </div>
+        <div class="form-row">
+            <label>Quantity:*</label>
+            <input type="number" min="1" value="@_quantity" @oninput="e => int.TryParse(e.Value?.ToString(), out _quantity)" />
+        </div>
+    </div>
+
+    <div class="form-row">
+        <label>Notes:</label>
+        <textarea rows="3" value="@_notes" @oninput="e => _notes = e.Value?.ToString() ?? string.Empty"></textarea>
+    </div>
+
+    @if (!string.IsNullOrEmpty(_error))
+    {
+        <p class="error-text">@_error</p>
+    }
+
+    <div class="form-actions">
+        <button class="btn-ghost" @onclick="Close">Cancel</button>
+        <button class="btn-primary" @onclick="Save">Hold It</button>
+    </div>
+</Modal>
+
+@code {
+    [Parameter] public bool Show { get; set; }
+    [Parameter] public string IssueLabel { get; set; } = "";
+    [Parameter] public List<string> KnownCoverLetters { get; set; } = new();
+    [Parameter] public string DefaultCoverLetter { get; set; } = "A";
+    [Parameter] public EventCallback<(int CustomerId, string CoverLetter, int Quantity, string? Notes)> OnSave { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    private string _searchText = "";
+    private List<Customer> _results = new();
+    private Customer? _selectedCustomer;
+    private string _cover = "A";
+    private int _quantity = 1;
+    private string _notes = "";
+    private string? _error;
+    private bool _wasShown;
+
+    protected override void OnParametersSet()
+    {
+        if (Show && !_wasShown)
+        {
+            _searchText = "";
+            _results = new();
+            _selectedCustomer = null;
+            _cover = DefaultCoverLetter;
+            _quantity = 1;
+            _notes = "";
+            _error = null;
+        }
+        _wasShown = Show;
+    }
+
+    private void OnSearchInput(ChangeEventArgs e)
+    {
+        _searchText = e.Value?.ToString() ?? "";
+        _selectedCustomer = null;
+        _results = string.IsNullOrWhiteSpace(_searchText) ? new() : Customers.SearchCustomers(_searchText);
+    }
+
+    private void PickCustomer(Customer c)
+    {
+        _selectedCustomer = c;
+        _searchText = c.Name;
+        _results = new();
+    }
+
+    private async Task Save()
+    {
+        _error = null;
+        if (_selectedCustomer == null) { _error = "Pick a customer from the search results first."; return; }
+
+        var cover = (_cover ?? "").Trim().ToUpperInvariant();
+        if (cover.Length != 1 || !char.IsLetter(cover[0])) { _error = "Cover letter must be a single letter (A, B, C, ...)."; return; }
+
+        if (_quantity < 1) { _error = "Quantity must be a whole number, 1 or more."; return; }
+
+        await OnSave.InvokeAsync((_selectedCustomer.Id, cover, _quantity, string.IsNullOrWhiteSpace(_notes) ? null : _notes.Trim()));
+    }
+
+    private async Task Close() => await OnClose.InvokeAsync();
+}
