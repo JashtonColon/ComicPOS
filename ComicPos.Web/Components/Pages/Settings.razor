@@ -1,0 +1,328 @@
+@page "/settings"
+@using ComicPos.Core.Models
+@using ComicPos.Core.Services
+@inject IStoreSettingsService StoreSettingsService
+@inject IEmailSettingsService EmailSettingsService
+@inject IBackupService Backup
+@rendermode InteractiveServer
+
+<PageTitle>Settings - Comic POS</PageTitle>
+
+<div class="page-header">
+    <h1>Settings</h1>
+</div>
+
+@if (_error != null)
+{
+    <p class="error-text">@_error</p>
+}
+@if (_status != null)
+{
+    <p class="help-text" style="color:var(--success, #2a8a4a);font-weight:600">@_status</p>
+}
+
+<div class="panel">
+    <p class="list-row-title" style="margin-bottom:10px">Store</p>
+    <div class="form-row">
+        <label>Store Name:</label>
+        <input type="text" value="@_storeName" @oninput="e => _storeName = e.Value?.ToString() ?? string.Empty" />
+    </div>
+    <div class="form-row">
+        <label>Address:</label>
+        <input type="text" value="@_address" @oninput="e => _address = e.Value?.ToString() ?? string.Empty" />
+    </div>
+    <div class="form-row-split">
+        <div class="form-row">
+            <label>Phone:</label>
+            <input type="text" value="@_phone" @oninput="e => _phone = e.Value?.ToString() ?? string.Empty" />
+        </div>
+        <div class="form-row">
+            <label>Sales Tax Rate (%):</label>
+            <input type="text" value="@_taxRate" @oninput="e => _taxRate = e.Value?.ToString() ?? string.Empty" />
+        </div>
+    </div>
+    <div class="form-row">
+        <label>Receipt Logo:</label>
+        <div style="display:flex;align-items:center;gap:14px">
+            <div style="width:140px;height:70px;border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;justify-content:center;background:#fff;overflow:hidden">
+                @if (!string.IsNullOrWhiteSpace(_logoPath))
+                {
+                    <img src="/api/store-logo?v=@_logoVersion" alt="logo" style="max-width:100%;max-height:100%;object-fit:contain" onerror="this.style.display='none';" />
+                }
+                else
+                {
+                    <span class="help-text" style="margin:0">No logo</span>
+                }
+            </div>
+            <div>
+                <InputFile OnChange="OnLogoSelected" accept="image/*" />
+                <button class="btn-ghost btn-sm" style="margin-top:6px" @onclick="ClearLogo">Clear</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="panel" style="margin-top:16px">
+    <p class="list-row-title" style="margin-bottom:10px">Email (FOC Report)</p>
+    <div class="form-row-split">
+        <div class="form-row">
+            <label>SMTP Host:</label>
+            <input type="text" value="@_smtpHost" @oninput="e => _smtpHost = e.Value?.ToString() ?? string.Empty" />
+        </div>
+        <div class="form-row">
+            <label>SMTP Port:</label>
+            <input type="text" value="@_smtpPort" @oninput="e => _smtpPort = e.Value?.ToString() ?? string.Empty" />
+        </div>
+    </div>
+    <div class="form-row-split">
+        <div class="form-row">
+            <label>SMTP Username:</label>
+            <input type="text" value="@_smtpUsername" @oninput="e => _smtpUsername = e.Value?.ToString() ?? string.Empty" />
+        </div>
+        <div class="form-row">
+            <label>SMTP Password:</label>
+            <input type="password" value="@_smtpPassword" @oninput="e => _smtpPassword = e.Value?.ToString() ?? string.Empty" />
+        </div>
+    </div>
+    <div class="form-row">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:400">
+            <input type="checkbox" @bind="_useSsl" /> Use SSL
+        </label>
+    </div>
+    <div class="form-row-split">
+        <div class="form-row">
+            <label>From Email:</label>
+            <input type="text" value="@_fromEmail" @oninput="e => _fromEmail = e.Value?.ToString() ?? string.Empty" />
+        </div>
+        <div class="form-row">
+            <label>From Display Name:</label>
+            <input type="text" value="@_fromDisplayName" @oninput="e => _fromDisplayName = e.Value?.ToString() ?? string.Empty" />
+        </div>
+    </div>
+    <div class="form-row">
+        <label>Admin Email (recipient):</label>
+        <input type="text" value="@_adminEmail" @oninput="e => _adminEmail = e.Value?.ToString() ?? string.Empty" />
+    </div>
+    <div class="form-row">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:400">
+            <input type="checkbox" @bind="_autoSendFocReport" /> Auto-email FOC report daily
+        </label>
+    </div>
+    <div class="form-row">
+        <label>Auto report days ahead:</label>
+        <input type="text" style="width:80px" value="@_focReportDaysAhead" @oninput="e => _focReportDaysAhead = e.Value?.ToString() ?? string.Empty" />
+    </div>
+    <p class="help-text">
+        When checked, the app emails the admin a FOC buy report every day (covering this many days ahead) with no
+        need to click "Send Email to Admin" yourself. Requires SMTP + Admin Email above to be filled in.
+    </p>
+</div>
+
+<div class="panel" style="margin-top:16px">
+    <p class="list-row-title" style="margin-bottom:10px">New Releases (Comic Vine)</p>
+    <div class="form-row">
+        <label>Comic Vine API Key:</label>
+        <input type="text" value="@_comicVineApiKey" @oninput="e => _comicVineApiKey = e.Value?.ToString() ?? string.Empty" />
+    </div>
+    <p class="help-text">Free - get one at comicvine.gamespot.com/api/. Used by the New Books page to find issues you don't have yet.</p>
+    <div class="form-row">
+        <label>Tracked Publishers:</label>
+        <input type="text" value="@_trackedPublishers" @oninput="e => _trackedPublishers = e.Value?.ToString() ?? string.Empty" />
+    </div>
+    <p class="help-text">
+        Comma-separated (e.g. Marvel, DC Comics, Image Comics) - must match Comic Vine's exact publisher name.
+        Strongly recommended: makes the weekly search faster and relevant. Leave blank to search ALL publishers on
+        Comic Vine (mostly manga/small press for a US shop - slow and noisy).
+    </p>
+</div>
+
+<div class="panel" style="margin-top:16px">
+    <p class="list-row-title" style="margin-bottom:10px">Backups</p>
+    <div class="form-row">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:400">
+            <input type="checkbox" @bind="_autoBackup" /> Automatically back up daily
+        </label>
+    </div>
+    <p class="help-text">
+        Saved to a Backups folder next to the database, keeping the most recent 30. "Backup Database Now" below
+        always runs regardless of this setting.
+    </p>
+    @if (_backupError != null)
+    {
+        <p class="error-text">@_backupError</p>
+    }
+    @if (_backupMessage != null)
+    {
+        <p class="help-text">@_backupMessage</p>
+    }
+    <button class="btn-ghost btn-sm" @onclick="RunBackup">Backup Database Now</button>
+</div>
+
+<div class="form-actions" style="justify-content:flex-start;margin-top:16px">
+    <button class="btn-primary" @onclick="SaveSettings">Save Settings</button>
+</div>
+
+<p class="help-text" style="margin-top:14px">
+    For Gmail: smtp.gmail.com, port 587, SSL on, and use an App Password (not your normal password) as SMTP Password.
+</p>
+
+@code {
+    private string _storeName = "";
+    private string _address = "";
+    private string _phone = "";
+    private string _taxRate = "0";
+    private string? _logoPath;
+    private int _logoVersion;
+
+    private string _smtpHost = "";
+    private string _smtpPort = "587";
+    private string _smtpUsername = "";
+    private string _smtpPassword = "";
+    private bool _useSsl = true;
+    private string _fromEmail = "";
+    private string _fromDisplayName = "";
+    private string _adminEmail = "";
+    private bool _autoSendFocReport;
+    private string _focReportDaysAhead = "14";
+
+    private string _comicVineApiKey = "";
+    private string _trackedPublishers = "";
+    private bool _autoBackup = true;
+
+    private string? _error;
+    private string? _status;
+    private string? _backupError;
+    private string? _backupMessage;
+
+    protected override void OnInitialized() => LoadSettings();
+
+    private void LoadSettings()
+    {
+        var store = StoreSettingsService.Load();
+        _storeName = store.StoreName;
+        _address = store.Address;
+        _phone = store.Phone;
+        _taxRate = store.TaxRatePercent.ToString();
+        _logoPath = store.LogoPath;
+        _comicVineApiKey = store.ComicVineApiKey ?? "";
+        _trackedPublishers = store.TrackedPublishers ?? "";
+        _autoBackup = store.AutoBackupEnabled;
+
+        var email = EmailSettingsService.Load();
+        _smtpHost = email.SmtpHost;
+        _smtpPort = email.SmtpPort.ToString();
+        _smtpUsername = email.SmtpUsername;
+        _smtpPassword = email.SmtpPassword;
+        _useSsl = email.UseSsl;
+        _fromEmail = email.FromEmail;
+        _fromDisplayName = email.FromDisplayName;
+        _adminEmail = email.AdminEmail;
+        _autoSendFocReport = email.AutoSendFocReport;
+        _focReportDaysAhead = email.FocReportDaysAhead.ToString();
+    }
+
+    private async Task OnLogoSelected(InputFileChangeEventArgs e)
+    {
+        _error = null;
+        try
+        {
+            var file = e.File;
+            var ext = Path.GetExtension(file.Name);
+            if (string.IsNullOrWhiteSpace(ext)) ext = ".png";
+
+            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ComicPos", "logos");
+            Directory.CreateDirectory(dir);
+            var path = Path.Combine(dir, $"logo-{Guid.NewGuid():N}{ext}");
+
+            await using (var stream = File.Create(path))
+            {
+                await file.OpenReadStream(maxAllowedSize: 5 * 1024 * 1024).CopyToAsync(stream);
+            }
+
+            _logoPath = path;
+            _logoVersion++;
+        }
+        catch (Exception ex)
+        {
+            _error = $"Couldn't load that image: {ex.Message}";
+        }
+    }
+
+    private void ClearLogo()
+    {
+        _logoPath = null;
+        _logoVersion++;
+    }
+
+    private void SaveSettings()
+    {
+        _error = null;
+        _status = null;
+
+        if (!int.TryParse(_smtpPort, out var port))
+        {
+            _error = "SMTP Port must be a number.";
+            return;
+        }
+
+        if (!decimal.TryParse(_taxRate, out var taxRate) || taxRate < 0)
+        {
+            _error = "Tax rate must be a non-negative number.";
+            return;
+        }
+
+        // Preserve these - neither is editable here, and overwriting them
+        // with null/default on every settings save would make the weekly
+        // New Books check, the daily auto-backup, and the daily FOC email
+        // all think they've never run, forcing an extra one on the very
+        // next startup/hourly tick.
+        var currentStore = StoreSettingsService.Load();
+        var currentEmail = EmailSettingsService.Load();
+
+        StoreSettingsService.Save(new StoreSettings
+        {
+            StoreName = string.IsNullOrWhiteSpace(_storeName) ? "Comic POS" : _storeName.Trim(),
+            Address = _address.Trim(),
+            Phone = _phone.Trim(),
+            TaxRatePercent = taxRate,
+            LogoPath = _logoPath,
+            ComicVineApiKey = string.IsNullOrWhiteSpace(_comicVineApiKey) ? null : _comicVineApiKey.Trim(),
+            TrackedPublishers = string.IsNullOrWhiteSpace(_trackedPublishers) ? null : _trackedPublishers.Trim(),
+            AutoBackupEnabled = _autoBackup,
+            LastAutoFetchRun = currentStore.LastAutoFetchRun,
+            LastAutoBackupAt = currentStore.LastAutoBackupAt
+        });
+
+        EmailSettingsService.Save(new EmailSettings
+        {
+            SmtpHost = _smtpHost.Trim(),
+            SmtpPort = port,
+            SmtpUsername = _smtpUsername.Trim(),
+            SmtpPassword = _smtpPassword,
+            UseSsl = _useSsl,
+            FromEmail = _fromEmail.Trim(),
+            FromDisplayName = _fromDisplayName.Trim(),
+            AdminEmail = _adminEmail.Trim(),
+            AutoSendFocReport = _autoSendFocReport,
+            FocReportDaysAhead = int.TryParse(_focReportDaysAhead, out var focDays) && focDays > 0 ? focDays : 14,
+            LastFocReportSentAt = currentEmail.LastFocReportSentAt
+        });
+
+        _status = "Saved.";
+    }
+
+    private void RunBackup()
+    {
+        _backupError = null;
+        _backupMessage = null;
+        try
+        {
+            var path = Backup.BackupNow();
+            _backupMessage = $"Backup saved to: {path}";
+        }
+        catch (Exception ex)
+        {
+            _backupError = $"Backup failed: {ex.Message}";
+        }
+    }
+}
