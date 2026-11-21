@@ -3,6 +3,7 @@
 @using ComicPos.Core.Models
 @using ComicPos.Core.Services
 @inject IAutoFetchService AutoFetch
+@inject IJSRuntime JS
 @rendermode InteractiveServer
 
 <PageTitle>New Books - Comic POS</PageTitle>
@@ -50,6 +51,7 @@
         {
             <span class="month-pill @(_selectedMonthLabel == month ? "active" : "")" @onclick="@(() => SelectMonth(month))">@month</span>
         }
+        <span class="month-pill" style="margin-left:auto;font-weight:400;opacity:0.7" @onclick="@(() => SelectMonth(_currentMonthLabel))">Jump to current month</span>
     </div>
 }
 
@@ -108,6 +110,8 @@ else
     private bool _showMonthTabs;
     private List<string> _monthTabs = new();
     private string? _selectedMonthLabel;
+    private bool _monthFilterInitialized;
+    private readonly string _currentMonthLabel = DateTime.Today.ToString("MMMM yyyy", CultureInfo.InvariantCulture);
 
     private List<DisplayRow> _displayRows = new();
 
@@ -135,13 +139,21 @@ else
         // under another (e.g. sorted by Publisher) - drop back to "All".
         _sortBy = e.Value?.ToString() ?? SortRelease;
         _selectedMonthLabel = null;
+        _monthFilterInitialized = false;
         RefreshGrid();
     }
 
-    private void SelectMonth(string? label)
+    private async Task SelectMonth(string? label)
     {
         _selectedMonthLabel = label;
+        _monthFilterInitialized = true;
         RefreshGrid();
+        // Switching tabs re-renders the table in place (no page
+        // navigation happens), so the browser doesn't naturally scroll
+        // back up on its own the way a full page load would - without
+        // this, clicking a tab while scrolled partway down a long list
+        // can look like the click "didn't go all the way back."
+        try { await JS.InvokeVoidAsync("window.scrollTo", 0, 0); } catch { /* best effort */ }
     }
 
     private void OpenDetail(Issue issue)
@@ -206,8 +218,19 @@ else
                 .OrderBy(label => DateTime.TryParseExact(label, "MMMM yyyy", CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt) ? dt : DateTime.MaxValue)
                 .ToList();
 
-            if (_selectedMonthLabel != null && !_monthTabs.Contains(_selectedMonthLabel))
+            if (!_monthFilterInitialized)
+            {
+                // First load (or just after a sort change): default to
+                // the current month instead of "All", so old months stay
+                // out of sight until explicitly asked for. Falls back to
+                // "All" only if there's genuinely nothing for this month.
+                _selectedMonthLabel = _monthTabs.Contains(_currentMonthLabel) ? _currentMonthLabel : null;
+                _monthFilterInitialized = true;
+            }
+            else if (_selectedMonthLabel != null && !_monthTabs.Contains(_selectedMonthLabel))
+            {
                 _selectedMonthLabel = null;
+            }
 
             if (_selectedMonthLabel != null)
                 orderedList = orderedList.Where(i => GroupLabelFor(i, _sortBy) == _selectedMonthLabel).ToList();
