@@ -1,0 +1,190 @@
+@namespace ComicPos.Web.Components.Shared
+@using ComicPos.Core.Models
+@using ComicPos.Core.Services
+@inject IInventoryService Inventory
+
+<Modal Show="Show" Title="Add New Item" OnBackdropClick="Close" ExtraClass="modal-wide">
+    <div class="form-row">
+        <label>Scan or type barcode:</label>
+        <div style="display:flex;gap:8px;align-items:flex-start">
+            <input type="text" style="flex:1" value="@_barcode" @oninput="e => _barcode = e.Value?.ToString() ?? string.Empty"
+                   @onkeydown="HandleBarcodeKeyDown" />
+            <button class="btn-primary btn-sm" @onclick="LookUp">Look Up</button>
+        </div>
+        @if (!string.IsNullOrEmpty(_status))
+        {
+            <p class="help-text">@_status</p>
+        }
+    </div>
+
+    <div class="form-row-split">
+        <div class="form-row">
+            <label>Series Name:*</label>
+            <input type="text" value="@_seriesName" @oninput="e => _seriesName = e.Value?.ToString() ?? string.Empty" />
+        </div>
+        <div class="form-row">
+            <label>Series Start:*</label>
+            <input type="text" value="@_startYear" @oninput="e => _startYear = e.Value?.ToString() ?? string.Empty" />
+        </div>
+    </div>
+
+    <div class="form-row-split">
+        <div class="form-row">
+            <label>Issue #:*</label>
+            <input type="text" value="@_issueNumber" @oninput="e => _issueNumber = e.Value?.ToString() ?? string.Empty" />
+        </div>
+        <div class="form-row">
+            <label>Type:</label>
+            <select value="@_type.ToString()" @onchange='e => _type = Enum.Parse<IssueType>(e.Value?.ToString() ?? "SingleIssue")'>
+                <option value="SingleIssue">Single Issue</option>
+                <option value="CollectedEdition">Collected Edition</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="form-row">
+        <label>Publisher:</label>
+        <input type="text" value="@_publisher" @oninput="e => _publisher = e.Value?.ToString() ?? string.Empty" />
+    </div>
+
+    <div class="form-row-split">
+        <div class="form-row">
+            <label>Cover Letter:</label>
+            <input type="text" maxlength="1" value="@_coverLetter" @oninput='e => _coverLetter = e.Value?.ToString() ?? "A"' />
+        </div>
+        <div class="form-row">
+            <label>Price:*</label>
+            <input type="text" value="@_price" @oninput="e => _price = e.Value?.ToString() ?? string.Empty" />
+        </div>
+        <div class="form-row">
+            <label>Starting Stock:*</label>
+            <input type="text" value="@_stock" @oninput="e => _stock = e.Value?.ToString() ?? string.Empty" />
+        </div>
+    </div>
+
+    <div class="form-row">
+        <label>Description:</label>
+        <input type="text" value="@_description" @oninput="e => _description = e.Value?.ToString() ?? string.Empty" />
+    </div>
+
+    <div class="form-row-split">
+        <div class="form-row">
+            <label><input type="checkbox" @bind="_hasFoc" /> FOC Date</label>
+            <input type="date" disabled="@(!_hasFoc)" value="@_focDate" @oninput="e => _focDate = e.Value?.ToString() ?? string.Empty" />
+        </div>
+        <div class="form-row">
+            <label><input type="checkbox" @bind="_hasRelease" /> Release Date</label>
+            <input type="date" disabled="@(!_hasRelease)" value="@_releaseDate" @oninput="e => _releaseDate = e.Value?.ToString() ?? string.Empty" />
+        </div>
+    </div>
+
+    @if (!string.IsNullOrEmpty(_error))
+    {
+        <p class="error-text">@_error</p>
+    }
+
+    <div class="form-actions">
+        <button class="btn-ghost" @onclick="Close">Cancel</button>
+        <button class="btn-primary" @onclick="Save">Save Item</button>
+    </div>
+</Modal>
+
+@code {
+    [Parameter] public bool Show { get; set; }
+    [Parameter] public EventCallback OnSaved { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    private bool _wasShown;
+    private string _barcode = "";
+    private string _status = "";
+    private string _seriesName = "";
+    private string _startYear = DateTime.Now.Year.ToString();
+    private string _issueNumber = "1";
+    private IssueType _type = IssueType.SingleIssue;
+    private string _publisher = "";
+    private string _coverLetter = "A";
+    private string _price = "0.00";
+    private string _stock = "0";
+    private string _description = "";
+    private bool _hasFoc;
+    private string _focDate = "";
+    private bool _hasRelease;
+    private string _releaseDate = "";
+    private string? _error;
+
+    protected override void OnParametersSet()
+    {
+        if (Show && !_wasShown)
+        {
+            _barcode = ""; _status = ""; _seriesName = ""; _startYear = DateTime.Now.Year.ToString();
+            _issueNumber = "1"; _type = IssueType.SingleIssue; _publisher = ""; _coverLetter = "A";
+            _price = "0.00"; _stock = "0"; _description = ""; _hasFoc = false; _focDate = ""; _hasRelease = false; _releaseDate = "";
+            _error = null;
+        }
+        _wasShown = Show;
+    }
+
+    private void HandleBarcodeKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") LookUp();
+    }
+
+    private void LookUp()
+    {
+        _error = null;
+        var cover = Inventory.FindByBarcode(_barcode.Trim());
+        if (cover == null)
+        {
+            _status = $"No existing item for \"{_barcode}\" - fill in the details below to add it as new.";
+            return;
+        }
+
+        var issue = cover.Issue;
+        var series = issue.Series;
+        _seriesName = series.Name;
+        _startYear = series.StartYear.ToString();
+        _issueNumber = issue.IssueNumber.ToString("0.##");
+        _type = issue.Type;
+        _publisher = issue.Publisher;
+        _coverLetter = cover.CoverLetter;
+        _price = cover.Price.ToString("0.00");
+        _stock = cover.StockQuantity.ToString();
+        _description = cover.Description ?? "";
+        _hasFoc = issue.FocDate != null;
+        _focDate = issue.FocDate?.ToString("yyyy-MM-dd") ?? "";
+        _hasRelease = issue.ReleaseDate != null;
+        _releaseDate = issue.ReleaseDate?.ToString("yyyy-MM-dd") ?? "";
+        _status = $"Found: {series.Name} #{issue.IssueNumber:0.##} - review price/stock below and save to add it to inventory.";
+    }
+
+    private void Save()
+    {
+        _error = null;
+
+        if (string.IsNullOrWhiteSpace(_seriesName)) { _error = "Series Name is required."; return; }
+        if (!int.TryParse(_startYear, out var startYear) || startYear < 1900) { _error = "Series Start Year must be a valid year."; return; }
+        if (!float.TryParse(_issueNumber, out var issueNumber)) { _error = "Issue Number must be a number (e.g. 1 or 1.5)."; return; }
+        if (string.IsNullOrWhiteSpace(_barcode)) { _error = "Barcode / UPC is required - scan or type one at the top."; return; }
+        if (!decimal.TryParse(_price, out var price) || price < 0) { _error = "Price must be a non-negative number."; return; }
+        if (!int.TryParse(_stock, out var stock) || stock < 0) { _error = "Starting Stock Qty must be a non-negative whole number."; return; }
+
+        DateOnly? focDate = _hasFoc && DateOnly.TryParse(_focDate, out var fd) ? fd : null;
+        DateOnly? releaseDate = _hasRelease && DateOnly.TryParse(_releaseDate, out var rd) ? rd : null;
+
+        try
+        {
+            Inventory.AddOrUpdateItem(_seriesName.Trim(), startYear, issueNumber, _type, _publisher.Trim(),
+                focDate, releaseDate, string.IsNullOrWhiteSpace(_coverLetter) ? "A" : _coverLetter.Trim(),
+                _barcode.Trim(), price, stock, string.IsNullOrWhiteSpace(_description) ? null : _description.Trim());
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+            return;
+        }
+
+        OnSaved.InvokeAsync();
+    }
+
+    private async Task Close() => await OnClose.InvokeAsync();
+}
