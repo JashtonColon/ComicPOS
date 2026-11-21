@@ -41,6 +41,7 @@ static class Program
         var history = new SalesHistoryService(db);
         var customers = new CustomerService(db);
         var pullLists = new PullListService(db);
+        var issueHolds = new IssueHoldService(db);
         var import = new ImportService(db);
         var focReport = new FocReportService(db);
         var email = new EmailService();
@@ -54,6 +55,6 @@ static class Program
         var gcd = new GcdService();
         var autoFetch = new AutoFetchService(db, comicVine, comicList, comicadeFoc, gcd, storeSettings);
 
-        Application.Run(new MainForm(inventory, checkout, history, customers, pullLists, import, focReport, email, emailSettings, dashboard, storeSettings, backupService, autoFetch));
+        Application.Run(new MainForm(inventory, checkout, history, customers, pullLists, issueHolds, import, focReport, email, emailSettings, dashboard, storeSettings, backupService, autoFetch));
     }
 }
