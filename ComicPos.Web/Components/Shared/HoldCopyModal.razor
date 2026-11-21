@@ -11,21 +11,30 @@
         <input type="text" class="search-box" style="margin-bottom:6px" value="@_searchText" @oninput="OnSearchInput" placeholder="Search customer by name..." />
     </div>
 
-    @if (_selectedCustomer == null && _results.Count > 0)
-    {
-        <div class="list-rows" style="max-height:160px;overflow-y:auto;margin-bottom:12px;">
+    @* Fixed-height box, always rendered (never toggled in/out of the DOM),
+       so typing a search or picking a customer never makes the modal
+       suddenly jump in height - only its contents change. *@
+    <div class="list-rows" style="height:140px;overflow-y:auto;margin-bottom:12px;border:1px solid var(--border);border-radius:8px">
+        @if (_selectedCustomer != null)
+        {
+            <div class="list-row" style="padding:10px 12px">
+                <div class="list-row-main"><div class="list-row-title">Selected: @_selectedCustomer.Name</div></div>
+            </div>
+        }
+        else if (_results.Count > 0)
+        {
             @foreach (var c in _results)
             {
                 <div class="list-row" style="cursor:pointer" @onclick="() => PickCustomer(c)">
                     <div class="list-row-main"><div class="list-row-title">@c.Name</div></div>
                 </div>
             }
-        </div>
-    }
-    else
-    {
-        <p class="help-text">@(_selectedCustomer == null ? "No customer selected yet." : $"Selected: {_selectedCustomer.Name}")</p>
-    }
+        }
+        else
+        {
+            <p class="help-text" style="padding:10px 12px;margin:0">@(string.IsNullOrWhiteSpace(_searchText) ? "Start typing a name above to search." : "No customers match that search.")</p>
+        }
+    </div>
 
     <div class="form-row-split">
         <div class="form-row">
