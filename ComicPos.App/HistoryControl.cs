@@ -24,8 +24,13 @@ public class HistoryControl : UserControl
         Dock = DockStyle.Fill;
 
         lblBreadcrumb.Dock = DockStyle.Top;
-        lblBreadcrumb.Height = 30;
+        // AutoSize, not a fixed Height - see InventoryControl's lblBreadcrumb
+        // for why a hardcoded pixel value here clipped the text.
+        lblBreadcrumb.AutoSize = true;
         lblBreadcrumb.TextAlign = ContentAlignment.MiddleLeft;
+        lblBreadcrumb.Font = UiTheme.HeaderFont;
+        lblBreadcrumb.ForeColor = UiTheme.PrimaryDark;
+        lblBreadcrumb.Padding = new Padding(4, 0, 0, 0);
 
         btnBack.Dock = DockStyle.Top;
         btnBack.Text = "< Back";
@@ -53,10 +58,13 @@ public class HistoryControl : UserControl
         grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         grid.CellDoubleClick += Grid_CellDoubleClick;
 
+        // Same Dock=Top stacking fix as InventoryControl: last-added ends
+        // up closest to the top edge, so this is in reverse of the
+        // intended reading order (title at the very top).
         Controls.Add(grid);
-        Controls.Add(lblBreadcrumb);
         Controls.Add(btnVoid);
         Controls.Add(btnBack);
+        Controls.Add(lblBreadcrumb);
 
         ShowSeriesList();
 
@@ -192,4 +200,9 @@ public class HistoryControl : UserControl
             }
         }
     }
+
+    // Re-clicking the History tab while already on it (MainForm's tab
+    // strip) jumps back out to the series list instead of leaving you
+    // stuck wherever you'd drilled down to.
+    public void ResetToTop() => ShowSeriesList();
 }
