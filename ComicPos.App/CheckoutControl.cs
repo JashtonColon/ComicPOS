@@ -193,8 +193,12 @@ public class CheckoutControl : UserControl
                     line.PriceEach = price;
                 break;
             case "Discount":
-                if (decimal.TryParse(newValue, out var disc) && disc >= 0)
-                    line.DiscountPercent = disc;
+                // Clamped to 0-100 - an unclamped value over 100 (a typo,
+                // e.g. "150" meant as "15") turns (1 - disc/100) negative,
+                // which silently makes that line's total, the sale
+                // subtotal, tax, and change due all negative too.
+                if (decimal.TryParse(newValue, out var disc))
+                    line.DiscountPercent = Math.Clamp(disc, 0, 100);
                 break;
         }
 
