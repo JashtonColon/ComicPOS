@@ -25,11 +25,21 @@
     </div>
 </div>
 
-<p class="help-text">@_status</p>
+@if (_checking)
+{
+    <p class="help-text"><span class="spinner"></span> @_status</p>
+}
 
 @if (_resultMessage != null)
 {
-    <p class="help-text" style="background:var(--accent-soft);padding:8px 12px;border-radius:8px">@_resultMessage</p>
+    <p class="help-text" style="background:var(--accent-soft);padding:8px 12px;border-radius:8px">&#10003; Done &mdash; @_resultMessage</p>
+    @if (!string.IsNullOrWhiteSpace(_resultTrace))
+    {
+        <details style="margin:-4px 0 12px">
+            <summary class="help-text" style="cursor:pointer;display:inline">Show full log</summary>
+            <pre class="log-trace">@_resultTrace</pre>
+        </details>
+    }
 }
 
 @if (_showMonthTabs)
@@ -92,6 +102,7 @@ else
     private string _search = "";
     private string _status = "";
     private string? _resultMessage;
+    private string? _resultTrace;
     private bool _checking;
 
     private bool _showMonthTabs;
@@ -227,6 +238,7 @@ else
         if (_checking) return;
         _checking = true;
         _resultMessage = null;
+        _resultTrace = null;
         _status = "Checking for new issues... this can take a minute.";
 
         AutoFetchResult? result = null;
@@ -252,6 +264,7 @@ else
             if (result.Errors.Count > 0)
                 summary += " Some series had errors: " + string.Join("; ", result.Errors.Take(10));
             _resultMessage = summary;
+            _resultTrace = result.Trace;
         }
 
         RefreshGrid();
@@ -262,6 +275,7 @@ else
         if (_checking) return;
         _checking = true;
         _resultMessage = null;
+        _resultTrace = null;
         _status = "Re-scanning existing books for better volume links and missing covers... this can take a while for a large catalog.";
 
         AutoFetchResult? result = null;
@@ -287,6 +301,7 @@ else
             if (result.Errors.Count > 0)
                 summary += " Some series had errors: " + string.Join("; ", result.Errors.Take(10));
             _resultMessage = summary;
+            _resultTrace = result.Trace;
         }
 
         RefreshGrid();
