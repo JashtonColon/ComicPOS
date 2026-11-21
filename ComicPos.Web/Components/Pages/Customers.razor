@@ -1,0 +1,558 @@
+@page "/customers"
+@using ComicPos.Core.Models
+@using ComicPos.Core.Services
+@inject ICustomerService CustomersService
+@inject ISalesHistoryService History
+@inject IPullListService PullLists
+@inject IInventoryService Inventory
+@inject ICheckoutService Checkout
+@rendermode InteractiveServer
+
+<PageTitle>Customers - Comic POS</PageTitle>
+
+<div class="page-header">
+    <h1>Customers</h1>
+</div>
+
+<div class="breadcrumb">
+    @if (_screen != Screen.List)
+    {
+        <button class="btn-ghost btn-sm" @onclick="GoBack">&larr; Back</button>
+    }
+    <h1>@HeaderText</h1>
+</div>
+
+@if (_screen == Screen.List)
+{
+    <div class="toolbar">
+        <input type="text" class="search-box" placeholder="Search customers..." value="@_search" @oninput="OnSearchInput" />
+        <button class="btn-primary" @onclick="@(() => _showAddCustomer = true)">+ Add Customer</button>
+    </div>
+
+    @if (_listRows.Count == 0)
+    {
+        <p class="empty-state">No customers found.</p>
+    }
+    else
+    {
+        <table class="pos-table">
+            <thead><tr><th>Name</th><th>Email</th><th>Phone</th><th></th></tr></thead>
+            <tbody>
+                @foreach (var c in _listRows)
+                {
+                    <tr style="cursor:pointer" @onclick="@(() => SelectCustomer(c))">
+                        <td>@c.Name</td>
+                        <td>@(c.Email ?? "")</td>
+                        <td>@(c.Phone ?? "")</td>
+                        <td>@(c.IsActive ? "" : "Inactive")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+}
+else if (_screen == Screen.Detail && _selectedCustomer != null)
+{
+    <p class="help-text">Email: @(_selectedCustomer.Email ?? "(none)")</p>
+    <p class="help-text">Phone: @(_selectedCustomer.Phone ?? "(none)")</p>
+
+    <div class="btn-row">
+        <button class="btn-ghost btn-sm" @onclick="ShowEdit">Edit</button>
+        <button class="btn-ghost btn-sm" @onclick="OpenSaleHistory">Sale History</button>
+        <button class="btn-ghost btn-sm" @onclick="@(() => GoToPullList())">Pull List</button>
+        <button class="btn-ghost btn-sm" @onclick="ToggleActive">@(_selectedCustomer.IsActive ? "Deactivate" : "Activate")</button>
+    </div>
+}
+else if (_screen == Screen.Edit && _selectedCustomer != null)
+{
+    <div class="form-row">
+        <label>Name:*</label>
+        <input type="text" value="@_editName" @oninput="e => _editName = e.Value?.ToString() ?? string.Empty" />
+    </div>
+    <div class="form-row">
+        <label>Email:</label>
+        <input type="text" value="@_editEmail" @oninput="e => _editEmail = e.Value?.ToString() ?? string.Empty" />
+    </div>
+    <div class="form-row">
+        <label>Phone:</label>
+        <input type="text" value="@_editPhone" @oninput="e => _editPhone = e.Value?.ToString() ?? string.Empty" />
+    </div>
+    @if (_editError != null)
+    {
+        <p class="error-text">@_editError</p>
+    }
+    <div class="form-actions">
+        <button class="btn-ghost" @onclick="ShowDetail">Cancel</button>
+        <button class="btn-primary" @onclick="SaveEdit">Save</button>
+    </div>
+}
+else if (_screen == Screen.HistorySeries)
+{
+    <div class="toolbar">
+        <input type="text" class="search-box" placeholder="Search series..." value="@_historySearch" @oninput="OnHistorySearchInput" />
+    </div>
+    @if (_historySeriesNames.Count == 0)
+    {
+        <p class="empty-state">No purchase history found.</p>
+    }
+    else
+    {
+        <div class="list-rows">
+            @foreach (var name in _historySeriesNames)
+            {
+                <div class="list-row" style="cursor:pointer" @onclick="@(() => GoToHistoryIssues(name))">
+                    <div class="list-row-main"><span class="list-row-title">@name</span></div>
+                </div>
+            }
+        </div>
+    }
+}
+else if (_screen == Screen.HistoryIssues)
+{
+    @if (_historyIssueRows.Count == 0)
+    {
+        <p class="empty-state">No purchases on file for this series.</p>
+    }
+    else
+    {
+        <table class="pos-table">
+            <thead><tr><th>Issue #</th><th>Times Bought</th><th>Last Bought</th></tr></thead>
+            <tbody>
+                @foreach (var row in _historyIssueRows)
+                {
+                    <tr style="cursor:pointer" @onclick="@(() => GoToHistoryLines(row.IssueNumber))">
+                        <td>@row.IssueNumber.ToString("0.##")</td>
+                        <td>@row.TimesBought</td>
+                        <td>@row.LastBought.ToString("d")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+}
+else if (_screen == Screen.HistoryLines)
+{
+    @if (_historyLines.Count == 0)
+    {
+        <p class="empty-state">No sales on file for this issue.</p>
+    }
+    else
+    {
+        <table class="pos-table">
+            <thead><tr><th>Cover</th><th>Quantity</th><th>Price Each</th><th>Discount %</th><th>Date</th><th>Status</th><th></th></tr></thead>
+            <tbody>
+                @foreach (var line in _historyLines)
+                {
+                    <tr style="@(line.Sale.IsVoided ? "color:var(--text-muted)" : "")">
+                        <td>@line.Cover.CoverLetter</td>
+                        <td>@line.Quantity</td>
+                        <td>@line.PriceEach.ToString("0.00")</td>
+                        <td>@line.DiscountPercent.ToString("0.00")</td>
+                        <td>@line.Sale.SoldAt.ToString("g")</td>
+                        <td>@(line.Sale.IsVoided ? "VOIDED" : "")</td>
+                        <td>
+                            @if (!line.Sale.IsVoided)
+                            {
+                                <button class="btn-ghost btn-sm" @onclick="@(() => RequestVoid(line))">Void Sale</button>
+                            }
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+    @if (_voidError != null)
+    {
+        <p class="error-text">@_voidError</p>
+    }
+}
+else if (_screen == Screen.PullList && _selectedCustomer != null)
+{
+    @if (_pullEntries.Count == 0)
+    {
+        <p class="empty-state">Nothing on this customer's pull list yet.</p>
+    }
+    else
+    {
+        <table class="pos-table">
+            <thead><tr><th>Series</th><th>Preferred Cover</th><th>Qty</th><th>Notes</th></tr></thead>
+            <tbody>
+                @foreach (var entry in _pullEntries)
+                {
+                    <tr style="cursor:pointer" @onclick="@(() => OpenEditPullEntry(entry))">
+                        <td>@entry.Series.Name (@entry.Series.StartYear)</td>
+                        <td>@entry.PreferredCoverLetter</td>
+                        <td>@entry.Quantity</td>
+                        <td>@(entry.Notes ?? "")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+
+    <div class="panel" style="margin-top:16px">
+        <p class="list-row-title">Add a series</p>
+        <input type="text" class="search-box" placeholder="Search a series to add..." value="@_pullSearch" @oninput="OnPullSearchInput" />
+        @if (_pullSeriesResults.Count > 0)
+        {
+            <div class="list-rows" style="margin-top:8px">
+                @foreach (var s in _pullSeriesResults)
+                {
+                    <div class="list-row" style="cursor:pointer" @onclick="@(() => OpenAddPullEntry(s))">
+                        <div class="list-row-main">
+                            <span class="list-row-title">@s.Name</span>
+                            <span class="list-row-sub">@s.StartYear</span>
+                        </div>
+                    </div>
+                }
+            </div>
+        }
+    </div>
+}
+
+<AddCustomerModal Show="_showAddCustomer" OnSaved="OnCustomerAdded" OnClose="@(() => _showAddCustomer = false)" />
+
+<PullListEntryModal Show="_showPullEntryModal" SeriesLabel="@_pullModalSeriesLabel" InitialCover="@_pullModalInitialCover"
+                     InitialQuantity="_pullModalInitialQuantity" InitialNotes="@_pullModalInitialNotes"
+                     IsEditingExisting="@(_pullModalEditingEntryId != null)" KnownCoverLetters="_pullModalKnownCovers"
+                     OnSave="OnPullEntrySave" OnRemove="OnPullEntryRemove" OnClose="@(() => _showPullEntryModal = false)" />
+
+@if (_confirmVoidLine != null)
+{
+    <Modal Show="true" Title="Void Sale" OnBackdropClick="@(() => _confirmVoidLine = null)">
+        <p>Void this entire sale from @_confirmVoidLine.Sale.SoldAt.ToString("g")? This restores stock for every item on that sale.</p>
+        <div class="form-actions">
+            <button class="btn-ghost" @onclick="@(() => _confirmVoidLine = null)">Cancel</button>
+            <button class="btn-primary" @onclick="ConfirmVoid">Void Sale</button>
+        </div>
+    </Modal>
+}
+
+@code {
+    private enum Screen { List, Detail, Edit, HistorySeries, HistoryIssues, HistoryLines, PullList }
+
+    private Screen _screen = Screen.List;
+    private string _search = "";
+    private List<Customer> _listRows = new();
+    private Customer? _selectedCustomer;
+
+    private bool _showAddCustomer;
+
+    private string _editName = "";
+    private string _editEmail = "";
+    private string _editPhone = "";
+    private string? _editError;
+
+    private List<SaleLine> _customerHistory = new();
+    private string _historySearch = "";
+    private List<string> _historySeriesNames = new();
+    private string? _selectedSeriesName;
+    private List<HistoryIssueRow> _historyIssueRows = new();
+    private float? _selectedIssueNumber;
+    private List<SaleLine> _historyLines = new();
+    private SaleLine? _confirmVoidLine;
+    private string? _voidError;
+
+    private List<PullListEntry> _pullEntries = new();
+    private string _pullSearch = "";
+    private List<Series> _pullSeriesResults = new();
+
+    private bool _showPullEntryModal;
+    private string _pullModalSeriesLabel = "";
+    private string _pullModalInitialCover = "A";
+    private int _pullModalInitialQuantity = 1;
+    private string? _pullModalInitialNotes;
+    private List<string> _pullModalKnownCovers = new();
+    private int? _pullModalEditingEntryId;
+    private int _pullModalSeriesId;
+
+    private class HistoryIssueRow
+    {
+        public float IssueNumber { get; set; }
+        public int TimesBought { get; set; }
+        public DateTime LastBought { get; set; }
+    }
+
+    protected override void OnInitialized() => LoadList();
+
+    private string HeaderText => _screen switch
+    {
+        Screen.List => "Customers",
+        Screen.Detail => _selectedCustomer?.Name ?? "",
+        Screen.Edit => $"Edit {_selectedCustomer?.Name}",
+        Screen.HistorySeries => $"{_selectedCustomer?.Name} — Purchase History",
+        Screen.HistoryIssues => $"{_selectedCustomer?.Name} — {_selectedSeriesName} — Issues",
+        Screen.HistoryLines => $"{_selectedCustomer?.Name} — {_selectedSeriesName} #{_selectedIssueNumber:0.##} — Sales",
+        Screen.PullList => $"{_selectedCustomer?.Name} — Pull List",
+        _ => ""
+    };
+
+    private void LoadList()
+    {
+        _screen = Screen.List;
+        _selectedCustomer = null;
+        _listRows = CustomersService.SearchCustomers(_search);
+    }
+
+    private void OnSearchInput(ChangeEventArgs e)
+    {
+        _search = e.Value?.ToString() ?? "";
+        LoadList();
+    }
+
+    private void SelectCustomer(Customer c)
+    {
+        _selectedCustomer = c;
+        ShowDetail();
+    }
+
+    private void ShowDetail()
+    {
+        if (_selectedCustomer == null) { LoadList(); return; }
+        _screen = Screen.Detail;
+    }
+
+    private void OnCustomerAdded()
+    {
+        _showAddCustomer = false;
+        LoadList();
+    }
+
+    private void ShowEdit()
+    {
+        if (_selectedCustomer == null) return;
+        _screen = Screen.Edit;
+        _editName = _selectedCustomer.Name;
+        _editEmail = _selectedCustomer.Email ?? "";
+        _editPhone = _selectedCustomer.Phone ?? "";
+        _editError = null;
+    }
+
+    private void SaveEdit()
+    {
+        if (_selectedCustomer == null) return;
+        if (string.IsNullOrWhiteSpace(_editName))
+        {
+            _editError = "Name is required.";
+            return;
+        }
+
+        _selectedCustomer.Name = _editName;
+        _selectedCustomer.Email = string.IsNullOrWhiteSpace(_editEmail) ? null : _editEmail;
+        _selectedCustomer.Phone = string.IsNullOrWhiteSpace(_editPhone) ? null : _editPhone;
+        CustomersService.UpdateCustomer(_selectedCustomer);
+        ShowDetail();
+    }
+
+    private void ToggleActive()
+    {
+        if (_selectedCustomer == null) return;
+        _selectedCustomer.IsActive = !_selectedCustomer.IsActive;
+        CustomersService.UpdateCustomer(_selectedCustomer);
+        ShowDetail();
+    }
+
+    private void OpenSaleHistory()
+    {
+        if (_selectedCustomer == null) return;
+        _customerHistory = History.GetHistoryForCustomer(_selectedCustomer.Id);
+        _selectedSeriesName = null;
+        _selectedIssueNumber = null;
+        _historySearch = "";
+        ShowHistorySeries();
+    }
+
+    private void ShowHistorySeries()
+    {
+        _screen = Screen.HistorySeries;
+        _historySeriesNames = _customerHistory
+            .Select(l => l.Cover.Issue.Series)
+            .DistinctBy(s => s.Name)
+            .Where(s => string.IsNullOrWhiteSpace(_historySearch) ||
+                        s.Name.Contains(_historySearch, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(s => s.Name)
+            .Select(s => $"{s.Name} ({s.StartYear})")
+            .ToList();
+    }
+
+    private void OnHistorySearchInput(ChangeEventArgs e)
+    {
+        _historySearch = e.Value?.ToString() ?? "";
+        ShowHistorySeries();
+    }
+
+    private void GoToHistoryIssues(string seriesDisplayName)
+    {
+        // Strip the trailing " (year)" the list row shows - GroupBy/Where
+        // below match against the raw Series.Name, same as the desktop
+        // app's row.Tag (which stored the plain name, not the display string).
+        var seriesName = _customerHistory
+            .Select(l => l.Cover.Issue.Series)
+            .FirstOrDefault(s => $"{s.Name} ({s.StartYear})" == seriesDisplayName)?.Name;
+        if (seriesName == null) return;
+
+        _selectedSeriesName = seriesName;
+        _screen = Screen.HistoryIssues;
+        _historyIssueRows = _customerHistory
+            .Where(l => l.Cover.Issue.Series.Name == _selectedSeriesName)
+            .GroupBy(l => l.Cover.Issue.IssueNumber)
+            .OrderBy(g => g.Key)
+            .Select(g => new HistoryIssueRow
+            {
+                IssueNumber = g.Key,
+                TimesBought = g.Sum(l => l.Quantity),
+                LastBought = g.Max(l => l.Sale.SoldAt)
+            })
+            .ToList();
+    }
+
+    private void GoToHistoryLines(float issueNumber)
+    {
+        _selectedIssueNumber = issueNumber;
+        _screen = Screen.HistoryLines;
+        LoadHistoryLines();
+    }
+
+    private void LoadHistoryLines()
+    {
+        if (_selectedSeriesName == null || _selectedIssueNumber == null) return;
+        _historyLines = _customerHistory
+            .Where(l => l.Cover.Issue.Series.Name == _selectedSeriesName && l.Cover.Issue.IssueNumber == _selectedIssueNumber)
+            .OrderByDescending(l => l.Sale.SoldAt)
+            .ToList();
+    }
+
+    private void RequestVoid(SaleLine line)
+    {
+        _voidError = null;
+        if (line.Sale.IsVoided)
+        {
+            _voidError = "That sale is already voided.";
+            return;
+        }
+        _confirmVoidLine = line;
+    }
+
+    private void ConfirmVoid()
+    {
+        if (_confirmVoidLine == null) return;
+        try
+        {
+            Checkout.VoidSale(_confirmVoidLine.SaleId);
+            // Refresh the in-memory history snapshot too, so Status updates.
+            if (_selectedCustomer != null)
+                _customerHistory = History.GetHistoryForCustomer(_selectedCustomer.Id);
+        }
+        catch (Exception ex)
+        {
+            _voidError = ex.Message;
+        }
+        _confirmVoidLine = null;
+        LoadHistoryLines();
+    }
+
+    private void GoToPullList()
+    {
+        if (_selectedCustomer == null) return;
+        _screen = Screen.PullList;
+        _pullSearch = "";
+        _pullSeriesResults = new();
+        RefreshPullEntries();
+    }
+
+    private void RefreshPullEntries()
+    {
+        if (_selectedCustomer == null) return;
+        _pullEntries = PullLists.GetForCustomer(_selectedCustomer.Id);
+    }
+
+    private void OnPullSearchInput(ChangeEventArgs e)
+    {
+        _pullSearch = e.Value?.ToString() ?? "";
+        _pullSeriesResults = string.IsNullOrWhiteSpace(_pullSearch)
+            ? Inventory.GetAllSeriesForDisplay()
+            : Inventory.SearchSeriesForDisplay(_pullSearch);
+    }
+
+    private void OpenAddPullEntry(Series series)
+    {
+        var knownCovers = Inventory.GetKnownCoverLetters(series.Id);
+        _pullModalSeriesLabel = $"{series.Name} ({series.StartYear})";
+        _pullModalInitialCover = knownCovers.Count > 0 ? knownCovers[0] : "A";
+        _pullModalInitialQuantity = 1;
+        _pullModalInitialNotes = null;
+        _pullModalKnownCovers = knownCovers;
+        _pullModalEditingEntryId = null;
+        _pullModalSeriesId = series.Id;
+        _showPullEntryModal = true;
+    }
+
+    private void OpenEditPullEntry(PullListEntry entry)
+    {
+        var knownCovers = Inventory.GetKnownCoverLetters(entry.SeriesId);
+        _pullModalSeriesLabel = $"{entry.Series.Name} ({entry.Series.StartYear})";
+        _pullModalInitialCover = entry.PreferredCoverLetter;
+        _pullModalInitialQuantity = entry.Quantity;
+        _pullModalInitialNotes = entry.Notes;
+        _pullModalKnownCovers = knownCovers;
+        _pullModalEditingEntryId = entry.Id;
+        _pullModalSeriesId = entry.SeriesId;
+        _showPullEntryModal = true;
+    }
+
+    private void OnPullEntrySave((string CoverLetter, int Quantity, string? Notes) result)
+    {
+        if (_pullModalEditingEntryId.HasValue)
+        {
+            PullLists.UpdatePullListEntry(_pullModalEditingEntryId.Value, result.CoverLetter, result.Quantity, result.Notes);
+        }
+        else if (_selectedCustomer != null)
+        {
+            PullLists.AddToPullList(_selectedCustomer.Id, _pullModalSeriesId, result.CoverLetter, result.Quantity, result.Notes);
+            _pullSearch = "";
+            _pullSeriesResults = new();
+        }
+
+        _showPullEntryModal = false;
+        RefreshPullEntries();
+    }
+
+    private void OnPullEntryRemove()
+    {
+        if (_pullModalEditingEntryId.HasValue)
+            PullLists.RemoveFromPullList(_pullModalEditingEntryId.Value);
+
+        _showPullEntryModal = false;
+        RefreshPullEntries();
+    }
+
+    private void GoBack()
+    {
+        switch (_screen)
+        {
+            case Screen.Detail:
+                LoadList();
+                break;
+            case Screen.Edit:
+                ShowDetail();
+                break;
+            case Screen.HistorySeries:
+                ShowDetail();
+                break;
+            case Screen.HistoryIssues:
+                _selectedSeriesName = null;
+                ShowHistorySeries();
+                break;
+            case Screen.HistoryLines:
+                _selectedIssueNumber = null;
+                _screen = Screen.HistoryIssues;
+                break;
+            case Screen.PullList:
+                ShowDetail();
+                break;
+            default:
+                LoadList();
+                break;
+        }
+    }
+}
