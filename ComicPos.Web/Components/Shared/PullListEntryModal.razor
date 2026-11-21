@@ -1,0 +1,123 @@
+@* Add-or-edit a customer's pull-list subscription to one series - web
+   port of PullListEntryForm.cs. Used both for a brand-new entry and for
+   editing one already on the list; when editing, a "Remove from Pull
+   List" action is shown too, with its own one-step confirm (same as the
+   desktop dialog's Yes/No before closing with DialogResult.Abort). *@
+@namespace ComicPos.Web.Components.Shared
+
+<Modal Show="Show" Title="@(IsEditingExisting ? "Edit Pull List Entry" : "Add to Pull List")" OnBackdropClick="Close">
+    <p class="list-row-title" style="margin:0 0 12px">@SeriesLabel</p>
+
+    <div class="form-row">
+        <label>Cover:*</label>
+        <input type="text" list="pull-cover-letters" maxlength="1" value="@_cover" @oninput="e => _cover = e.Value?.ToString() ?? string.Empty" />
+        <datalist id="pull-cover-letters">
+            @foreach (var c in KnownCoverLetters)
+            {
+                <option value="@c"></option>
+            }
+        </datalist>
+    </div>
+    <div class="form-row">
+        <label>Quantity:*</label>
+        <input type="text" value="@_quantity" @oninput="e => _quantity = e.Value?.ToString() ?? string.Empty" />
+    </div>
+    <div class="form-row">
+        <label>Notes:</label>
+        <textarea rows="3" @oninput="e => _notes = e.Value?.ToString() ?? string.Empty">@_notes</textarea>
+    </div>
+
+    @if (_error != null)
+    {
+        <p class="error-text">@_error</p>
+    }
+
+    <div class="form-actions" style="justify-content:space-between">
+        @if (IsEditingExisting)
+        {
+            <button class="btn-ghost" style="color:var(--danger)" @onclick="RequestRemove">Remove from Pull List</button>
+        }
+        else
+        {
+            <span></span>
+        }
+        <div style="display:flex;gap:10px">
+            <button class="btn-ghost" @onclick="Close">Cancel</button>
+            <button class="btn-primary" @onclick="Save">Save</button>
+        </div>
+    </div>
+</Modal>
+
+@if (_confirmingRemove)
+{
+    <Modal Show="true" Title="Remove" OnBackdropClick="@(() => _confirmingRemove = false)">
+        <p>Remove this series from the customer's pull list?</p>
+        <div class="form-actions">
+            <button class="btn-ghost" @onclick="@(() => _confirmingRemove = false)">No</button>
+            <button class="btn-primary" @onclick="ConfirmRemove">Yes, Remove</button>
+        </div>
+    </Modal>
+}
+
+@code {
+    [Parameter] public bool Show { get; set; }
+    [Parameter] public string SeriesLabel { get; set; } = "";
+    [Parameter] public string InitialCover { get; set; } = "A";
+    [Parameter] public int InitialQuantity { get; set; } = 1;
+    [Parameter] public string? InitialNotes { get; set; }
+    [Parameter] public bool IsEditingExisting { get; set; }
+    [Parameter] public List<string> KnownCoverLetters { get; set; } = new();
+    [Parameter] public EventCallback<(string CoverLetter, int Quantity, string? Notes)> OnSave { get; set; }
+    [Parameter] public EventCallback OnRemove { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    private bool _wasShown;
+    private bool _confirmingRemove;
+    private string _cover = "A";
+    private string _quantity = "1";
+    private string _notes = "";
+    private string? _error;
+
+    protected override void OnParametersSet()
+    {
+        if (Show && !_wasShown)
+        {
+            _cover = InitialCover;
+            _quantity = InitialQuantity.ToString();
+            _notes = InitialNotes ?? "";
+            _error = null;
+            _confirmingRemove = false;
+        }
+        _wasShown = Show;
+    }
+
+    private async Task Close() => await OnClose.InvokeAsync();
+
+    private void RequestRemove() => _confirmingRemove = true;
+
+    private async Task ConfirmRemove()
+    {
+        _confirmingRemove = false;
+        await OnRemove.InvokeAsync();
+    }
+
+    private async Task Save()
+    {
+        _error = null;
+        var cover = _cover.Trim().ToUpperInvariant();
+        if (cover.Length != 1 || !char.IsLetter(cover[0]))
+        {
+            _error = "Cover letter must be a single letter (A, B, C, ...).";
+            return;
+        }
+
+        if (!int.TryParse(_quantity.Trim(), out var qty) || qty < 1)
+        {
+            _error = "Quantity must be a whole number, 1 or more.";
+            return;
+        }
+
+        var notes = string.IsNullOrWhiteSpace(_notes) ? null : _notes.Trim();
+        await OnSave.InvokeAsync((cover, qty, notes));
+    }
+}
