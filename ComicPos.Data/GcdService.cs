@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using ComicPos.Core.Models;
@@ -138,6 +139,14 @@ public class GcdService : IGcdService
             Thread.Sleep(RequestDelay);
             listJson = Http.GetStringAsync(url).GetAwaiter().GetResult();
         }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            return RateLimited($"{ex.Message} ({url})");
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Forbidden)
+        {
+            return Blocked($"{ex.Message} ({url})");
+        }
         catch (Exception ex)
         {
             return Fail($"GCD request failed: {ex.GetType().Name}", $"{ex.Message} ({url})");
@@ -169,6 +178,14 @@ public class GcdService : IGcdService
             Thread.Sleep(RequestDelay);
             issueJson = Http.GetStringAsync(chosen.api_url).GetAwaiter().GetResult();
         }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            return RateLimited($"{ex.Message} ({chosen.api_url})");
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Forbidden)
+        {
+            return Blocked($"{ex.Message} ({chosen.api_url})");
+        }
         catch (Exception ex)
         {
             return Fail($"GCD detail request failed: {ex.GetType().Name}", $"{ex.Message} ({chosen.api_url})");
@@ -191,6 +208,14 @@ public class GcdService : IGcdService
         try
         {
             bytes = Http.GetByteArrayAsync(detail.cover).GetAwaiter().GetResult();
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            return RateLimited($"{ex.Message} ({detail.cover})");
+        }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.Forbidden)
+        {
+            return Blocked($"{ex.Message} ({detail.cover})");
         }
         catch (Exception ex)
         {
@@ -220,6 +245,20 @@ public class GcdService : IGcdService
 
     private static GcdCoverLookupResult Fail(string reason, string? detail) =>
         new GcdCoverLookupResult { ImagePath = null, Reason = reason, Detail = detail };
+
+    private static GcdCoverLookupResult RateLimited(string detail) =>
+        new GcdCoverLookupResult { ImagePath = null, Reason = "GCD rate limit hit (429) - stop using it for the rest of this run", Detail = detail, IsRateLimited = true };
+
+    // GCD's image CDN (files1.comics.org) is separately protected by
+    // Cloudflare, and a confirmed report on GCD's own mailing list says
+    // that block can persist for 24+ hours once tripped - a different
+    // (and worse) situation than the API's own 429, which just needs to
+    // wait out an hourly window. Treated the same as a rate limit (stop
+    // calling GCD for the rest of this run) so a persistent 403 doesn't
+    // turn into hundreds of further blocked requests that could extend
+    // the block further.
+    private static GcdCoverLookupResult Blocked(string detail) =>
+        new GcdCoverLookupResult { ImagePath = null, Reason = "GCD blocked this app (403, likely Cloudflare) - reports say this can take 24+ hours to clear, not just a short wait", Detail = detail, IsRateLimited = true };
 
     private static string Truncate(string? s, int max)
     {
