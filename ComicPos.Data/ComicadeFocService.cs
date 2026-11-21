@@ -246,7 +246,8 @@ public class ComicadeFocService : IComicadeFocService
             ReleaseDate = ParseIsoDate(item, "release_date"),
             FocDate = ParseIsoDate(item, "foc_date"),
             Upc = GetString(item, "upc"),
-            CoverImageUrl = GetString(item, "thumbCover")
+            CoverImageUrl = GetString(item, "thumbCover"),
+            Description = GetString(item, "description")
         };
     }
 
