@@ -51,18 +51,25 @@ public class AddItemForm : Form
 
         Text = "Add New Item";
         Width = 460;
-        Height = 660;
+        // A bit taller than before - scanPanel and the footer button row
+        // both grew (wrapped hint text, taller rounded buttons).
+        Height = 700;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
 
         // --- Barcode lookup strip, at the top so it's the first thing used ---
-        var scanPanel = new Panel { Dock = DockStyle.Top, Height = 90, Padding = new Padding(12, 10, 12, 0) };
+        // Grown from 90 - lblLookupStatus now wraps to two lines (AutoSize)
+        // and barcodeRow grew to fit the taller Look Up button, so the old
+        // fixed 90 was no longer enough room for its own children.
+        var scanPanel = new Panel { Dock = DockStyle.Top, Height = 120, Padding = new Padding(12, 10, 12, 0) };
 
         var lblBarcode = new Label { Text = "Scan or type barcode:", Dock = DockStyle.Top, Height = 20, TextAlign = ContentAlignment.MiddleLeft, Font = UiTheme.BoldFont };
 
-        var barcodeRow = new Panel { Dock = DockStyle.Top, Height = 32 };
+        // Tall enough for the Look Up button's new height floor
+        // (UiTheme.StyleButton) - at the old 32 it clipped the button.
+        var barcodeRow = new Panel { Dock = DockStyle.Top, Height = 40 };
         btnLookUp.Text = "Look Up";
         btnLookUp.Dock = DockStyle.Right;
         btnLookUp.Width = 90;
@@ -79,7 +86,19 @@ public class AddItemForm : Form
         barcodeRow.Controls.Add(btnLookUp);
 
         lblLookupStatus.Dock = DockStyle.Top;
-        lblLookupStatus.Height = 28;
+        // AutoSize, not a fixed Height - this is a full sentence that
+        // wraps to two lines at this dialog's width, and the fixed 28px
+        // was only tall enough for one, clipping the wrapped second line
+        // ("...to auto-fill everything below, or just fill the form in by
+        // hand." was getting cut off after "to").
+        lblLookupStatus.AutoSize = true;
+        // AutoSize alone doesn't wrap - a Label with AutoSize measures its
+        // text on one line and just grows to fit it, so without a width
+        // cap this sentence was overflowing past the dialog's right edge
+        // instead of wrapping (Dock=Top stretches the control but not the
+        // text layout). Capping MaximumSize.Width forces the wrap while
+        // still letting AutoSize grow the height to fit both lines.
+        lblLookupStatus.MaximumSize = new Size(420, 0);
         lblLookupStatus.TextAlign = ContentAlignment.MiddleLeft;
         lblLookupStatus.ForeColor = UiTheme.TextMuted;
         lblLookupStatus.Text = "Scan a barcode already in New Books to auto-fill everything below, or just fill the form in by hand.";
@@ -157,7 +176,7 @@ public class AddItemForm : Form
         lblError.ForeColor = Color.Red;
         lblError.TextAlign = ContentAlignment.MiddleLeft;
 
-        var buttonPanel = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 44, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(12) };
+        var buttonPanel = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 56, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(10) };
         btnCancel.Text = "Cancel";
         btnCancel.Width = 90;
         btnCancel.DialogResult = DialogResult.Cancel;
