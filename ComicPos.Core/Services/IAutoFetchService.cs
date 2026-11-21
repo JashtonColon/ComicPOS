@@ -16,6 +16,12 @@ public class AutoFetchResult
 
     public List<string> Added { get; } = new();
     public List<string> Errors { get; } = new();
+
+    // The full step-by-step trace of this run (same text DebugLog writes
+    // to checknow-debug.txt) - exposed here too so a caller like the web
+    // app's New Books page can show it inline instead of making someone
+    // go find that file on disk.
+    public string Trace = "";
 }
 
 // Fully automatic: every series in inventory gets matched to a Comic Vine
