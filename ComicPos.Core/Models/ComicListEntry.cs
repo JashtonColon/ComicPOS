@@ -44,6 +44,11 @@ public class ComicListEntry
     // downloads it immediately so the issue has a real cover right away,
     // instead of needing AutoFetchService's later Comic Vine backfill pass.
     public string? CoverImageUrl { get; set; }
+
+    // The publisher's own solicit blurb - what shows up in the New Books
+    // detail popup as the issue's description. comicade.com is the only
+    // source that has this text at all.
+    public string? Description { get; set; }
 }
 
 // One week's worth of entries, plus the street date they all ship on
