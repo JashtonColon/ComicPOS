@@ -1,0 +1,371 @@
+@page "/checkout"
+@using System.Text
+@using ComicPos.Core.Models
+@using ComicPos.Core.Services
+@inject ICheckoutService CheckoutService
+@inject ICustomerService Customers
+@inject IStoreSettingsService StoreSettingsService
+@rendermode InteractiveServer
+
+<PageTitle>Checkout - Comic POS</PageTitle>
+
+<div class="page-header">
+    <h1>Checkout</h1>
+</div>
+
+<div class="checkout-layout">
+    <div class="checkout-main">
+        <div class="toolbar">
+            <input type="text" class="search-box" placeholder="Scan barcode..." value="@_barcode"
+                   @oninput="e => _barcode = e.Value?.ToString() ?? string.Empty"
+                   @onkeydown="HandleBarcodeKeyDown" />
+        </div>
+        @if (_scanError != null)
+        {
+            <p class="error-text">@_scanError</p>
+        }
+
+        @if (_cartRows.Count == 0)
+        {
+            <p class="empty-state">Cart is empty - scan an item to begin.</p>
+        }
+        else
+        {
+            <table class="pos-table">
+                <thead>
+                    <tr><th>Series</th><th>Issue</th><th>Cover</th><th>Qty</th><th>Price Each</th><th>Discount %</th><th>Total</th><th></th></tr>
+                </thead>
+                <tbody>
+                    @foreach (var row in _cartRows)
+                    {
+                        <tr>
+                            <td>@row.SeriesLabel</td>
+                            <td>@row.Line.Cover.Issue.IssueNumber.ToString("0.##")</td>
+                            <td>@row.Line.Cover.CoverLetter</td>
+                            <td><input type="text" style="width:50px" value="@row.Quantity" @onchange="e => SaveQuantity(row, e.Value?.ToString() ?? string.Empty)" /></td>
+                            <td><input type="text" style="width:70px" value="@row.PriceEach" @onchange="e => SavePriceEach(row, e.Value?.ToString() ?? string.Empty)" /></td>
+                            <td><input type="text" style="width:60px" value="@row.Discount" @onchange="e => SaveDiscount(row, e.Value?.ToString() ?? string.Empty)" /></td>
+                            <td>@row.LineTotal.ToString("C")</td>
+                            <td><button class="btn-ghost btn-sm" @onclick="@(() => RemoveLine(row.Line))">Remove</button></td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    </div>
+
+    <div class="checkout-side">
+        <div class="panel">
+            <p class="list-row-title">@_customerLabel</p>
+            <input type="text" class="search-box" placeholder="Search customer (optional)..." value="@_customerSearch" @oninput="OnCustomerSearchInput" />
+            @if (_customerResults.Count > 0)
+            {
+                <div class="list-rows" style="margin-top:8px">
+                    @foreach (var c in _customerResults)
+                    {
+                        <div class="list-row" style="cursor:pointer;padding:8px 10px" @onclick="@(() => SelectCustomer(c))">
+                            <div class="list-row-main"><span class="list-row-title">@c.Name</span></div>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+
+        <div class="panel" style="margin-top:14px">
+            <div class="totals-row"><span>Subtotal</span><span>@_subtotal.ToString("C")</span></div>
+            <div class="totals-row"><span>Tax</span><span>@_tax.ToString("C")</span></div>
+            <div class="totals-row grand"><span>Total</span><span>@_total.ToString("C")</span></div>
+
+            <div class="form-row" style="margin-top:10px">
+                <label>Cash Tendered:</label>
+                <input type="text" value="@_cashTendered" @oninput="OnCashTenderedInput" />
+            </div>
+            <div class="totals-row">
+                <span>Change Due</span>
+                <span style="@(_change < 0 ? "color:var(--danger)" : "")">@_changeDisplay</span>
+            </div>
+
+            @if (_completeError != null)
+            {
+                <p class="error-text">@_completeError</p>
+            }
+
+            <button class="btn-primary" style="width:100%;margin-top:10px" @onclick="CompleteSaleClicked">Complete Sale</button>
+        </div>
+    </div>
+</div>
+
+@if (_lowStockWarnings != null)
+{
+    <Modal Show="true" Title="Low Stock Warning" OnBackdropClick="CancelLowStockConfirm">
+        <p>Some items are low on stock:</p>
+        <ul>
+            @foreach (var w in _lowStockWarnings)
+            {
+                <li>@w</li>
+            }
+        </ul>
+        <p>Complete the sale anyway?</p>
+        <div class="form-actions">
+            <button class="btn-ghost" @onclick="CancelLowStockConfirm">No</button>
+            <button class="btn-primary" @onclick="ConfirmLowStockAndComplete">Yes, Complete Sale</button>
+        </div>
+    </Modal>
+}
+
+<ReceiptModal Show="_showReceipt" Body="@_receiptBody" StoreName="@_receiptStoreName"
+              Address="@_receiptAddress" Phone="@_receiptPhone" HasLogo="_receiptHasLogo" OnClose="CloseReceipt" />
+
+@code {
+    private const int ReceiptWidth = 34;
+
+    private Sale _sale = null!;
+    private List<CartRow> _cartRows = new();
+    private string _barcode = "";
+    private string? _scanError;
+
+    private string _customerSearch = "";
+    private List<Customer> _customerResults = new();
+    private string _customerLabel = "Customer: Walk-in";
+
+    private string _cashTendered = "";
+    private decimal _subtotal;
+    private decimal _tax;
+    private decimal _total;
+    private decimal _change;
+    private string _changeDisplay = "";
+    private string? _completeError;
+    private List<string>? _lowStockWarnings;
+
+    private bool _showReceipt;
+    private string _receiptBody = "";
+    private string _receiptStoreName = "";
+    private string _receiptAddress = "";
+    private string _receiptPhone = "";
+    private bool _receiptHasLogo;
+
+    private class CartRow
+    {
+        public SaleLine Line { get; set; } = null!;
+        public string SeriesLabel { get; set; } = "";
+        public string Quantity { get; set; } = "";
+        public string PriceEach { get; set; } = "";
+        public string Discount { get; set; } = "";
+        public decimal LineTotal { get; set; }
+    }
+
+    protected override void OnInitialized()
+    {
+        _sale = CheckoutService.StartSale();
+        RefreshCart();
+    }
+
+    private void RefreshCart()
+    {
+        _cartRows = _sale.Lines.Select(l => new CartRow
+        {
+            Line = l,
+            SeriesLabel = $"{l.Cover.Issue.Series.Name} ({l.Cover.Issue.Series.StartYear})",
+            Quantity = l.Quantity.ToString(),
+            PriceEach = l.PriceEach.ToString("0.00"),
+            Discount = l.DiscountPercent.ToString("0.00"),
+            LineTotal = l.PriceEach * l.Quantity * (1 - l.DiscountPercent / 100)
+        }).ToList();
+
+        RecalculateTotals();
+    }
+
+    private decimal GetSubtotal() => _sale.Lines.Sum(l => l.PriceEach * l.Quantity * (1 - l.DiscountPercent / 100));
+    private decimal GetTaxRate() => StoreSettingsService.Load().TaxRatePercent;
+
+    private void RecalculateTotals()
+    {
+        _subtotal = GetSubtotal();
+        _tax = _subtotal * (GetTaxRate() / 100);
+        _total = _subtotal + _tax;
+        UpdateChangeDue();
+    }
+
+    private void UpdateChangeDue()
+    {
+        if (decimal.TryParse(_cashTendered, out var tendered))
+        {
+            _change = tendered - _total;
+            _changeDisplay = _change.ToString("C");
+        }
+        else
+        {
+            _change = 0;
+            _changeDisplay = "";
+        }
+    }
+
+    private void OnCashTenderedInput(ChangeEventArgs e)
+    {
+        _cashTendered = e.Value?.ToString() ?? "";
+        UpdateChangeDue();
+    }
+
+    private void HandleBarcodeKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key != "Enter") return;
+
+        _scanError = null;
+        var barcode = _barcode;
+        var success = CheckoutService.ScanItem(_sale, barcode);
+        if (!success)
+        {
+            _scanError = $"Item with barcode {barcode} not found.";
+        }
+        else
+        {
+            RefreshCart();
+        }
+        _barcode = "";
+    }
+
+    private void SaveQuantity(CartRow row, string newValue)
+    {
+        if (int.TryParse(newValue, out var qty))
+        {
+            if (qty <= 0)
+                _sale.Lines.Remove(row.Line);
+            else
+                row.Line.Quantity = qty;
+        }
+        RefreshCart();
+    }
+
+    private void SavePriceEach(CartRow row, string newValue)
+    {
+        if (decimal.TryParse(newValue, out var price) && price >= 0)
+            row.Line.PriceEach = price;
+        RefreshCart();
+    }
+
+    private void SaveDiscount(CartRow row, string newValue)
+    {
+        // Clamped to 0-100 - an unclamped value over 100 would make the
+        // line's total (and the sale subtotal/tax/change due) negative.
+        if (decimal.TryParse(newValue, out var disc))
+            row.Line.DiscountPercent = Math.Clamp(disc, 0, 100);
+        RefreshCart();
+    }
+
+    private void RemoveLine(SaleLine line)
+    {
+        _sale.Lines.Remove(line);
+        RefreshCart();
+    }
+
+    private void OnCustomerSearchInput(ChangeEventArgs e)
+    {
+        _customerSearch = e.Value?.ToString() ?? "";
+        _customerResults = string.IsNullOrWhiteSpace(_customerSearch)
+            ? new List<Customer>()
+            : Customers.SearchCustomers(_customerSearch);
+    }
+
+    private void SelectCustomer(Customer customer)
+    {
+        _sale.CustomerId = customer.Id;
+        _customerLabel = $"Customer: {customer.Name}";
+        _customerSearch = "";
+        _customerResults = new List<Customer>();
+    }
+
+    private void CompleteSaleClicked()
+    {
+        _completeError = null;
+        if (_sale.Lines.Count == 0)
+        {
+            _completeError = "Scan at least one item first.";
+            return;
+        }
+
+        var warnings = CheckoutService.GetLowStockWarnings(_sale);
+        if (warnings.Count > 0)
+        {
+            _lowStockWarnings = warnings;
+            return;
+        }
+
+        FinishSale();
+    }
+
+    private void CancelLowStockConfirm() => _lowStockWarnings = null;
+
+    private void ConfirmLowStockAndComplete()
+    {
+        _lowStockWarnings = null;
+        FinishSale();
+    }
+
+    private void FinishSale()
+    {
+        var completingSale = _sale;
+
+        var subtotal = completingSale.Lines.Sum(l => l.PriceEach * l.Quantity * (1 - l.DiscountPercent / 100));
+        var tax = subtotal * (GetTaxRate() / 100);
+        var total = subtotal + tax;
+        decimal.TryParse(_cashTendered, out var tendered);
+        var change = tendered - total;
+
+        var store = StoreSettingsService.Load();
+        var receiptBody = BuildReceipt(completingSale, subtotal, tax, total, tendered, change);
+
+        CheckoutService.CompleteSale(completingSale);
+        _sale = CheckoutService.StartSale();
+        _customerLabel = "Customer: Walk-in";
+        _customerSearch = "";
+        _customerResults = new List<Customer>();
+        _cashTendered = "";
+        RefreshCart();
+
+        _receiptBody = receiptBody;
+        _receiptStoreName = store.StoreName;
+        _receiptAddress = store.Address;
+        _receiptPhone = store.Phone;
+        _receiptHasLogo = !string.IsNullOrWhiteSpace(store.LogoPath) && File.Exists(store.LogoPath);
+        _showReceipt = true;
+    }
+
+    private void CloseReceipt() => _showReceipt = false;
+
+    // Itemized body only - date, line items, totals, right-aligned amounts.
+    // The store name/address/phone/logo header is rendered by ReceiptModal.
+    private static string BuildReceipt(Sale sale, decimal subtotal, decimal tax, decimal total, decimal tendered, decimal change)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine(DateTime.Now.ToString("MM/dd/yyyy h:mm tt"));
+        sb.AppendLine(new string('-', ReceiptWidth));
+
+        foreach (var line in sale.Lines)
+        {
+            sb.AppendLine($"{line.Cover.Issue.Series.Name} #{line.Cover.Issue.IssueNumber:0.##} [{line.Cover.CoverLetter}]");
+            var qtyPrice = $"  {line.Quantity} x {line.PriceEach:C}";
+            var lineTotal = (line.PriceEach * line.Quantity * (1 - line.DiscountPercent / 100)).ToString("C");
+            sb.AppendLine(PadLine(qtyPrice, lineTotal));
+        }
+
+        sb.AppendLine(new string('-', ReceiptWidth));
+        sb.AppendLine(PadLine("Subtotal", subtotal.ToString("C")));
+        sb.AppendLine(PadLine("Tax", tax.ToString("C")));
+        sb.AppendLine(PadLine("TOTAL", total.ToString("C")));
+
+        if (tendered > 0)
+        {
+            sb.AppendLine(new string('-', ReceiptWidth));
+            sb.AppendLine(PadLine("Tendered", tendered.ToString("C")));
+            sb.AppendLine(PadLine("Change", change.ToString("C")));
+        }
+
+        return sb.ToString();
+    }
+
+    private static string PadLine(string left, string right)
+    {
+        var gap = Math.Max(1, ReceiptWidth - left.Length - right.Length);
+        return left + new string(' ', gap) + right;
+    }
+}
