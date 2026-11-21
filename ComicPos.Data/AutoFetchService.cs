@@ -12,15 +12,17 @@ public class AutoFetchService : IAutoFetchService
     private readonly IComicListService _comicList;
     private readonly IComicadeFocService _comicadeFoc;
     private readonly IGcdService _gcd;
+    private readonly IMetronService _metron;
     private readonly IStoreSettingsService _storeSettings;
 
-    public AutoFetchService(ComicDbContext db, IComicVineService comicVine, IComicListService comicList, IComicadeFocService comicadeFoc, IGcdService gcd, IStoreSettingsService storeSettings)
+    public AutoFetchService(ComicDbContext db, IComicVineService comicVine, IComicListService comicList, IComicadeFocService comicadeFoc, IGcdService gcd, IMetronService metron, IStoreSettingsService storeSettings)
     {
         _db = db;
         _comicVine = comicVine;
         _comicList = comicList;
         _comicadeFoc = comicadeFoc;
         _gcd = gcd;
+        _metron = metron;
         _storeSettings = storeSettings;
     }
 
@@ -569,12 +571,29 @@ public class AutoFetchService : IAutoFetchService
         // GCD, a separate and independent source, keeps going for all of
         // them regardless.
         var comicVineRateLimited = false;
+        // GCD's anonymous access is capped around 30 requests/hour
+        // (confirmed on GCD's own gcd-tech mailing list) - a hard quota,
+        // not something a longer per-call delay can avoid. Once it trips,
+        // every further call this run fails the exact same way, so this
+        // stops calling GCD AT ALL for the rest of the run instead of
+        // burning through the whole remaining catalog re-hitting an
+        // already-tripped limit one issue at a time (confirmed: a run
+        // against 504 series made 813 GCD calls that all failed with 429
+        // after the first ~30 succeeded or failed normally).
+        var gcdRateLimited = false;
+        var gcdAttempts = 0;
         var backfilledFromGcd = 0;
-        // Tallies WHY a GCD attempt didn't produce a cover, grouped by a
-        // fixed reason string (see GcdCoverLookupResult) - the only way
-        // to tell "GCD genuinely doesn't carry any of these" apart from
-        // "every GCD call is silently failing" instead of both looking
-        // like an identical "backfilled 0" result.
+        var metronRateLimited = false;
+        var metronAttempts = 0;
+        var backfilledFromMetron = 0;
+        // Tallies WHY a GCD or Metron attempt didn't produce a cover,
+        // grouped by a fixed reason string (see GcdCoverLookupResult /
+        // MetronCoverLookupResult) - the only way to tell "neither
+        // genuinely carries any of these" apart from "every call is
+        // silently failing" instead of both looking like an identical
+        // "backfilled 0" result. Both sources share these two
+        // collections - each Reason string already names its own source
+        // ("GCD ..." / "Metron ...") so a mixed breakdown stays readable.
         var gcdReasonCounts = new Dictionary<string, int>();
         var gcdSampleDetails = new List<string>();
 
@@ -597,18 +616,61 @@ public class AutoFetchService : IAutoFetchService
                 }
             }
 
-            foreach (var issue in series.Issues.Where(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath))).ToList())
+            if (!gcdRateLimited || !metronRateLimited)
             {
-                var gcdResult = BackfillCoverFromGcd(series, issue);
-                if (gcdResult.Success)
+                foreach (var issue in series.Issues.Where(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath))).ToList())
                 {
-                    backfilledFromGcd++;
-                }
-                else
-                {
-                    gcdReasonCounts[gcdResult.Reason] = gcdReasonCounts.GetValueOrDefault(gcdResult.Reason) + 1;
-                    if (gcdSampleDetails.Count < 10 && !string.IsNullOrWhiteSpace(gcdResult.Detail))
-                        gcdSampleDetails.Add($"{series.Name} #{issue.IssueNumber:0.##}: {gcdResult.Reason} - {gcdResult.Detail}");
+                    var backfilled = false;
+
+                    if (!gcdRateLimited)
+                    {
+                        gcdAttempts++;
+                        var gcdResult = BackfillCoverFromGcd(series, issue);
+                        if (gcdResult.Success)
+                        {
+                            backfilledFromGcd++;
+                            backfilled = true;
+                        }
+                        else if (gcdResult.IsRateLimited)
+                        {
+                            gcdRateLimited = true;
+                            result.Errors.Add($"GCD stopped responding normally after {gcdAttempts} attempt(s) - skipping it for the rest of this run. Reason: {gcdResult.Reason}.");
+                        }
+                        else
+                        {
+                            gcdReasonCounts[gcdResult.Reason] = gcdReasonCounts.GetValueOrDefault(gcdResult.Reason) + 1;
+                            if (gcdSampleDetails.Count < 10 && !string.IsNullOrWhiteSpace(gcdResult.Detail))
+                                gcdSampleDetails.Add($"{series.Name} #{issue.IssueNumber:0.##}: {gcdResult.Reason} - {gcdResult.Detail}");
+                        }
+                    }
+
+                    // Metron is tried independently of GCD's outcome (not
+                    // only when GCD missed) whenever this issue still has
+                    // no cover - two separate services with two separate
+                    // budgets, so one running dry is no reason to skip
+                    // trying the other.
+                    if (!backfilled && !metronRateLimited)
+                    {
+                        metronAttempts++;
+                        var metronResult = BackfillCoverFromMetron(series, issue);
+                        if (metronResult.Success)
+                        {
+                            backfilledFromMetron++;
+                        }
+                        else if (metronResult.IsRateLimited)
+                        {
+                            metronRateLimited = true;
+                            result.Errors.Add($"Metron stopped responding normally after {metronAttempts} attempt(s) - skipping it for the rest of this run. Reason: {metronResult.Reason}.");
+                        }
+                        else
+                        {
+                            gcdReasonCounts[metronResult.Reason] = gcdReasonCounts.GetValueOrDefault(metronResult.Reason) + 1;
+                            if (gcdSampleDetails.Count < 10 && !string.IsNullOrWhiteSpace(metronResult.Detail))
+                                gcdSampleDetails.Add($"{series.Name} #{issue.IssueNumber:0.##}: {metronResult.Reason} - {metronResult.Detail}");
+                        }
+                    }
+
+                    if (gcdRateLimited && metronRateLimited) break; // nothing left that could still succeed for this series
                 }
             }
 
@@ -623,15 +685,15 @@ public class AutoFetchService : IAutoFetchService
                 result.Added.Add($"{series.Name}: backfilled {backfilledThisSeries} cover(s) ({missingAfter} still missing).");
         }
 
-        trace.AppendLine($"GCD backfilled {backfilledFromGcd} cover(s) across this run (on top of whatever Comic Vine backfilled above).");
+        trace.AppendLine($"GCD backfilled {backfilledFromGcd} cover(s) out of {gcdAttempts} attempt(s); Metron backfilled {backfilledFromMetron} cover(s) out of {metronAttempts} attempt(s) (on top of whatever Comic Vine backfilled above).");
         if (gcdReasonCounts.Count > 0)
         {
-            trace.AppendLine("GCD misses, by reason:");
+            trace.AppendLine("GCD/Metron misses, by reason:");
             foreach (var kv in gcdReasonCounts.OrderByDescending(kv => kv.Value))
                 trace.AppendLine($"  {kv.Value}x: {kv.Key}");
             if (gcdSampleDetails.Count > 0)
             {
-                trace.AppendLine("Sample GCD misses (with detail):");
+                trace.AppendLine("Sample GCD/Metron misses (with detail):");
                 foreach (var line in gcdSampleDetails) trace.AppendLine("  " + line);
             }
         }
@@ -650,7 +712,7 @@ public class AutoFetchService : IAutoFetchService
 
         trace.AppendLine();
         trace.AppendLine(new string('=', 60));
-        trace.AppendLine($"Final: checked {result.SeriesChecked} series, re-linked {result.SeriesAutoLinked}, backfilled {result.CoversBackfilled} cover(s) ({backfilledFromGcd} of those from GCD).");
+        trace.AppendLine($"Final: checked {result.SeriesChecked} series, re-linked {result.SeriesAutoLinked}, backfilled {result.CoversBackfilled} cover(s) ({backfilledFromGcd} from GCD, {backfilledFromMetron} from Metron).");
         if (result.Added.Count > 0)
         {
             trace.AppendLine();
@@ -846,7 +908,28 @@ public class AutoFetchService : IAutoFetchService
             return new GcdCoverLookupResult { Reason = "no missing cover to fill" };
 
         var hint = $"{series.Name}_{issue.IssueNumber:0.##}_{Guid.NewGuid():N}".Replace(" ", "_");
-        var result = _gcd.FindAndDownloadCover(series.Name, issue.IssueNumber, series.StartYear, hint);
+        int? startYear = series.StartYear > 0 ? series.StartYear : null;
+        var result = _gcd.FindAndDownloadCover(series.Name, issue.IssueNumber, startYear, hint);
+        if (result.Success)
+        {
+            foreach (var cover in missingCovers)
+                cover.CoverImagePath = result.ImagePath;
+        }
+        return result;
+    }
+
+    // Same shape as BackfillCoverFromGcd, one issue at a time, against
+    // Metron instead - see MetronService/IMetronService for why this
+    // exists and its own rate-limit/bot-protection handling.
+    private MetronCoverLookupResult BackfillCoverFromMetron(Series series, Issue issue)
+    {
+        var missingCovers = issue.Covers.Where(c => string.IsNullOrWhiteSpace(c.CoverImagePath)).ToList();
+        if (missingCovers.Count == 0)
+            return new MetronCoverLookupResult { Reason = "no missing cover to fill" };
+
+        var hint = $"{series.Name}_{issue.IssueNumber:0.##}_{Guid.NewGuid():N}".Replace(" ", "_");
+        int? startYear = series.StartYear > 0 ? series.StartYear : null;
+        var result = _metron.FindAndDownloadCover(series.Name, issue.IssueNumber, startYear, hint);
         if (result.Success)
         {
             foreach (var cover in missingCovers)
