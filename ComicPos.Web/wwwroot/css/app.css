@@ -209,22 +209,22 @@ button {
 .pos-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 14px;
+    font-size: 15px;
 }
 
 .pos-table th {
     text-align: left;
     color: var(--text-muted);
     font-weight: 600;
-    font-size: 12px;
+    font-size: 13px;
     text-transform: uppercase;
     letter-spacing: 0.03em;
-    padding: 6px 8px;
+    padding: 10px 10px;
     border-bottom: 1px solid var(--border);
 }
 
 .pos-table td {
-    padding: 9px 8px;
+    padding: 13px 10px;
     border-bottom: 1px solid var(--border);
 }
 
@@ -405,7 +405,7 @@ button {
     flex-wrap: wrap;
 }
 
-.breadcrumb h1 { font-size: 22px; margin: 0; }
+.breadcrumb h1 { font-size: 24px; margin: 0; min-width: 0; overflow-wrap: break-word; }
 
 .search-box {
     width: 100%;
@@ -466,11 +466,24 @@ button {
 .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
 
 .cover-thumb {
-    width: 40px;
-    height: 56px;
+    width: 56px;
+    height: 80px;
     object-fit: cover;
     border-radius: 4px;
     background: #e8e9ef;
+}
+
+.cover-upload-input {
+    display: block;
+    font-size: 11px;
+    max-width: 96px;
+    margin-top: 6px;
+}
+
+.cover-missing-label {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin: 6px 0 0;
 }
 
 .cover-thumb-lg {
