@@ -1,0 +1,130 @@
+@* Quick "who's working the register" picker - name + PIN, no password,
+   no permission levels (see Worker.Pin's comment for why). Sets
+   CurrentWorker for this browser circuit so Checkout can put a "Served By"
+   line on the receipt. *@
+@namespace ComicPos.Web.Components.Shared
+@using ComicPos.Core.Models
+@using ComicPos.Core.Services
+@using ComicPos.Web.Services
+@inject IWorkerService WorkerService
+@inject CurrentWorkerContext CurrentWorker
+
+<Modal Show="Show" Title="Who's Working?" OnBackdropClick="Close">
+    @if (CurrentWorker.Current != null)
+    {
+        <p class="help-text">Currently working as <strong>@CurrentWorker.Current.Name</strong>.</p>
+        <button class="btn-ghost btn-sm" style="margin-bottom:14px" @onclick="LogOut">Log Out</button>
+    }
+
+    @if (_selectedWorker == null)
+    {
+        <div class="list-rows">
+            @foreach (var w in _workers)
+            {
+                <div class="list-row" style="cursor:pointer" @onclick="@(() => PickWorker(w))">
+                    <div class="list-row-main"><span class="list-row-title">@w.Name</span></div>
+                </div>
+            }
+        </div>
+        @if (_workers.Count == 0)
+        {
+            <p class="help-text">No workers set up yet - add one from the Settings page.</p>
+        }
+    }
+    else
+    {
+        <p class="list-row-title" style="margin-bottom:10px">@_selectedWorker.Name</p>
+        <div class="form-row">
+            <label>PIN:</label>
+            <input type="password" inputmode="numeric" maxlength="8" value="@_pin" @ref="_pinInputRef"
+                   @oninput="e => _pin = e.Value?.ToString() ?? string.Empty"
+                   @onkeydown="HandlePinKeyDown" />
+        </div>
+        @if (_error != null)
+        {
+            <p class="error-text">@_error</p>
+        }
+        <div class="form-actions">
+            <button class="btn-ghost" @onclick="@(() => _selectedWorker = null)">Back</button>
+            <button class="btn-primary" @onclick="ConfirmLogin">Log In</button>
+        </div>
+    }
+</Modal>
+
+@code {
+    [Parameter] public bool Show { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    private List<Worker> _workers = new();
+    private Worker? _selectedWorker;
+    private string _pin = "";
+    private string? _error;
+    private bool _wasShown;
+    private bool _focusPinNext;
+    private ElementReference _pinInputRef;
+
+    protected override void OnParametersSet()
+    {
+        if (Show && !_wasShown)
+        {
+            _workers = WorkerService.GetActiveWorkers();
+            _selectedWorker = null;
+            _pin = "";
+            _error = null;
+        }
+        _wasShown = Show;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_focusPinNext)
+        {
+            _focusPinNext = false;
+            try { await _pinInputRef.FocusAsync(); }
+            catch { /* non-fatal */ }
+        }
+    }
+
+    private void PickWorker(Worker w)
+    {
+        _selectedWorker = w;
+        _pin = "";
+        _error = null;
+        _focusPinNext = true;
+    }
+
+    private async Task HandlePinKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter")
+            await ConfirmLogin();
+    }
+
+    private async Task ConfirmLogin()
+    {
+        if (_selectedWorker == null) return;
+
+        var worker = WorkerService.TryLogin(_selectedWorker.Id, _pin);
+        if (worker == null)
+        {
+            _error = "Wrong PIN - try again.";
+            return;
+        }
+
+        CurrentWorker.SetCurrent(worker);
+        await Close();
+    }
+
+    private async Task LogOut()
+    {
+        CurrentWorker.SetCurrent(null);
+        await Close();
+    }
+
+    private async Task Close()
+    {
+        _selectedWorker = null;
+        _pin = "";
+        _error = null;
+        await OnClose.InvokeAsync();
+    }
+}
