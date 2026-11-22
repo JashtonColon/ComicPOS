@@ -16,6 +16,11 @@
          regex tag-stripping, which breaks the moment the markup changes
          even slightly. -->
     <PackageReference Include="HtmlAgilityPack" Version="1.11.72" />
+    <!-- Used by LocgService - leagueofcomicgeeks.com sits behind
+         Cloudflare bot-protection, so plain HTTP (what ComicListService/
+         GcdService use) doesn't work against it; this drives a real
+         Chrome window instead. -->
+    <PackageReference Include="Microsoft.Playwright" Version="1.49.0" />
   </ItemGroup>
 
   <PropertyGroup>
