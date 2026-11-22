@@ -85,6 +85,29 @@ button {
     padding: 10px 10px 4px;
 }
 
+.pos-worker-chip {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    cursor: pointer;
+}
+
+.pos-worker-chip-label {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #565d72;
+}
+
+.pos-worker-chip-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--sidebar-text);
+    margin-top: 2px;
+}
+
 .pos-nav-item {
     padding: 10px 12px;
     border-radius: 8px;
@@ -221,6 +244,13 @@ button {
     letter-spacing: 0.03em;
     padding: 10px 10px;
     border-bottom: 1px solid var(--border);
+    /* The page itself scrolls (not a wrapper div), so this sticks relative
+       to the window - a solid background is needed or table rows would
+       show through the header while scrolled underneath it. */
+    position: sticky;
+    top: 0;
+    background: var(--panel-bg);
+    z-index: 2;
 }
 
 .pos-table td {
@@ -307,6 +337,10 @@ button {
 
 .modal-box.modal-wide { width: 640px; }
 .modal-box.modal-xwide { width: 860px; }
+/* Focused via JS on open (Modal.razor) so Escape can be captured -
+   tabindex="-1" already keeps it off the Tab order, so the browser's
+   default focus ring here would be pure visual noise. */
+.modal-box:focus { outline: none; }
 
 .modal-header {
     display: flex;
@@ -387,6 +421,17 @@ button {
     color: var(--danger);
     font-size: 13px;
     margin: 6px 0 10px;
+}
+
+.warning-text {
+    color: #9a6700;
+    background: #fff6e5;
+    border: 1px solid #f0d9a8;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    margin: 6px 0 10px;
+    padding: 8px 10px;
 }
 
 .help-text {
@@ -470,6 +515,17 @@ button {
     height: 80px;
     object-fit: cover;
     border-radius: 4px;
+    background: #e8e9ef;
+}
+
+/* Inventory's Cover Detail table specifically - bigger than the compact
+   list thumbnail above (used in New Books' dense list, where this size
+   would be too bulky), but smaller than the full zoom-in size below. */
+.cover-thumb-detail {
+    width: 110px;
+    height: 155px;
+    object-fit: cover;
+    border-radius: 6px;
     background: #e8e9ef;
 }
 
@@ -584,7 +640,7 @@ button {
 .receipt-card {
     background: #fff;
     color: #111;
-    width: 320px;
+    width: 360px;
     max-width: 100%;
     margin: 0 auto;
     padding: 18px 20px;
@@ -595,11 +651,44 @@ button {
 .receipt-store-name { text-align: center; font-weight: 700; font-size: 15px; margin: 0 0 2px; }
 .receipt-sub { text-align: center; color: #666; font-size: 12px; margin: 0 0 2px; }
 .receipt-body {
-    font-family: "Consolas", "Courier New", monospace;
-    font-size: 13px;
-    white-space: pre-wrap;
+    font-family: "Segoe UI", -apple-system, Arial, sans-serif;
+    font-size: 12.5px;
     margin: 10px 0;
 }
+
+.receipt-meta {
+    border-top: 1px dashed #bbb;
+    border-bottom: 1px dashed #bbb;
+    padding: 8px 0;
+    margin-bottom: 8px;
+}
+.receipt-meta-row { display: flex; justify-content: space-between; gap: 10px; color: #333; font-weight: 600; }
+.receipt-meta-row + .receipt-meta-row { margin-top: 3px; color: #777; font-size: 11.5px; font-weight: 400; }
+
+.receipt-table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+.receipt-table th {
+    text-align: left;
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: #888;
+    border-bottom: 1px solid #ddd;
+    padding: 4px 2px 6px;
+}
+.receipt-table td { padding: 5px 2px; border-bottom: 1px solid #f0f0f0; vertical-align: top; }
+.receipt-table .col-qty { width: 26px; text-align: center; }
+.receipt-table .col-num { text-align: right; white-space: nowrap; }
+
+.receipt-totals { margin-top: 4px; }
+.receipt-totals-row { display: flex; justify-content: space-between; padding: 2px 0; }
+.receipt-totals-row.receipt-grand {
+    font-weight: 700;
+    font-size: 14px;
+    border-top: 1px solid #ccc;
+    margin-top: 4px;
+    padding-top: 6px;
+}
+
 .receipt-footer { text-align: center; color: #666; font-size: 12px; font-style: italic; margin-top: 6px; }
 
 .receipt-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
