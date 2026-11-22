@@ -291,6 +291,28 @@ namespace ComicPos.Data.Migrations
                     b.ToTable("AllSeries");
                 });
 
+            modelBuilder.Entity("ComicPos.Core.Models.Worker", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("IsActive")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Pin")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("Workers");
+                });
+
             modelBuilder.Entity("ComicPos.Core.Models.Cover", b =>
                 {
                     b.HasOne("ComicPos.Core.Models.Issue", "Issue")
