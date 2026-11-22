@@ -65,4 +65,24 @@ public class DashboardService : IDashboardService
             .ThenBy(e => e.SeriesName)
             .ToList();
     }
+
+    public List<RecentSaleEntry> GetRecentSales(int count)
+    {
+        return _db.Sales
+            .Include(s => s.Customer)
+            .Include(s => s.Lines)
+            .Where(s => !s.IsVoided)
+            .OrderByDescending(s => s.SoldAt)
+            .Take(count)
+            .ToList()
+            .Select(s => new RecentSaleEntry
+            {
+                SaleId = s.Id,
+                SoldAt = s.SoldAt,
+                CustomerName = s.Customer?.Name,
+                ItemCount = s.Lines.Sum(l => l.Quantity),
+                Total = s.Lines.Sum(l => l.PriceEach * l.Quantity * (1 - l.DiscountPercent / 100))
+            })
+            .ToList();
+    }
 }
