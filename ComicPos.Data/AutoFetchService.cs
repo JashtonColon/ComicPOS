@@ -455,6 +455,23 @@ public class AutoFetchService : IAutoFetchService
 
         var best = exact.FirstOrDefault(m => m.StartYear == seriesStartYear);
 
+        // A StartYear coincidence alone isn't trustworthy: seriesStartYear
+        // is often just a wrong placeholder (see the comment below), and
+        // even a previously-synced StartYear can still land on it by pure
+        // chance - every volume (legacy or current) has its own real
+        // StartYear, and nothing stops a stale/placeholder value from
+        // matching the WRONG one exactly. Confirmed live: Batman's
+        // StartYear was left at 1940 from an earlier bad link, and 1940
+        // really is Comic Vine volume 796's own StartYear - so this check
+        // kept re-selecting 796 every single time, completely bypassing
+        // the issue-count logic below that exists specifically to catch
+        // this. Same VolumeCoversIssue test as the fallback further down:
+        // a StartYear match only counts if it can plausibly cover the
+        // issue numbers already on file - otherwise it's treated exactly
+        // like "no StartYear match" and falls through to that logic too.
+        if (best != null && knownIssues.Count > 0 && !VolumeCoversIssue(best, knownIssues.Max(i => i.IssueNumber)))
+            best = null;
+
         if (best == null && knownIssues.Count > 0)
         {
             // seriesStartYear is often just a creation-time placeholder
