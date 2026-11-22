@@ -2,6 +2,9 @@
 @using ComicPos.Core.Models
 @using ComicPos.Core.Services
 @inject IInventoryService Inventory
+@inject IComicVineService ComicVine
+@inject IGcdService Gcd
+@inject IMetronService Metron
 
 <Modal Show="Show" Title="Add New Item" OnBackdropClick="Close" ExtraClass="modal-wide">
     <div class="form-row">
@@ -14,6 +17,10 @@
         @if (!string.IsNullOrEmpty(_status))
         {
             <p class="help-text">@_status</p>
+        }
+        @if (_missingFields.Count > 0)
+        {
+            <p class="warning-text">Already in the system, but missing: @string.Join(", ", _missingFields).</p>
         }
     </div>
 
@@ -43,8 +50,43 @@
     </div>
 
     <div class="form-row">
+        <button class="btn-ghost btn-sm" @onclick="LookUpOnline">Look Up Online (Comic Vine / GCD / Metron)</button>
+        <p class="help-text" style="margin-top:4px">
+            Uses the Series Name and Issue # above to fill in Publisher and a cover image when it can find a match.
+            It can't fetch writer/artist credits - type those below if you know them.
+        </p>
+        @if (!string.IsNullOrEmpty(_onlineLookupStatus))
+        {
+            <p class="help-text">@_onlineLookupStatus</p>
+        }
+    </div>
+
+    <div class="form-row">
         <label>Publisher:</label>
         <input type="text" value="@_publisher" @oninput="e => _publisher = e.Value?.ToString() ?? string.Empty" />
+    </div>
+
+    <div class="form-row-split">
+        <div class="form-row">
+            <label>Writer:</label>
+            <input type="text" value="@_author" @oninput="e => _author = e.Value?.ToString() ?? string.Empty" />
+        </div>
+        <div class="form-row">
+            <label>Penciler:</label>
+            <input type="text" value="@_penciler" @oninput="e => _penciler = e.Value?.ToString() ?? string.Empty" />
+        </div>
+        <div class="form-row">
+            <label>Inker:</label>
+            <input type="text" value="@_inker" @oninput="e => _inker = e.Value?.ToString() ?? string.Empty" />
+        </div>
+        <div class="form-row">
+            <label>Colorist:</label>
+            <input type="text" value="@_colorist" @oninput="e => _colorist = e.Value?.ToString() ?? string.Empty" />
+        </div>
+        <div class="form-row">
+            <label>Letterer:</label>
+            <input type="text" value="@_letterer" @oninput="e => _letterer = e.Value?.ToString() ?? string.Empty" />
+        </div>
     </div>
 
     <div class="form-row-split">
@@ -92,6 +134,15 @@
 @code {
     [Parameter] public bool Show { get; set; }
     [Parameter] public EventCallback OnSaved { get; set; }
+
+    // Fires on every item a UPC scan auto-adds (see LookUp/
+    // LookUpByUpcAndAutoAdd below) - separate from OnSaved, which the
+    // "Save Item" button still fires on its own and which the host page
+    // treats as "close the modal now." A worker scanning a stack of new
+    // books in wants the list behind this modal kept up to date without
+    // the modal itself closing and reopening between every single scan.
+    [Parameter] public EventCallback OnItemAdded { get; set; }
+
     [Parameter] public EventCallback OnClose { get; set; }
 
     private bool _wasShown;
@@ -110,6 +161,14 @@
     private string _focDate = "";
     private bool _hasRelease;
     private string _releaseDate = "";
+    private string _author = "";
+    private string _penciler = "";
+    private string _inker = "";
+    private string _colorist = "";
+    private string _letterer = "";
+    private List<string> _missingFields = new();
+    private string? _onlineLookupStatus;
+    private string? _lookedUpCoverImagePath;
     private string? _error;
 
     protected override void OnParametersSet()
@@ -119,6 +178,8 @@
             _barcode = ""; _status = ""; _seriesName = ""; _startYear = DateTime.Now.Year.ToString();
             _issueNumber = "1"; _type = IssueType.SingleIssue; _publisher = ""; _coverLetter = "A";
             _price = "0.00"; _stock = "0"; _description = ""; _hasFoc = false; _focDate = ""; _hasRelease = false; _releaseDate = "";
+            _author = ""; _penciler = ""; _inker = ""; _colorist = ""; _letterer = "";
+            _missingFields = new(); _onlineLookupStatus = null; _lookedUpCoverImagePath = null;
             _error = null;
         }
         _wasShown = Show;
@@ -132,10 +193,15 @@
     private void LookUp()
     {
         _error = null;
-        var cover = Inventory.FindByBarcode(_barcode.Trim());
+        _missingFields = new();
+        _onlineLookupStatus = null;
+        _lookedUpCoverImagePath = null;
+
+        var trimmedBarcode = _barcode.Trim();
+        var cover = Inventory.FindByBarcode(trimmedBarcode);
         if (cover == null)
         {
-            _status = $"No existing item for \"{_barcode}\" - fill in the details below to add it as new.";
+            LookUpByUpcAndAutoAdd(trimmedBarcode);
             return;
         }
 
@@ -154,36 +220,216 @@
         _focDate = issue.FocDate?.ToString("yyyy-MM-dd") ?? "";
         _hasRelease = issue.ReleaseDate != null;
         _releaseDate = issue.ReleaseDate?.ToString("yyyy-MM-dd") ?? "";
+        _author = issue.Author;
+        _penciler = issue.Penciler;
+        _inker = issue.Inker;
+        _colorist = issue.Colorist;
+        _letterer = issue.Letterer;
         _status = $"Found: {series.Name} #{issue.IssueNumber:0.##} - review price/stock below and save to add it to inventory.";
+
+        // "verify that everything is there" - flag what's missing on an
+        // item that's already in the system, rather than silently letting
+        // a restock go through with gaps nobody noticed.
+        if (string.IsNullOrWhiteSpace(cover.CoverImagePath)) _missingFields.Add("Cover image");
+        if (string.IsNullOrWhiteSpace(issue.Publisher)) _missingFields.Add("Publisher");
+        if (string.IsNullOrWhiteSpace(issue.Author)) _missingFields.Add("Writer");
+        if (string.IsNullOrWhiteSpace(issue.Penciler)) _missingFields.Add("Penciler");
+        if (string.IsNullOrWhiteSpace(issue.Inker)) _missingFields.Add("Inker");
+        if (string.IsNullOrWhiteSpace(issue.Colorist)) _missingFields.Add("Colorist");
+        if (string.IsNullOrWhiteSpace(issue.Letterer)) _missingFields.Add("Letterer");
     }
 
+    // "if the book is not already in the system we look up and try to find
+    // it" - uses whatever the worker typed into Series Name / Issue # /
+    // Series Start to query the same sources Re-scan already falls back
+    // through for existing books: Comic Vine for the publisher (it doesn't
+    // expose writer/artist credits in this app - see IComicVineService),
+    // then GCD and Metron for a cover image. A barcode alone can't drive
+    // this - there's no comic-specific barcode-to-title database behind
+    // these sources, only name+issue+year search.
+    private void LookUpOnline()
+    {
+        _error = null;
+        _onlineLookupStatus = null;
+
+        if (string.IsNullOrWhiteSpace(_seriesName) || !float.TryParse(_issueNumber, out var issueNumber))
+        {
+            _onlineLookupStatus = "Enter a series name and issue number above first.";
+            return;
+        }
+
+        var found = new List<string>();
+
+        var matches = ComicVine.SearchVolumes(_seriesName.Trim());
+        var bestMatch = matches.FirstOrDefault(m => string.Equals(m.Name, _seriesName.Trim(), StringComparison.OrdinalIgnoreCase))
+                        ?? matches.FirstOrDefault();
+        if (bestMatch != null)
+        {
+            _publisher = bestMatch.Publisher;
+            if (bestMatch.StartYear != null) _startYear = bestMatch.StartYear.Value.ToString();
+            found.Add($"publisher ({bestMatch.Publisher})");
+        }
+
+        // Only a bare year is known here (the Series Start Year field),
+        // not a real date - June 15 is just a mid-year anchor so GCD/
+        // Metron's closest-date matching (see GcdService/MetronService)
+        // still lands in roughly the right era rather than comparing
+        // against nothing at all.
+        DateOnly? expectedDate = int.TryParse(_startYear, out var sy) ? new DateOnly(sy, 6, 15) : null;
+
+        var hint = $"{_seriesName}_{_issueNumber}_{Guid.NewGuid():N}".Replace(" ", "_");
+        var metronResult = Metron.FindAndDownloadCover(_seriesName.Trim(), issueNumber, expectedDate, hint);
+        if (metronResult.Success)
+        {
+            _lookedUpCoverImagePath = metronResult.ImagePath;
+            found.Add("a cover image (via Metron)");
+        }
+        else
+        {
+            var gcdResult = Gcd.FindAndDownloadCover(_seriesName.Trim(), issueNumber, expectedDate, hint);
+            if (gcdResult.Success)
+            {
+                _lookedUpCoverImagePath = gcdResult.ImagePath;
+                found.Add("a cover image (via GCD)");
+            }
+        }
+
+        _onlineLookupStatus = found.Count > 0
+            ? $"Found {string.Join(" and ", found)}. Writer/artist credits aren't available from these sources - type them below if you know them."
+            : "Couldn't find this online - double check the series name and issue number, or just fill in the rest by hand.";
+    }
+
+    // The "Save Item" button - manual, single-item save. Closes the
+    // modal afterward (OnSaved is what the host page treats as "close
+    // and refresh now") exactly as before this session's UPC auto-add
+    // work; TrySaveItem below holds the actual save logic so the new
+    // rapid-scan path (LookUpByUpcAndAutoAdd) can reuse it without
+    // closing the modal after every single scan.
     private void Save()
+    {
+        if (TrySaveItem())
+            OnSaved.InvokeAsync();
+    }
+
+    // All the real validation + save logic, shared by the manual Save
+    // button and the UPC auto-add path. Returns true/false instead of
+    // always closing the modal, since a failed auto-add should leave
+    // everything filled in for the worker to fix, not silently do
+    // nothing.
+    private bool TrySaveItem()
     {
         _error = null;
 
-        if (string.IsNullOrWhiteSpace(_seriesName)) { _error = "Series Name is required."; return; }
-        if (!int.TryParse(_startYear, out var startYear) || startYear < 1900) { _error = "Series Start Year must be a valid year."; return; }
-        if (!float.TryParse(_issueNumber, out var issueNumber)) { _error = "Issue Number must be a number (e.g. 1 or 1.5)."; return; }
-        if (string.IsNullOrWhiteSpace(_barcode)) { _error = "Barcode / UPC is required - scan or type one at the top."; return; }
-        if (!decimal.TryParse(_price, out var price) || price < 0) { _error = "Price must be a non-negative number."; return; }
-        if (!int.TryParse(_stock, out var stock) || stock < 0) { _error = "Starting Stock Qty must be a non-negative whole number."; return; }
+        if (string.IsNullOrWhiteSpace(_seriesName)) { _error = "Series Name is required."; return false; }
+        if (!int.TryParse(_startYear, out var startYear) || startYear < 1900) { _error = "Series Start Year must be a valid year."; return false; }
+        if (!float.TryParse(_issueNumber, out var issueNumber)) { _error = "Issue Number must be a number (e.g. 1 or 1.5)."; return false; }
+        if (string.IsNullOrWhiteSpace(_barcode)) { _error = "Barcode / UPC is required - scan or type one at the top."; return false; }
+        if (!decimal.TryParse(_price, out var price) || price < 0) { _error = "Price must be a non-negative number."; return false; }
+        if (!int.TryParse(_stock, out var stock) || stock < 0) { _error = "Starting Stock Qty must be a non-negative whole number."; return false; }
 
         DateOnly? focDate = _hasFoc && DateOnly.TryParse(_focDate, out var fd) ? fd : null;
         DateOnly? releaseDate = _hasRelease && DateOnly.TryParse(_releaseDate, out var rd) ? rd : null;
 
         try
         {
-            Inventory.AddOrUpdateItem(_seriesName.Trim(), startYear, issueNumber, _type, _publisher.Trim(),
+            var cover = Inventory.AddOrUpdateItem(_seriesName.Trim(), startYear, issueNumber, _type, _publisher.Trim(),
                 focDate, releaseDate, string.IsNullOrWhiteSpace(_coverLetter) ? "A" : _coverLetter.Trim(),
-                _barcode.Trim(), price, stock, string.IsNullOrWhiteSpace(_description) ? null : _description.Trim());
+                _barcode.Trim(), price, stock, string.IsNullOrWhiteSpace(_description) ? null : _description.Trim(),
+                _author.Trim(), _penciler.Trim(), _inker.Trim(), _colorist.Trim(), _letterer.Trim());
+
+            // If "Look Up Online" (or the UPC auto-add path) found a
+            // cover image and this item still doesn't have one (a brand
+            // new item, or an existing one that was missing it), attach
+            // it now that the cover row exists.
+            if (!string.IsNullOrWhiteSpace(_lookedUpCoverImagePath) && string.IsNullOrWhiteSpace(cover.CoverImagePath))
+            {
+                cover.CoverImagePath = _lookedUpCoverImagePath;
+                Inventory.UpdateCover(cover);
+            }
         }
         catch (Exception ex)
         {
             _error = ex.Message;
+            return false;
+        }
+
+        return true;
+    }
+
+    // "when scanning a book into inventory it will just look at metron
+    // if its not in the system based on upc then... add to db and
+    // everything" - reached from LookUp() when FindByBarcode comes up
+    // empty. Looks the scanned barcode up on Metron directly (far more
+    // precise than the name+issue search "Look Up Online" does, since a
+    // UPC - in principle - identifies one specific printing), and on a
+    // match pre-fills every field Metron gave us AND saves immediately,
+    // rather than making the worker review and click Save for every
+    // single book in a stack. Stays open afterward (success or not) and
+    // resets for the next scan - see OnItemAdded's own doc comment for
+    // why this doesn't use OnSaved.
+    private void LookUpByUpcAndAutoAdd(string barcode)
+    {
+        if (string.IsNullOrWhiteSpace(barcode))
+        {
+            _status = "Scan or type a barcode first.";
             return;
         }
 
-        OnSaved.InvokeAsync();
+        var result = Metron.FindIssueByUpc(barcode);
+        if (!result.Success)
+        {
+            _status = $"No existing item for \"{barcode}\", and Metron didn't find it by barcode either ({result.Reason}) - type the series name and issue number below, then try \"Look Up Online\", or fill everything in by hand.";
+            return;
+        }
+
+        _seriesName = result.SeriesName ?? "";
+        _startYear = (result.SeriesStartYear ?? DateTime.Now.Year).ToString();
+        _issueNumber = result.IssueNumber.ToString("0.##");
+        _type = IssueType.SingleIssue;
+        _publisher = result.Publisher ?? "";
+        _coverLetter = result.CoverLetterGuess;
+        _price = result.Price?.ToString("0.00") ?? "0.00";
+        _stock = "1"; // receiving one physical copy right now, not a blank starting count
+        _description = "";
+        _hasFoc = result.FocDate != null;
+        _focDate = result.FocDate?.ToString("yyyy-MM-dd") ?? "";
+        _hasRelease = result.StoreDate != null;
+        _releaseDate = result.StoreDate?.ToString("yyyy-MM-dd") ?? "";
+        _author = result.Author;
+        _penciler = result.Penciler;
+        _inker = result.Inker;
+        _colorist = result.Colorist;
+        _letterer = result.Letterer;
+        _lookedUpCoverImagePath = result.DownloadedImagePath;
+        _barcode = barcode;
+
+        if (TrySaveItem())
+        {
+            OnItemAdded.InvokeAsync();
+            var addedSeries = _seriesName;
+            var addedIssue = _issueNumber;
+            var addedCover = _coverLetter;
+
+            // Clear back to a blank slate for the next scan - same
+            // starting point as first opening this modal - but leave it
+            // open and show what just happened, since this is a rapid-
+            // fire receiving flow, not a one-book-at-a-time form.
+            _barcode = ""; _seriesName = ""; _startYear = DateTime.Now.Year.ToString(); _issueNumber = "1";
+            _type = IssueType.SingleIssue; _publisher = ""; _coverLetter = "A";
+            _price = "0.00"; _stock = "0"; _description = ""; _hasFoc = false; _focDate = ""; _hasRelease = false; _releaseDate = "";
+            _author = ""; _penciler = ""; _inker = ""; _colorist = ""; _letterer = ""; _lookedUpCoverImagePath = null;
+            _missingFields = new(); _onlineLookupStatus = null;
+
+            _status = $"Added via Metron: {addedSeries} #{addedIssue} (Cover {addedCover}) - stock 1. Scan the next book.";
+        }
+        else
+        {
+            // TrySaveItem already set _error - leave every field filled
+            // in (don't reset _barcode either) so the worker can see
+            // exactly what Metron found and fix whatever's wrong, rather
+            // than losing it all on a save that didn't go through.
+            _status = "Found via Metron, but couldn't save automatically - review the fields below and click Save Item.";
+        }
     }
 
     private async Task Close() => await OnClose.InvokeAsync();
