@@ -288,6 +288,21 @@ public class SettingsControl : UserControl
             return;
         }
 
+        // Loaded once up front (not three separate .Load() calls like
+        // before) - this control has no field for MetronApiToken or
+        // WrongEraCoverCleanupApplied at all (both are web-only additions
+        // from the 2026-11-21 cover-matching fix), so without explicitly
+        // carrying them over here, saving Settings from this desktop app
+        // would silently wipe out whatever Metron token was set from the
+        // web Settings page, and reset WrongEraCoverCleanupApplied back to
+        // false - making Program.cs's one-time Wonder Woman cover cleanup
+        // (ComicPos.Web/Program.cs) incorrectly re-run and wipe those
+        // covers again on the web app's very next startup. Found during
+        // the 2026-11-21 bug sweep - same root cause as the LastAutoFetchRun/
+        // LastAutoBackupAt preserve below, just for two fields this form
+        // doesn't even show.
+        var currentStore = _storeSettingsService.Load();
+
         _storeSettingsService.Save(new StoreSettings
         {
             StoreName = string.IsNullOrWhiteSpace(txtStoreName.Text) ? "Comic POS" : txtStoreName.Text.Trim(),
@@ -304,8 +319,10 @@ public class SettingsControl : UserControl
             // they've never run, forcing an extra one on the very next
             // startup/hourly tick (same bug class as LastFocReportSentAt
             // a few lines down for the email side).
-            LastAutoFetchRun = _storeSettingsService.Load().LastAutoFetchRun,
-            LastAutoBackupAt = _storeSettingsService.Load().LastAutoBackupAt
+            LastAutoFetchRun = currentStore.LastAutoFetchRun,
+            LastAutoBackupAt = currentStore.LastAutoBackupAt,
+            MetronApiToken = currentStore.MetronApiToken,
+            WrongEraCoverCleanupApplied = currentStore.WrongEraCoverCleanupApplied
         });
 
         _emailSettingsService.Save(new EmailSettings
