@@ -5,6 +5,7 @@
 @inject ICheckoutService CheckoutService
 @inject ICustomerService Customers
 @inject IStoreSettingsService StoreSettingsService
+@inject ComicPos.Web.Services.CurrentWorkerContext CurrentWorker
 @rendermode InteractiveServer
 
 <PageTitle>Checkout - Comic POS</PageTitle>
@@ -117,8 +118,6 @@
               Address="@_receiptAddress" Phone="@_receiptPhone" HasLogo="_receiptHasLogo" OnClose="CloseReceipt" />
 
 @code {
-    private const int ReceiptWidth = 34;
-
     private Sale _sale = null!;
     private List<CartRow> _cartRows = new();
     private string _barcode = "";
@@ -127,6 +126,7 @@
     private string _customerSearch = "";
     private List<Customer> _customerResults = new();
     private string _customerLabel = "Customer: Walk-in";
+    private string? _selectedCustomerName;
 
     private string _cashTendered = "";
     private decimal _subtotal;
@@ -270,6 +270,7 @@
     {
         _sale.CustomerId = customer.Id;
         _customerLabel = $"Customer: {customer.Name}";
+        _selectedCustomerName = customer.Name;
         _customerSearch = "";
         _customerResults = new List<Customer>();
     }
@@ -310,13 +311,19 @@
         var total = subtotal + tax;
         decimal.TryParse(_cashTendered, out var tendered);
         var change = tendered - total;
+        var customerNameForReceipt = _selectedCustomerName;
+        var servedByForReceipt = CurrentWorker.Current?.Name;
 
         var store = StoreSettingsService.Load();
-        var receiptBody = BuildReceipt(completingSale, subtotal, tax, total, tendered, change);
 
+        // Complete the sale first so completingSale.Id is assigned by the
+        // database - the receipt wants a real receipt number, not 0.
         CheckoutService.CompleteSale(completingSale);
+        var receiptBody = BuildReceipt(completingSale, customerNameForReceipt, servedByForReceipt, subtotal, tax, total, tendered, change);
+
         _sale = CheckoutService.StartSale();
         _customerLabel = "Customer: Walk-in";
+        _selectedCustomerName = null;
         _customerSearch = "";
         _customerResults = new List<Customer>();
         _cashTendered = "";
@@ -332,40 +339,62 @@
 
     private void CloseReceipt() => _showReceipt = false;
 
-    // Itemized body only - date, line items, totals, right-aligned amounts.
-    // The store name/address/phone/logo header is rendered by ReceiptModal.
-    private static string BuildReceipt(Sale sale, decimal subtotal, decimal tax, decimal total, decimal tendered, decimal change)
+    // Builds the receipt as real HTML (a meta row, an itemized table, then
+    // totals) instead of monospace-padded text, so it prints like an actual
+    // store receipt rather than a plain-text dump. Rendered via
+    // ReceiptModal's Body parameter, which casts this to a MarkupString.
+    // "Served By" comes from CurrentWorker.Current (set at worker login) -
+    // left off the receipt entirely when nobody's logged in rather than
+    // showing a blank/faked row.
+    private static string BuildReceipt(Sale sale, string? customerName, string? servedBy, decimal subtotal, decimal tax, decimal total, decimal tendered, decimal change)
     {
         var sb = new StringBuilder();
-        sb.AppendLine(DateTime.Now.ToString("MM/dd/yyyy h:mm tt"));
-        sb.AppendLine(new string('-', ReceiptWidth));
+
+        sb.Append("<div class=\"receipt-meta\">");
+        sb.Append("<div class=\"receipt-meta-row\">");
+        sb.Append($"<span>To: {Esc(string.IsNullOrWhiteSpace(customerName) ? "Walk-in Customer" : customerName)}</span>");
+        sb.Append($"<span>Receipt No: #{sale.Id}</span>");
+        sb.Append("</div>");
+        sb.Append("<div class=\"receipt-meta-row\">");
+        sb.Append($"<span>{sale.SoldAt:MMM d, yyyy h:mm tt}</span>");
+        sb.Append(string.IsNullOrWhiteSpace(servedBy) ? "<span></span>" : $"<span>Served By: {Esc(servedBy)}</span>");
+        sb.Append("</div>");
+        sb.Append("</div>");
+
+        sb.Append("<table class=\"receipt-table\"><thead><tr>");
+        sb.Append("<th class=\"col-qty\">Qty</th><th class=\"col-item\">Item</th><th class=\"col-num\">Price</th><th class=\"col-num\">Disc%</th><th class=\"col-num\">Total</th>");
+        sb.Append("</tr></thead><tbody>");
 
         foreach (var line in sale.Lines)
         {
-            sb.AppendLine($"{line.Cover.Issue.Series.Name} #{line.Cover.Issue.IssueNumber:0.##} [{line.Cover.CoverLetter}]");
-            var qtyPrice = $"  {line.Quantity} x {line.PriceEach:C}";
-            var lineTotal = (line.PriceEach * line.Quantity * (1 - line.DiscountPercent / 100)).ToString("C");
-            sb.AppendLine(PadLine(qtyPrice, lineTotal));
+            var name = Esc($"{line.Cover.Issue.Series.Name} #{line.Cover.Issue.IssueNumber:0.##} [{line.Cover.CoverLetter}]");
+            var lineTotal = line.PriceEach * line.Quantity * (1 - line.DiscountPercent / 100);
+            sb.Append("<tr>");
+            sb.Append($"<td class=\"col-qty\">{line.Quantity}</td>");
+            sb.Append($"<td class=\"col-item\">{name}</td>");
+            sb.Append($"<td class=\"col-num\">{line.PriceEach:C}</td>");
+            sb.Append($"<td class=\"col-num\">{(line.DiscountPercent > 0 ? line.DiscountPercent.ToString("0.##") + "%" : "-")}</td>");
+            sb.Append($"<td class=\"col-num\">{lineTotal:C}</td>");
+            sb.Append("</tr>");
         }
 
-        sb.AppendLine(new string('-', ReceiptWidth));
-        sb.AppendLine(PadLine("Subtotal", subtotal.ToString("C")));
-        sb.AppendLine(PadLine("Tax", tax.ToString("C")));
-        sb.AppendLine(PadLine("TOTAL", total.ToString("C")));
+        sb.Append("</tbody></table>");
+
+        sb.Append("<div class=\"receipt-totals\">");
+        sb.Append($"<div class=\"receipt-totals-row\"><span>Subtotal</span><span>{subtotal:C}</span></div>");
+        sb.Append($"<div class=\"receipt-totals-row\"><span>Tax</span><span>{tax:C}</span></div>");
+        sb.Append($"<div class=\"receipt-totals-row receipt-grand\"><span>Total</span><span>{total:C}</span></div>");
 
         if (tendered > 0)
         {
-            sb.AppendLine(new string('-', ReceiptWidth));
-            sb.AppendLine(PadLine("Tendered", tendered.ToString("C")));
-            sb.AppendLine(PadLine("Change", change.ToString("C")));
+            sb.Append($"<div class=\"receipt-totals-row\"><span>Cash Tendered</span><span>{tendered:C}</span></div>");
+            sb.Append($"<div class=\"receipt-totals-row\"><span>Change</span><span>{change:C}</span></div>");
         }
+
+        sb.Append("</div>");
 
         return sb.ToString();
     }
 
-    private static string PadLine(string left, string right)
-    {
-        var gap = Math.Max(1, ReceiptWidth - left.Length - right.Length);
-        return left + new string(' ', gap) + right;
-    }
+    private static string Esc(string text) => System.Net.WebUtility.HtmlEncode(text);
 }
