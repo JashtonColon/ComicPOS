@@ -22,6 +22,7 @@
             <option value="@SortTitle">Title</option>
         </select>
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRescan">Re-scan Existing</button>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunLocgBackfill" title="Pulls every week of @DateTime.Today.Year from League of Comic Geeks. Opens a real Chrome window - LOCG only lets a request through every few minutes, so a full year can take several hours. Safe to leave running in the background.">Backfill @DateTime.Today.Year (LOCG)</button>
         <button class="btn-primary btn-sm" disabled="@_checking" @onclick="RunCheckNow">Check Now</button>
     </div>
 </div>
@@ -286,6 +287,44 @@ else
             var summary = $"Checked {result.SeriesChecked} series, linked {result.SeriesAutoLinked} new one(s), added {result.NewIssuesAdded} new issue(s).";
             if (result.Errors.Count > 0)
                 summary += " Some series had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    private async Task RunLocgBackfill()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        var year = DateTime.Today.Year;
+        _status = $"Backfilling {year} from League of Comic Geeks... this opens a real Chrome window. LOCG only lets a request through every few minutes, so a full year can take several hours - leave it running in the background.";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.BackfillYearFromLocg(year));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"LOCG backfill failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Added {result.NewIssuesAdded} new issue(s) from LOCG for {year}.";
+            if (result.Errors.Count > 0)
+                summary += " Some weeks had errors: " + string.Join("; ", result.Errors.Take(10));
             _resultMessage = summary;
             _resultTrace = result.Trace;
         }
