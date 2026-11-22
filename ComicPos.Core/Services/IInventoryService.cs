@@ -51,5 +51,10 @@ public interface IInventoryService
         string barcode,
         decimal price,
         int stockQuantity,
-        string? description);
+        string? description,
+        string author = "",
+        string penciler = "",
+        string inker = "",
+        string colorist = "",
+        string letterer = "");
 }
