@@ -24,23 +24,45 @@ public interface IGcdService
     ComicListWeek GetThisWeeksOnSaleIssues();
 
     // Fallback cover-art source for RescanExistingBooks - tried only after
-    // Comic Vine has already been asked and the issue is still missing a
-    // cover (common for back-catalog Comic Vine's linked volume doesn't
-    // cover, or genuinely has no art for). Looks the issue up directly by
-    // series name + issue number (+ start year, to tell a relaunch #1
-    // apart from an older series sharing the same title) via GCD's
-    // "/series/name/.../issue/..." endpoint, picks the base (non-variant)
-    // printing when more than one comes back, fetches that specific
-    // issue for its real cover scan URL, downloads it, and saves it the
-    // same way ComicVineService.DownloadCoverImage does. Never throws -
-    // GCD simply not having this issue, or having no cover scan on file
-    // for it, is a normal outcome here, not a failure. Unlike the old
-    // bool-returning version, the result always says WHY it didn't find
-    // anything (a real "GCD doesn't have it" vs. a request that failed
-    // outright) - that distinction is the only way a "0 covers backfilled
-    // from GCD" run can be told apart from "GCD just doesn't carry any of
-    // these" instead of staying a total mystery.
-    GcdCoverLookupResult FindAndDownloadCover(string seriesName, float issueNumber, int? startYear, string fileNameHint);
+    // Metron and Comic Vine have already been asked and the issue is
+    // still missing a cover. Looks the issue up directly by series name +
+    // issue number via GCD's "/series/name/.../issue/..." endpoint (no
+    // year filter in the request itself - see expectedDate below for why)
+    // and, among whatever comes back, picks whichever result's own
+    // publication_date sits closest to expectedDate (falling back to the
+    // base/non-variant printing when dates can't be compared at all),
+    // fetches that specific issue for its real cover scan URL, downloads
+    // it, and saves it the same way ComicVineService.DownloadCoverImage
+    // does. Never throws - GCD simply not having this issue, or having
+    // no cover scan on file for it, is a normal outcome here, not a
+    // failure. Unlike the old bool-returning version, the result always
+    // says WHY it didn't find anything (a real "GCD doesn't have it" vs.
+    // a request that failed outright) - that distinction is the only way
+    // a "0 covers backfilled from GCD" run can be told apart from "GCD
+    // just doesn't carry any of these" instead of staying a total
+    // mystery.
+    //
+    // expectedDate is the one real-world date this exact physical issue
+    // is tied to (its own ReleaseDate/FocDate, not the series' often-
+    // wrong StartYear scalar - confirmed live: a character relaunched
+    // across decades, like Wonder Woman, can have the SAME issue number
+    // published multiple times, and only the actual date tells those
+    // apart). It's used to pick the closest-matching result client-side
+    // rather than as a server-side filter - GCD's own "/year/" path
+    // segment turned out to mean the SERIES' start year, not this
+    // issue's own date, so asking for "year 2026" on a series that
+    // actually started years earlier just returned nothing at all, every
+    // time, even for a issue that genuinely releases in 2026.
+    // maxCoversNeeded: see IMetronService's own copy of this parameter for
+    // the full rationale (same bug, same fix shape). For GCD specifically:
+    // the list endpoint used here already returns separate rows for
+    // variant printings of the same issue number (the pre-existing
+    // variant_of field) - when more than one cover is actually needed,
+    // this takes the N closest-dated distinct results instead of just
+    // the single best one, fetches each one's own detail (GCD's list view
+    // has no cover field at all - see the class comment below), and
+    // returns every image it found via AllCovers.
+    GcdCoverLookupResult FindAndDownloadCover(string seriesName, float issueNumber, DateOnly? expectedDate, string fileNameHint, int maxCoversNeeded = 1);
 }
 
 public class GcdCoverLookupResult
@@ -68,4 +90,10 @@ public class GcdCoverLookupResult
     public bool IsRateLimited { get; set; }
 
     public bool Success => !string.IsNullOrWhiteSpace(ImagePath);
+
+    // See MetronCoverLookupResult.AllCovers (CoverCandidate is shared
+    // between both services, defined in IMetronService.cs) - always
+    // populated alongside ImagePath, just [primary] in the common
+    // maxCoversNeeded=1 case.
+    public List<CoverCandidate> AllCovers { get; set; } = new();
 }
