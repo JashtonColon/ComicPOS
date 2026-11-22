@@ -58,4 +58,20 @@ public interface IAutoFetchService
     // lot of Comic Vine calls for a store with a large catalog, so it's
     // meant to be run occasionally by hand, not on a schedule.
     AutoFetchResult RescanExistingBooks();
+
+    // A separate, one-time/on-demand historical backfill - not something
+    // that runs as part of the normal weekly Check Now flow, and never
+    // run automatically (same spirit as RescanExistingBooks above).
+    // Pulls every week of the given year from League of Comic Geeks (see
+    // ILocgService) and feeds each week into the same series/issue/cover
+    // creation logic as ComicList/GCD (AddEntriesAsIssues), with a
+    // mandatory delay between weeks to respect LOCG's own robots.txt
+    // crawl-delay - and, confirmed live, LOCG's own AJAX endpoint only
+    // actually lets a request through roughly once every few minutes
+    // regardless (see LocgService.FetchWeekJsonWithRetryAsync), so a
+    // full year can take several hours in practice, not minutes. A
+    // single real browser session is kept open for the whole run rather
+    // than one per week - meant to be kicked off and left running in the
+    // background, not something to repeat casually.
+    AutoFetchResult BackfillYearFromLocg(int year);
 }
