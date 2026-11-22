@@ -67,6 +67,28 @@
             </tbody>
         </table>
     </section>
+
+    <section class="panel">
+        <h2>Recent Purchases <span class="panel-sub">last @_recentSales.Count</span></h2>
+        <table class="pos-table">
+            <thead><tr><th>When</th><th>Customer</th><th>Items</th><th>Total</th></tr></thead>
+            <tbody>
+                @foreach (var sale in _recentSales)
+                {
+                    <tr>
+                        <td>@sale.SoldAt.ToString("MMM d, h:mm tt")</td>
+                        <td>@(string.IsNullOrWhiteSpace(sale.CustomerName) ? "Walk-in" : sale.CustomerName)</td>
+                        <td>@sale.ItemCount</td>
+                        <td>@sale.Total.ToString("C")</td>
+                    </tr>
+                }
+                @if (_recentSales.Count == 0)
+                {
+                    <tr><td colspan="4" class="pos-table-empty">No purchases yet.</td></tr>
+                }
+            </tbody>
+        </table>
+    </section>
 </div>
 
 @code {
@@ -75,6 +97,7 @@
     private decimal _month;
     private List<TopSellerEntry> _topSellers = new();
     private List<LowStockEntry> _lowStock = new();
+    private List<RecentSaleEntry> _recentSales = new();
 
     protected override void OnInitialized() => Load();
 
@@ -90,5 +113,6 @@
         _month = DashboardService.GetRevenue(startOfMonth, now);
         _topSellers = DashboardService.GetTopSellingSeries(30, 10);
         _lowStock = DashboardService.GetLowStock(2);
+        _recentSales = DashboardService.GetRecentSales(10);
     }
 }
