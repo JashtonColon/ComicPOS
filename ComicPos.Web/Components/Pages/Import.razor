@@ -43,6 +43,18 @@
         _resultText = null;
         _canImport = false;
 
+        // Picking a file, then picking a different one before ever clicking
+        // Run Import, used to leak the first file's temp copy forever -
+        // RunImport's own cleanup only ever deletes whichever path
+        // _tempFilePath currently points at, so the one we're about to
+        // overwrite right here would never get deleted. Clean it up now,
+        // same best-effort way RunImport does.
+        if (_tempFilePath != null)
+        {
+            try { File.Delete(_tempFilePath); } catch { /* best-effort only */ }
+            _tempFilePath = null;
+        }
+
         try
         {
             var file = e.File;
