@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using System.Threading;
 using ComicPos.Core.Models;
 using ComicPos.Core.Services;
 using Microsoft.EntityFrameworkCore;
@@ -13,9 +14,10 @@ public class AutoFetchService : IAutoFetchService
     private readonly IComicadeFocService _comicadeFoc;
     private readonly IGcdService _gcd;
     private readonly IMetronService _metron;
+    private readonly ILocgService _locg;
     private readonly IStoreSettingsService _storeSettings;
 
-    public AutoFetchService(ComicDbContext db, IComicVineService comicVine, IComicListService comicList, IComicadeFocService comicadeFoc, IGcdService gcd, IMetronService metron, IStoreSettingsService storeSettings)
+    public AutoFetchService(ComicDbContext db, IComicVineService comicVine, IComicListService comicList, IComicadeFocService comicadeFoc, IGcdService gcd, IMetronService metron, ILocgService locg, IStoreSettingsService storeSettings)
     {
         _db = db;
         _comicVine = comicVine;
@@ -23,6 +25,7 @@ public class AutoFetchService : IAutoFetchService
         _comicadeFoc = comicadeFoc;
         _gcd = gcd;
         _metron = metron;
+        _locg = locg;
         _storeSettings = storeSettings;
     }
 
@@ -53,7 +56,7 @@ public class AutoFetchService : IAutoFetchService
             // without needing another test round just to find out.
             trace.AppendLine();
             trace.AppendLine(new string('=', 60));
-            trace.AppendLine($"Final: checked {result.SeriesChecked} series, linked {result.SeriesAutoLinked}, added {result.NewIssuesAdded} new issue(s).");
+            trace.AppendLine($"Final: checked {result.SeriesChecked} series, linked {result.SeriesAutoLinked}, added {result.NewIssuesAdded} new issue(s), backfilled {result.CoversBackfilled} cover(s).");
             if (result.Added.Count > 0)
             {
                 trace.AppendLine();
@@ -207,11 +210,28 @@ public class AutoFetchService : IAutoFetchService
                     }
                     if (!TryAutoLink(series, result)) continue; // no confident match - leave unlinked, try again after the cooldown
                 }
-                else if (series.LastCheckedForNewIssues != null &&
-                         DateTime.Now - series.LastCheckedForNewIssues.Value < RecheckCooldown)
+                else
                 {
-                    skippedCooldown++;
-                    continue; // checked too recently to be worth another Comic Vine call
+                    if (series.LastCheckedForNewIssues != null &&
+                        DateTime.Now - series.LastCheckedForNewIssues.Value < RecheckCooldown)
+                    {
+                        skippedCooldown++;
+                        continue; // checked too recently to be worth another Comic Vine call
+                    }
+
+                    // Re-examine an already-linked series' volume match
+                    // every time it's otherwise due for a normal recheck,
+                    // not just during RescanExistingBooks (which only
+                    // calls ReverifyVolumeLink for series that still have
+                    // a missing cover - see its own loop). Without this, a
+                    // series whose covers are already all filled in (like
+                    // Wonder Woman's, once Re-scan finished backfilling
+                    // them) never got its link reconsidered again, ever -
+                    // confirmed live: Wonder Woman stayed linked to the
+                    // wrong 1942 Comic Vine volume indefinitely because
+                    // nothing still called this for it once its covers
+                    // were complete.
+                    ReverifyVolumeLink(series, result);
                 }
 
                 CheckOneSeries(series, result);
@@ -329,6 +349,7 @@ public class AutoFetchService : IAutoFetchService
         if (best == null) return false;
 
         series.ComicVineVolumeId = best.Id;
+        SyncStartYear(series, best);
         result.SeriesAutoLinked++;
         return true;
     }
@@ -405,6 +426,28 @@ public class AutoFetchService : IAutoFetchService
     // matching rule lives in exactly one place: an exact (case-insensitive)
     // name match is required; among those, the one whose start year
     // matches the series wins when the series' StartYear is trustworthy.
+    // How many issues behind a solicited-but-not-yet-published issue
+    // number a volume's own Comic Vine issue count is still allowed to be
+    // and count as "covers this issue". Extended Forecast solicitations
+    // run up to ~10 months ahead (see ComicListService), so by the time a
+    // brand-new Series row exists for one, the volume that will actually
+    // publish it often hasn't been catalogued that far yet - confirmed
+    // live: a fresh "Batman" row created for a solicited (not yet
+    // published) Batman #17 matched Comic Vine's original 1940 legacy-
+    // numbered volume (hundreds of issues, trivially ">= 17") instead of
+    // the real current volume, because the real current volume's own
+    // issue count hadn't reached 17 yet and so failed a strict ">="
+    // check - leaving the ancient volume as the ONLY "qualifying"
+    // candidate in the set, and therefore "smallest qualifying" by
+    // default even though it was the one genuinely wrong choice. This
+    // constant lets a volume within striking distance BELOW the target
+    // still qualify; "smallest qualifying count wins" still naturally
+    // favors it over a legacy volume's much larger count once both do.
+    private const int SolicitationLeadBufferIssues = 12;
+
+    private static bool VolumeCoversIssue(ComicVineVolumeMatch match, float maxKnownIssue)
+        => match.IssueCount >= maxKnownIssue - SolicitationLeadBufferIssues;
+
     private static ComicVineVolumeMatch? PickBestVolumeMatch(List<ComicVineVolumeMatch> matches, string seriesName, int seriesStartYear, List<Issue> knownIssues)
     {
         var exact = matches.Where(m => string.Equals(m.Name, seriesName, StringComparison.OrdinalIgnoreCase)).ToList();
@@ -426,18 +469,47 @@ public class AutoFetchService : IAutoFetchService
             // already on file (e.g. the current Superman relaunch, issue
             // #46). Comic Vine's count_of_issues is a much better signal
             // here: prefer a volume whose issue count already covers the
-            // highest issue number this series carries, and among those,
-            // the one whose count is closest to it (a volume still being
-            // published should have at least that many issues catalogued,
-            // not drastically more from decades of unrelated history).
+            // highest issue number this series carries - but among those,
+            // the SMALLEST qualifying count wins, not merely the closest
+            // one. "Closest by absolute distance" still loses for a
+            // character with a long publishing history: confirmed live,
+            // Wonder Woman's real current volume (a couple dozen issues)
+            // lost to the original 1942 volume (hundreds of issues)
+            // because 1942's count happened to sit closer in raw terms
+            // than some other old volume's, even though BOTH were wrong
+            // and the right volume was in the candidate list the whole
+            // time. A volume still actively publishing a recent issue
+            // number almost always has the SMALLEST issue count that
+            // still covers it - a decades-spanning legacy volume always
+            // has drastically more, never fewer.
             var maxKnownIssue = knownIssues.Max(i => i.IssueNumber);
-            best = exact
-                .OrderByDescending(m => m.IssueCount >= maxKnownIssue)
-                .ThenBy(m => Math.Abs(m.IssueCount - maxKnownIssue))
-                .First();
+            var qualifying = exact.Where(m => VolumeCoversIssue(m, maxKnownIssue)).ToList();
+            best = qualifying.Count > 0
+                ? qualifying.OrderBy(m => m.IssueCount).First()
+                : exact.OrderByDescending(m => m.IssueCount).First(); // nothing covers it yet - best guess is whichever has the most issues so far
         }
 
         return best ?? exact[0];
+    }
+
+    // Comic Vine's own StartYear for a matched volume is the one
+    // trustworthy source this app has for what a series' displayed year
+    // should be - everywhere a Series row gets CREATED (AddEntriesAsIssues,
+    // ImportService, InventoryService.AddOrUpdateItem), StartYear is just
+    // a placeholder (today's date, or whatever a CSV row happened to
+    // carry), and nothing ever revisited it afterward even once a real
+    // Comic Vine link was confirmed - confirmed live: "Wonder Woman" kept
+    // displaying "(1942)" next to a 2026 solicitation because
+    // PickBestVolumeMatch's own fix (the smallest-qualifying-count rule
+    // above) only ever corrected ComicVineVolumeId, never StartYear
+    // itself. Called from both TryAutoLink and ReverifyVolumeLink so a
+    // series' displayed year self-corrects the moment its Comic Vine link
+    // is confirmed or re-confirmed, instead of staying wrong forever once
+    // a bad placeholder gets stamped at creation.
+    private static void SyncStartYear(Series series, ComicVineVolumeMatch match)
+    {
+        if (match.StartYear is int y && y > 0 && series.StartYear != y)
+            series.StartYear = y;
     }
 
     // Current + last 3 months + next 3 months of street dates - a rolling
@@ -517,6 +589,15 @@ public class AutoFetchService : IAutoFetchService
 
         foreach (var cover in missingCovers)
             cover.CoverImagePath = imagePath;
+
+        // Previously silent - Check Now's own trace never said which
+        // exact issue got touched here, only a run-wide "added N new
+        // issue(s)" total that said nothing about covers. Logged the
+        // same way AddIssueIfNew logs a brand-new issue, so the trace
+        // can answer "what exactly changed" issue by issue, not just
+        // "something happened."
+        result.CoversBackfilled++;
+        result.Added.Add($"{series.Name} #{cvIssue.IssueNumber:0.##}: cover backfilled from Comic Vine ({missingCovers.Count} cover variant(s) updated).");
     }
 
     private static (DateOnly since, DateOnly until) DiscoveryWindow() =>
@@ -544,23 +625,24 @@ public class AutoFetchService : IAutoFetchService
 
         // Every series with at least one cover still missing art - not
         // just the ones already linked to a Comic Vine volume (the old
-        // filter here). GCD (tried below for every series) looks an
-        // issue up directly by series name + issue number, so it needs
-        // no Comic Vine link at all - a series that could never
-        // auto-link (a TP/GN, or one Comic Vine simply doesn't carry)
-        // used to be skipped outright and now still gets a GCD attempt.
+        // filter here). Metron (tried below for every series, see the
+        // priority note further down) looks an issue up directly by
+        // series name + issue number, so it needs no Comic Vine link at
+        // all - a series that could never auto-link (a TP/GN, or one
+        // Comic Vine simply doesn't carry) still gets a Metron attempt.
         var allSeries = _db.AllSeries
             .Include(s => s.Issues).ThenInclude(i => i.Covers)
             .Where(s => s.Issues.Any(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath))))
             .ToList();
 
         // Comic-Vine-linked series first, while its (shared, depletable)
-        // budget is freshest - GCD below runs for every series regardless
-        // of this ordering, since it has its own separate budget.
+        // budget is freshest - Metron/GCD below run for every series
+        // regardless of this ordering, since they have their own
+        // separate budgets.
         allSeries = allSeries
             .OrderByDescending(s => s.ComicVineVolumeId != null)
             .ToList();
-        trace.AppendLine($"Re-checking {allSeries.Count} series with at least one missing cover (Comic Vine where linked, GCD for all of them)...");
+        trace.AppendLine($"Re-checking {allSeries.Count} series with at least one missing cover (Comic Vine where linked, then Metron, then GCD as a last resort)...");
 
         // Once Comic Vine's rate limit trips, every further call to it
         // this run will just fail the same way - so instead of the old
@@ -622,40 +704,29 @@ public class AutoFetchService : IAutoFetchService
                 {
                     var backfilled = false;
 
-                    if (!gcdRateLimited)
-                    {
-                        gcdAttempts++;
-                        var gcdResult = BackfillCoverFromGcd(series, issue);
-                        if (gcdResult.Success)
-                        {
-                            backfilledFromGcd++;
-                            backfilled = true;
-                        }
-                        else if (gcdResult.IsRateLimited)
-                        {
-                            gcdRateLimited = true;
-                            result.Errors.Add($"GCD stopped responding normally after {gcdAttempts} attempt(s) - skipping it for the rest of this run. Reason: {gcdResult.Reason}.");
-                        }
-                        else
-                        {
-                            gcdReasonCounts[gcdResult.Reason] = gcdReasonCounts.GetValueOrDefault(gcdResult.Reason) + 1;
-                            if (gcdSampleDetails.Count < 10 && !string.IsNullOrWhiteSpace(gcdResult.Detail))
-                                gcdSampleDetails.Add($"{series.Name} #{issue.IssueNumber:0.##}: {gcdResult.Reason} - {gcdResult.Detail}");
-                        }
-                    }
-
-                    // Metron is tried independently of GCD's outcome (not
-                    // only when GCD missed) whenever this issue still has
-                    // no cover - two separate services with two separate
-                    // budgets, so one running dry is no reason to skip
-                    // trying the other.
-                    if (!backfilled && !metronRateLimited)
+                    // Metron goes first now, GCD second as a last resort -
+                    // not just GCD's rate limit (20/min, same as Metron's),
+                    // but its anonymous-access cap (~30/hour, a hard wall
+                    // for a whole run) and its Cloudflare bot-protection
+                    // (403s that can take 24+ hours to clear, confirmed
+                    // live this session) make it the far less reliable of
+                    // the two. Metron's own per-issue data is also simply
+                    // richer and less ambiguous - its series names carry
+                    // their own year disambiguator ("Absolute Flash
+                    // (2025)"), and it gives exact cover/in-store/FOC
+                    // dates plus full creator credits, none of which GCD's
+                    // response shape here is used for yet. GCD still runs
+                    // whenever Metron misses or is rate-limited - a second
+                    // independent source is still worth trying, just no
+                    // longer the first one asked.
+                    if (!metronRateLimited)
                     {
                         metronAttempts++;
                         var metronResult = BackfillCoverFromMetron(series, issue);
                         if (metronResult.Success)
                         {
                             backfilledFromMetron++;
+                            backfilled = true;
                         }
                         else if (metronResult.IsRateLimited)
                         {
@@ -667,6 +738,30 @@ public class AutoFetchService : IAutoFetchService
                             gcdReasonCounts[metronResult.Reason] = gcdReasonCounts.GetValueOrDefault(metronResult.Reason) + 1;
                             if (gcdSampleDetails.Count < 10 && !string.IsNullOrWhiteSpace(metronResult.Detail))
                                 gcdSampleDetails.Add($"{series.Name} #{issue.IssueNumber:0.##}: {metronResult.Reason} - {metronResult.Detail}");
+                        }
+                    }
+
+                    // GCD is only tried when Metron didn't come through for
+                    // this exact issue (missed, or rate-limited) - a
+                    // fallback now, not a co-equal first attempt.
+                    if (!backfilled && !gcdRateLimited)
+                    {
+                        gcdAttempts++;
+                        var gcdResult = BackfillCoverFromGcd(series, issue);
+                        if (gcdResult.Success)
+                        {
+                            backfilledFromGcd++;
+                        }
+                        else if (gcdResult.IsRateLimited)
+                        {
+                            gcdRateLimited = true;
+                            result.Errors.Add($"GCD stopped responding normally after {gcdAttempts} attempt(s) - skipping it for the rest of this run. Reason: {gcdResult.Reason}.");
+                        }
+                        else
+                        {
+                            gcdReasonCounts[gcdResult.Reason] = gcdReasonCounts.GetValueOrDefault(gcdResult.Reason) + 1;
+                            if (gcdSampleDetails.Count < 10 && !string.IsNullOrWhiteSpace(gcdResult.Detail))
+                                gcdSampleDetails.Add($"{series.Name} #{issue.IssueNumber:0.##}: {gcdResult.Reason} - {gcdResult.Detail}");
                         }
                     }
 
@@ -685,7 +780,7 @@ public class AutoFetchService : IAutoFetchService
                 result.Added.Add($"{series.Name}: backfilled {backfilledThisSeries} cover(s) ({missingAfter} still missing).");
         }
 
-        trace.AppendLine($"GCD backfilled {backfilledFromGcd} cover(s) out of {gcdAttempts} attempt(s); Metron backfilled {backfilledFromMetron} cover(s) out of {metronAttempts} attempt(s) (on top of whatever Comic Vine backfilled above).");
+        trace.AppendLine($"Metron backfilled {backfilledFromMetron} cover(s) out of {metronAttempts} attempt(s); GCD (fallback) backfilled {backfilledFromGcd} cover(s) out of {gcdAttempts} attempt(s) (on top of whatever Comic Vine backfilled above).");
         if (gcdReasonCounts.Count > 0)
         {
             trace.AppendLine("GCD/Metron misses, by reason:");
@@ -712,7 +807,7 @@ public class AutoFetchService : IAutoFetchService
 
         trace.AppendLine();
         trace.AppendLine(new string('=', 60));
-        trace.AppendLine($"Final: checked {result.SeriesChecked} series, re-linked {result.SeriesAutoLinked}, backfilled {result.CoversBackfilled} cover(s) ({backfilledFromGcd} from GCD, {backfilledFromMetron} from Metron).");
+        trace.AppendLine($"Final: checked {result.SeriesChecked} series, re-linked {result.SeriesAutoLinked}, backfilled {result.CoversBackfilled} cover(s) ({backfilledFromMetron} from Metron, {backfilledFromGcd} from GCD fallback).");
         if (result.Added.Count > 0)
         {
             trace.AppendLine();
@@ -730,6 +825,110 @@ public class AutoFetchService : IAutoFetchService
         DebugLog.WriteCheckNowLog(rescanTraceText);
 
         return result;
+    }
+
+    // How long LOCG's own robots.txt asks every crawler to wait between
+    // requests (Crawl-delay: 30.00) - this is the one real, documented
+    // constraint on this whole feature, so it's a named constant instead
+    // of a bare literal buried in a loop.
+    private static readonly TimeSpan LocgCrawlDelay = TimeSpan.FromSeconds(30);
+
+    public AutoFetchResult BackfillYearFromLocg(int year)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"LOCG backfill for {year} run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
+
+        try
+        {
+            RunBackfillYearFromLocg(year, result, trace);
+            return result;
+        }
+        finally
+        {
+            trace.AppendLine();
+            trace.AppendLine(new string('=', 60));
+            trace.AppendLine($"Final: added {result.NewIssuesAdded} new issue(s) for {year}.");
+            if (result.Added.Count > 0)
+            {
+                trace.AppendLine();
+                trace.AppendLine("Added:");
+                foreach (var line in result.Added) trace.AppendLine("  " + line);
+            }
+            if (result.Errors.Count > 0)
+            {
+                trace.AppendLine();
+                trace.AppendLine("Errors:");
+                foreach (var line in result.Errors) trace.AppendLine("  " + line);
+            }
+            var locgTraceText = trace.ToString();
+            result.Trace = locgTraceText;
+            DebugLog.WriteCheckNowLog(locgTraceText);
+        }
+    }
+
+    // Walks every Monday of the given year (LOCG's weekly pages are
+    // always Monday-to-Monday - see ILocgService) from Jan 1 through
+    // Dec 31, pulling each week from LOCG and feeding it through the
+    // exact same grouping/creation logic ComicList and GCD already use
+    // (AddEntriesAsIssues) so a LOCG-sourced issue is handled identically
+    // to one from any other source once it's in ComicListEntry shape.
+    // One week failing (a transient site error, LOCG's own quota window
+    // never opening up within LocgService's retry budget) is recorded
+    // and skipped rather than aborting the whole run - since LOCG's AJAX
+    // endpoint only actually lets a request through every few minutes
+    // regardless of how this is spaced out, a full year can take several
+    // hours in practice. Losing all of it over one stubborn week would be
+    // far worse than a gap in the results that a second run (same year)
+    // can simply fill back in, since already-known issues are
+    // skipped/merged rather than duplicated either way.
+    private void RunBackfillYearFromLocg(int year, AutoFetchResult result, System.Text.StringBuilder trace)
+    {
+        var allSeries = _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers).ToList();
+
+        // Every Monday whose week (Monday-Sunday) overlaps this year,
+        // collected up front - a plain index-based loop over a known list
+        // is what lets "skip the delay after the very last week" below be
+        // a simple i < count - 1 check instead of re-deriving "is this
+        // the last iteration" from date arithmetic on the fly.
+        var mondays = new List<DateOnly>();
+        var firstDay = new DateOnly(year, 1, 1);
+        // DayOfWeek: Sunday=0 ... Saturday=6, Monday=1 - walks backward
+        // (never forward) from Jan 1 to land on that week's Monday, which
+        // may fall in the prior December; LOCG's own week containing
+        // Jan 1 is whichever Monday-Sunday span Jan 1 falls inside, same
+        // as the site itself would show.
+        var monday = firstDay.AddDays(-(((int)firstDay.DayOfWeek + 6) % 7));
+        while (monday.Year == year || monday.AddDays(6).Year == year)
+        {
+            mondays.Add(monday);
+            monday = monday.AddDays(7);
+        }
+
+        for (var i = 0; i < mondays.Count; i++)
+        {
+            var week = mondays[i];
+            try
+            {
+                var entries = _locg.GetWeekEntries(week);
+                var beforeCount = result.NewIssuesAdded;
+                AddEntriesAsIssues(allSeries, entries, week, "LOCG", result);
+                trace.AppendLine($"Week of {week:MM/dd/yyyy}: {entries.Count} entries from LOCG, +{result.NewIssuesAdded - beforeCount} new issue(s).");
+                _db.SaveChanges(); // persist incrementally - a later week's failure shouldn't lose earlier weeks' work
+            }
+            catch (Exception ex)
+            {
+                result.Errors.Add($"LOCG week of {week:MM/dd/yyyy}: {ex.Message}");
+            }
+
+            // No delay after the very last week - nothing left to be
+            // polite to LOCG about once the run is finished.
+            if (i < mondays.Count - 1)
+                Thread.Sleep(LocgCrawlDelay);
+        }
+
+        trace.AppendLine($"Pulled {mondays.Count} week(s) from LOCG for {year}.");
     }
 
     // Scans every cover image already on file, groups them by the
@@ -813,10 +1012,18 @@ public class AutoFetchService : IAutoFetchService
         return cleared;
     }
 
-    // Only ever called from RescanExistingBooks, never the normal Check Now
-    // flow - re-running a full name search for every already-linked series
-    // on every ordinary check would waste Comic Vine's budget and risk
-    // flipping a correct link for no reason. This exists specifically to
+    // Called from RescanExistingBooks (for a series that still has a
+    // missing cover) AND from RunCheckForNewIssues's own per-series loop
+    // (for every already-linked series whose RecheckCooldown has expired)
+    // - the latter was added specifically because a series whose covers
+    // are already all filled in never shows up in Re-scan's candidate
+    // list at all, so without this it could never get a second look once
+    // RescanExistingBooks stopped visiting it (confirmed live: Wonder
+    // Woman stayed linked to the wrong volume indefinitely for exactly
+    // this reason). The extra SearchVolumes call this adds to a normal
+    // Check Now is bounded by RecheckCooldown (currently 3h) the same way
+    // CheckOneSeries's own calls already are, so it's one more call per
+    // series per cooldown window, not per run. This exists specifically to
     // undo damage from a link made before PickBestVolumeMatch's
     // issue-count-based matching existed (the "Superman (1939)" bug).
     private void ReverifyVolumeLink(Series series, AutoFetchResult result)
@@ -836,7 +1043,16 @@ public class AutoFetchService : IAutoFetchService
         }
 
         var best = PickBestVolumeMatch(matches, series.Name, series.StartYear, series.Issues);
-        if (best == null || best.Id == series.ComicVineVolumeId) return; // no match, or already linked to the right one
+        if (best == null) return; // no confident match at all
+
+        // Sync the display year to Comic Vine's own record for whichever
+        // volume we're confident is the right one - even when the link
+        // itself doesn't need to change below, a series created with a
+        // wrong placeholder StartYear (see SyncStartYear's own comment)
+        // still gets corrected here every time this runs.
+        SyncStartYear(series, best);
+
+        if (best.Id == series.ComicVineVolumeId) return; // already linked to the right one
 
         var maxKnownIssue = series.Issues.Max(i => i.IssueNumber);
         var current = matches.FirstOrDefault(m => m.Id == series.ComicVineVolumeId);
@@ -848,9 +1064,24 @@ public class AutoFetchService : IAutoFetchService
         // "the current link wasn't found in this search" is never treated
         // as "the current link is wrong" on its own - only a genuinely
         // better-fitting alternative is.
-        var currentFits = current != null && current.IssueCount >= maxKnownIssue;
-        var bestFits = best.IssueCount >= maxKnownIssue;
-        if (currentFits || !bestFits) return;
+        //
+        // The old check here only asked "does the CURRENT link still
+        // technically cover the known issue numbers" - nearly always true
+        // for a decades-old legacy volume with hundreds of issues, so a
+        // bad link could never self-correct on a later Re-scan (confirmed
+        // live: Wonder Woman stayed linked to the original 1942 volume
+        // through every Re-scan since its 329 issues trivially satisfied
+        // ">= maxKnownIssue" every single time). This asks the real
+        // question instead - is CURRENT at least as good a fit as BEST, by
+        // the same smallest-qualifying-count rule PickBestVolumeMatch
+        // itself uses - so a clearly-too-big legacy volume loses to a
+        // smaller, better-fitting candidate instead of being permanently
+        // grandfathered in just for still being numerically possible.
+        var bestFits = VolumeCoversIssue(best, maxKnownIssue);
+        if (!bestFits) return; // the candidate doesn't even cover the known issues - never worth switching to
+
+        var currentFits = current != null && VolumeCoversIssue(current, maxKnownIssue);
+        if (currentFits && current!.IssueCount <= best.IssueCount) return; // current is already at least as good a fit - don't flap to an equally-valid alternative
 
         result.Added.Add($"{series.Name}: re-linked from Comic Vine volume {series.ComicVineVolumeId} to {best.Id} (\"{best.Name}\", {best.IssueCount} issue(s) on file - a better fit for issue #{maxKnownIssue:0.##} than the previous link).");
         series.ComicVineVolumeId = best.Id;
@@ -860,6 +1091,21 @@ public class AutoFetchService : IAutoFetchService
         // volume entirely.
         series.LastCheckedForNewIssues = null;
         result.SeriesAutoLinked++;
+
+        // The wrong volume may already have supplied cover art for issues
+        // on file (confirmed live: Batman #17 had all 7 of its covers
+        // filled in with a single Golden-Age image pulled from the wrong,
+        // just-corrected volume) - re-linking alone doesn't touch already-
+        // downloaded images, so without this a corrected link would still
+        // display the old, wrong art forever. Clearing every cover here
+        // means a FEW correct Metron/GCD-sourced covers get needlessly
+        // re-fetched too (there's no stored record of which backfill
+        // source actually supplied a given image), but that's a cheap,
+        // harmless re-download next Re-scan - leaving a wrong cover in
+        // place is the far worse outcome.
+        foreach (var issue in series.Issues)
+        foreach (var cover in issue.Covers)
+            cover.CoverImagePath = null;
     }
 
     // Comic-Vine-only half of what RescanSeriesCovers used to do in one
@@ -896,6 +1142,34 @@ public class AutoFetchService : IAutoFetchService
             BackfillCoverImage(series, cvIssue, result);
     }
 
+    // GCD/Metron need a real date to tell same-named volumes apart
+    // (Wonder Woman, Batman, Green Lantern Corps and plenty of other
+    // characters have been relaunched under the same title many times
+    // across decades, sometimes reusing the exact same issue number).
+    // series.StartYear is NOT reliable for this - it's one scalar for
+    // the whole series, often wrong (a creation-time placeholder, or the
+    // wrong Comic Vine volume's earliest-appearance year - confirmed
+    // live: Wonder Woman's series.StartYear was 1942, which sent Metron
+    // looking for a 1940s issue number 39 and it happily returned the
+    // real 1948 Golden Age cover). Using the issue's own release YEAR
+    // alone turned out not to be enough either - confirmed live, same
+    // session: Metron/GCD's "what year did this volume start" filters
+    // still came back with nothing for a correctly-dated modern issue,
+    // because "the volume's start year" and "this issue's release year"
+    // are different numbers for any series more than one year old. The
+    // fix living in MetronService/GcdService now is to stop asking
+    // either source to filter by year at all, and instead compare each
+    // candidate's own cover/publication date against this issue's real
+    // ReleaseDate/FocDate client-side - which needs the full date, not
+    // just a year, hence DateOnly here. series.StartYear only backs a
+    // rough mid-year guess for an issue with no date on file at all.
+    private static DateOnly? IssueDateHint(Series series, Issue issue)
+    {
+        if (issue.ReleaseDate != null) return issue.ReleaseDate;
+        if (issue.FocDate != null) return issue.FocDate;
+        return series.StartYear > 0 ? new DateOnly(series.StartYear, 6, 15) : null;
+    }
+
     // One issue at a time - GCD is a free, unauthenticated, rate-limited
     // API (see GcdService's own header comment), so this is only ever
     // reached from the manual, deliberate Re-scan action, never the
@@ -908,13 +1182,10 @@ public class AutoFetchService : IAutoFetchService
             return new GcdCoverLookupResult { Reason = "no missing cover to fill" };
 
         var hint = $"{series.Name}_{issue.IssueNumber:0.##}_{Guid.NewGuid():N}".Replace(" ", "_");
-        int? startYear = series.StartYear > 0 ? series.StartYear : null;
-        var result = _gcd.FindAndDownloadCover(series.Name, issue.IssueNumber, startYear, hint);
+        var expectedDate = IssueDateHint(series, issue);
+        var result = _gcd.FindAndDownloadCover(series.Name, issue.IssueNumber, expectedDate, hint, missingCovers.Count);
         if (result.Success)
-        {
-            foreach (var cover in missingCovers)
-                cover.CoverImagePath = result.ImagePath;
-        }
+            AssignCoversByLetter(missingCovers, result.AllCovers);
         return result;
     }
 
@@ -928,14 +1199,75 @@ public class AutoFetchService : IAutoFetchService
             return new MetronCoverLookupResult { Reason = "no missing cover to fill" };
 
         var hint = $"{series.Name}_{issue.IssueNumber:0.##}_{Guid.NewGuid():N}".Replace(" ", "_");
-        int? startYear = series.StartYear > 0 ? series.StartYear : null;
-        var result = _metron.FindAndDownloadCover(series.Name, issue.IssueNumber, startYear, hint);
+        var expectedDate = IssueDateHint(series, issue);
+        var result = _metron.FindAndDownloadCover(series.Name, issue.IssueNumber, expectedDate, hint, missingCovers.Count);
         if (result.Success)
-        {
-            foreach (var cover in missingCovers)
-                cover.CoverImagePath = result.ImagePath;
-        }
+            AssignCoversByLetter(missingCovers, result.AllCovers);
         return result;
+    }
+
+    // Found live this session: every missing Cover row for one issue (A,
+    // B, C, D...) was getting the exact same downloaded image, because
+    // the old code just looped every missing cover and wrote the same
+    // single path to each - even though Metron's own site shows genuinely
+    // distinct art per variant (confirmed via screenshot: Wonder Woman
+    // #39's own "Covers (5)" panel). FindAndDownloadCover/GCD's
+    // equivalent now return one CoverCandidate per distinct image they
+    // actually found (see CoverCandidate on IMetronService) - this maps
+    // them onto ComicPos's own Cover rows by best-effort letter matching:
+    // a candidate whose Label parses to a letter ("Cover B" -> 'B') goes
+    // to the Cover row with that exact CoverLetter; anything left over
+    // (an unlettered variant name, or more/fewer candidates than Cover
+    // rows) gets handed out to whatever Cover rows are still unmatched,
+    // in order - a real distinct cover for every row beats a blank one,
+    // even where the exact letter pairing can't be confirmed.
+    private static void AssignCoversByLetter(List<Cover> missingCovers, List<CoverCandidate> candidates)
+    {
+        if (candidates.Count == 0) return;
+
+        var remainingCovers = new List<Cover>(missingCovers);
+        var leftoverCandidates = new List<CoverCandidate>();
+
+        foreach (var candidate in candidates)
+        {
+            var letter = ParseCoverLetterFromLabel(candidate.Label);
+            var match = letter != null
+                ? remainingCovers.FirstOrDefault(c => string.Equals(c.CoverLetter?.Trim(), letter, StringComparison.OrdinalIgnoreCase))
+                : null;
+
+            if (match != null)
+            {
+                match.CoverImagePath = candidate.ImagePath;
+                remainingCovers.Remove(match);
+            }
+            else
+            {
+                leftoverCandidates.Add(candidate);
+            }
+        }
+
+        // Whatever didn't get a clean letter match (an unlettered variant
+        // name, a label that parsed to a letter no remaining Cover row
+        // actually has, or simply more candidates than rows) still goes
+        // out to whatever Cover rows are left, in order, rather than
+        // being thrown away.
+        foreach (var candidate in leftoverCandidates)
+        {
+            if (remainingCovers.Count == 0) break;
+            remainingCovers[0].CoverImagePath = candidate.ImagePath;
+            remainingCovers.RemoveAt(0);
+        }
+    }
+
+    // "Cover B", "2nd Printing Cover C Variant" -> "B"/"C". No label at
+    // all (the primary/base cover, Label == null) is treated as "A" -
+    // the overwhelmingly common convention for which letter a comic's
+    // un-suffixed main cover is filed under in this app.
+    private static string? ParseCoverLetterFromLabel(string? label)
+    {
+        if (label == null) return "A";
+        var match = Regex.Match(label, @"Cover\s+([A-Za-z])\b", RegexOptions.IgnoreCase);
+        return match.Success ? match.Groups[1].Value.ToUpperInvariant() : null;
     }
 
     // Builds and saves the Issue+Cover for one Comic Vine issue, if its
