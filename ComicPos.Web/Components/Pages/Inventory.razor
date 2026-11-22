@@ -120,7 +120,7 @@ else if (_level == 3)
                 {
                     <tr>
                         <td>
-                            <img class="cover-thumb" src="/api/cover-image/@row.Cover.Id?v=@row.ImageVersion" alt="cover"
+                            <img class="cover-thumb-detail" src="/api/cover-image/@row.Cover.Id?v=@row.ImageCacheKey" alt="cover"
                                  style="cursor:pointer"
                                  onerror="this.onerror=null;this.src='/img/no-cover.svg';"
                                  @onclick="@(() => OpenZoom(row.Cover.Id))" />
@@ -135,7 +135,7 @@ else if (_level == 3)
                         <td><input type="text" style="width:70px" value="@row.Price" @onchange="e => SavePrice(row, e.Value?.ToString() ?? string.Empty)" /></td>
                         <td><input type="text" style="width:60px" value="@row.Stock" @onchange="e => SaveStock(row, e.Value?.ToString() ?? string.Empty)" /></td>
                         <td><input type="text" value="@row.Description" @onchange="e => SaveDescription(row, e.Value?.ToString() ?? string.Empty)" /></td>
-                        <td><button class="btn-ghost btn-sm" @onclick="@(() => OpenHoldCopy(row.Cover.CoverLetter))">Hold</button></td>
+                        <td><button class="btn-primary btn-sm" @onclick="@(() => OpenHoldCopy(row.Cover.CoverLetter))">Hold</button></td>
                     </tr>
                 }
             </tbody>
@@ -143,7 +143,7 @@ else if (_level == 3)
     }
 }
 
-<AddItemModal Show="_showAddItem" OnSaved="OnAddItemSaved" OnClose="@(() => _showAddItem = false)" />
+<AddItemModal Show="_showAddItem" OnSaved="OnAddItemSaved" OnItemAdded="OnAddItemAddedNoClose" OnClose="@(() => _showAddItem = false)" />
 
 <HoldCopyModal Show="_showHold" IssueLabel="@HoldIssueLabel" KnownCoverLetters="_knownCoverLetters"
                DefaultCoverLetter="@_holdDefaultCover" OnSave="OnHoldSave" OnClose="@(() => _showHold = false)" />
@@ -184,7 +184,23 @@ else if (_level == 3)
         public string Price { get; set; } = "";
         public string Stock { get; set; } = "";
         public string Description { get; set; } = "";
-        public int ImageVersion { get; set; }
+
+        // Cache-busting key for the <img> src. This used to be a plain
+        // incrementing int (ImageVersion++ after a successful upload), but
+        // every save path - including this one - ends with LoadCoverDetail()
+        // rebuilding _coverRows from scratch as brand-new CoverRow objects,
+        // which reset any incremented counter straight back to its default
+        // (0) before the browser ever saw the bumped value. The query string
+        // the <img> tag actually rendered with was therefore always "?v=0",
+        // so after replacing a cover image the browser kept showing the old
+        // cached picture at that same URL. Deriving the key from the cover's
+        // own CoverImagePath instead fixes this for good: a new upload always
+        // gets a brand-new GUID-named file (see OnCoverImageSelected below),
+        // so the key changes automatically and survives the row-list rebuild
+        // because it comes from persisted data, not a transient counter.
+        public string ImageCacheKey => string.IsNullOrEmpty(Cover.CoverImagePath)
+            ? "0"
+            : Cover.CoverImagePath.GetHashCode().ToString();
     }
 
     protected override void OnInitialized() => LoadSeriesList();
@@ -286,6 +302,15 @@ else if (_level == 3)
     {
         _showAddItem = false;
         _search = "";
+        LoadSeriesList();
+    }
+
+    // Fired once per book the modal's UPC scan-and-auto-add path adds,
+    // which keeps the modal open for the next scan (see AddItemModal's
+    // own OnItemAdded doc comment) - just refresh the list behind it,
+    // don't close anything here.
+    private void OnAddItemAddedNoClose()
+    {
         LoadSeriesList();
     }
 
@@ -407,7 +432,6 @@ else if (_level == 3)
             }
 
             row.Cover.CoverImagePath = path;
-            row.ImageVersion++;
             SaveCover(row.Cover, false, row.Cover.Barcode);
         }
         catch (Exception ex)
