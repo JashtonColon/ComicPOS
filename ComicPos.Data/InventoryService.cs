@@ -99,7 +99,12 @@ public class InventoryService : IInventoryService
         string barcode,
         decimal price,
         int stockQuantity,
-        string? description)
+        string? description,
+        string author = "",
+        string penciler = "",
+        string inker = "",
+        string colorist = "",
+        string letterer = "")
     {
         var series = _db.AllSeries.FirstOrDefault(s => s.Name == seriesName);
         if (series == null)
@@ -121,7 +126,12 @@ public class InventoryService : IInventoryService
                 Type = type,
                 Publisher = publisher,
                 FocDate = focDate,
-                ReleaseDate = releaseDate
+                ReleaseDate = releaseDate,
+                Author = author,
+                Penciler = penciler,
+                Inker = inker,
+                Colorist = colorist,
+                Letterer = letterer
             };
             _db.Issues.Add(issue);
         }
@@ -130,6 +140,11 @@ public class InventoryService : IInventoryService
             issue.Publisher = publisher;
             issue.FocDate = focDate;
             issue.ReleaseDate = releaseDate;
+            issue.Author = author;
+            issue.Penciler = penciler;
+            issue.Inker = inker;
+            issue.Colorist = colorist;
+            issue.Letterer = letterer;
         }
 
         var existingCover = _db.Covers.FirstOrDefault(c => c.Barcode == barcode);
