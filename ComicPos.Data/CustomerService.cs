@@ -25,6 +25,7 @@ public class CustomerService : ICustomerService
                 EF.Functions.Like(c.Name, $"%{text}%") ||
                 (c.Email != null && EF.Functions.Like(c.Email, $"%{text}%")) ||
                 (c.Phone != null && EF.Functions.Like(c.Phone, $"%{text}%")))
+            .OrderBy(c => c.Name)
             .ToList();
     }
     public Customer AddCustomer(string name, string? email, string? phone)
