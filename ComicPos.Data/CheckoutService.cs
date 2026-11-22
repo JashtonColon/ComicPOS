@@ -47,9 +47,15 @@ public class CheckoutService : ICheckoutService
 
     public void CompleteSale(Sale sale)
     {
+        // Deduct the full quantity sold, even past zero. Clamping this at 0
+        // used to throw away the real oversell amount (stock=2, sell 5 ->
+        // clamped to 0), which made VoidSale's symmetric "+= line.Quantity"
+        // restore inflate stock on void (0 + 5 = 5 instead of back to 2).
+        // Letting stock go negative keeps deduct/restore exact opposites of
+        // each other and doubles as an honest "oversold by N" signal.
         foreach (var line in sale.Lines)
         {
-            line.Cover.StockQuantity = Math.Max(0, line.Cover.StockQuantity - line.Quantity);
+            line.Cover.StockQuantity -= line.Quantity;
         }
 
         _db.Sales.Add(sale);
