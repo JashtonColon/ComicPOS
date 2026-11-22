@@ -4,6 +4,7 @@
 @inject IStoreSettingsService StoreSettingsService
 @inject IEmailSettingsService EmailSettingsService
 @inject IBackupService Backup
+@inject IWorkerService WorkerService
 @rendermode InteractiveServer
 
 <PageTitle>Settings - Comic POS</PageTitle>
@@ -139,20 +140,61 @@
 <div class="panel" style="margin-top:16px">
     <p class="list-row-title" style="margin-bottom:10px">Cover Art Fallback (Metron)</p>
     <div class="form-row">
-        <label>Metron Username:</label>
-        <input type="text" value="@_metronUsername" @oninput="e => _metronUsername = e.Value?.ToString() ?? string.Empty" />
-    </div>
-    <div class="form-row">
-        <label>Metron Password:</label>
-        <input type="password" value="@_metronPassword" @oninput="e => _metronPassword = e.Value?.ToString() ?? string.Empty" />
+        <label>Metron API Token:</label>
+        <input type="password" value="@_metronApiToken" @oninput="e => _metronApiToken = e.Value?.ToString() ?? string.Empty" />
     </div>
     <p class="help-text">
         Free account at metron.cloud - a third, independent source "Re-scan Existing" tries for cover art when Comic
-        Vine and GCD both come up empty for an issue. Optional: leave blank to skip it entirely (GCD and Comic Vine
-        alone will still cover most of a typical catalog). Note: metron.cloud's own site has blocked automated
-        requests with bot-protection during our own testing - if Re-scan's log shows Metron failing for that reason,
-        it just means this source didn't work out, not that something here is broken.
+        Vine and GCD both come up empty for an issue. Metron's API recently switched from a plain username/password
+        login to a per-account API token, so this needs a token, not your website password - log into metron.cloud
+        in your own browser and look for an API token under your account/profile settings (I can't browse that site
+        myself to point you at the exact page - it blocks automated requests). Optional: leave blank to skip Metron
+        entirely (GCD and Comic Vine alone will still cover most of a typical catalog).
     </p>
+</div>
+
+<div class="panel" style="margin-top:16px">
+    <p class="list-row-title" style="margin-bottom:10px">Workers</p>
+    <p class="help-text" style="margin-top:-4px;margin-bottom:12px">
+        Workers pick their name and a short PIN at the register before ringing up a sale, so receipts and the
+        Dashboard can show who served each customer. This isn't a security login - it doesn't restrict any page.
+    </p>
+
+    <div class="list-rows" style="margin-bottom:14px">
+        @foreach (var w in _workers)
+        {
+            <div class="list-row">
+                <div class="list-row-main">
+                    <span class="list-row-title">@w.Name</span>
+                    @if (!w.IsActive)
+                    {
+                        <span class="help-text" style="margin-left:8px">(inactive)</span>
+                    }
+                </div>
+                <button class="btn-ghost btn-sm" @onclick="@(() => ToggleWorkerActive(w))">@(w.IsActive ? "Deactivate" : "Reactivate")</button>
+            </div>
+        }
+        @if (_workers.Count == 0)
+        {
+            <p class="help-text">No workers added yet.</p>
+        }
+    </div>
+
+    <div class="form-row-split">
+        <div class="form-row">
+            <label>Name:</label>
+            <input type="text" value="@_newWorkerName" @oninput="e => _newWorkerName = e.Value?.ToString() ?? string.Empty" />
+        </div>
+        <div class="form-row">
+            <label>PIN:</label>
+            <input type="text" inputmode="numeric" maxlength="8" value="@_newWorkerPin" @oninput="e => _newWorkerPin = e.Value?.ToString() ?? string.Empty" />
+        </div>
+    </div>
+    @if (_workerError != null)
+    {
+        <p class="error-text">@_workerError</p>
+    }
+    <button class="btn-primary btn-sm" @onclick="AddWorker">Add Worker</button>
 </div>
 
 <div class="panel" style="margin-top:16px">
@@ -206,14 +248,18 @@
 
     private string _comicVineApiKey = "";
     private string _trackedPublishers = "";
-    private string _metronUsername = "";
-    private string _metronPassword = "";
+    private string _metronApiToken = "";
     private bool _autoBackup = true;
 
     private string? _error;
     private string? _status;
     private string? _backupError;
     private string? _backupMessage;
+
+    private List<Worker> _workers = new();
+    private string _newWorkerName = "";
+    private string _newWorkerPin = "";
+    private string? _workerError;
 
     protected override void OnInitialized() => LoadSettings();
 
@@ -227,9 +273,9 @@
         _logoPath = store.LogoPath;
         _comicVineApiKey = store.ComicVineApiKey ?? "";
         _trackedPublishers = store.TrackedPublishers ?? "";
-        _metronUsername = store.MetronUsername ?? "";
-        _metronPassword = store.MetronPassword ?? "";
+        _metronApiToken = store.MetronApiToken ?? "";
         _autoBackup = store.AutoBackupEnabled;
+        _workers = WorkerService.GetAllWorkers();
 
         var email = EmailSettingsService.Load();
         _smtpHost = email.SmtpHost;
@@ -298,7 +344,14 @@
         // with null/default on every settings save would make the weekly
         // New Books check, the daily auto-backup, and the daily FOC email
         // all think they've never run, forcing an extra one on the very
-        // next startup/hourly tick.
+        // next startup/hourly tick. WrongEraCoverCleanupApplied belongs
+        // here too (found during this session's own bug sweep) - it
+        // defaults to false like any other bool, so without preserving it
+        // explicitly, saving Settings even once after the one-time Wonder
+        // Woman cover cleanup ran would silently reset it to false and
+        // make Program.cs re-run that cleanup (wiping those covers again,
+        // including ones a later Re-scan had already correctly refilled)
+        // on every subsequent app startup.
         var currentStore = StoreSettingsService.Load();
         var currentEmail = EmailSettingsService.Load();
 
@@ -311,11 +364,11 @@
             LogoPath = _logoPath,
             ComicVineApiKey = string.IsNullOrWhiteSpace(_comicVineApiKey) ? null : _comicVineApiKey.Trim(),
             TrackedPublishers = string.IsNullOrWhiteSpace(_trackedPublishers) ? null : _trackedPublishers.Trim(),
-            MetronUsername = string.IsNullOrWhiteSpace(_metronUsername) ? null : _metronUsername.Trim(),
-            MetronPassword = string.IsNullOrWhiteSpace(_metronPassword) ? null : _metronPassword,
+            MetronApiToken = string.IsNullOrWhiteSpace(_metronApiToken) ? null : _metronApiToken.Trim(),
             AutoBackupEnabled = _autoBackup,
             LastAutoFetchRun = currentStore.LastAutoFetchRun,
-            LastAutoBackupAt = currentStore.LastAutoBackupAt
+            LastAutoBackupAt = currentStore.LastAutoBackupAt,
+            WrongEraCoverCleanupApplied = currentStore.WrongEraCoverCleanupApplied
         });
 
         EmailSettingsService.Save(new EmailSettings
@@ -334,6 +387,42 @@
         });
 
         _status = "Saved.";
+    }
+
+    private void ToggleWorkerActive(Worker w)
+    {
+        WorkerService.SetActive(w.Id, !w.IsActive);
+        _workers = WorkerService.GetAllWorkers();
+    }
+
+    private void AddWorker()
+    {
+        _workerError = null;
+        if (string.IsNullOrWhiteSpace(_newWorkerName))
+        {
+            _workerError = "Enter a name.";
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(_newWorkerPin))
+        {
+            _workerError = "Enter a PIN.";
+            return;
+        }
+
+        try
+        {
+            WorkerService.AddWorker(_newWorkerName, _newWorkerPin);
+        }
+        catch (InvalidOperationException ex)
+        {
+            // Duplicate PIN among active workers - see WorkerService.AddWorker.
+            _workerError = ex.Message;
+            return;
+        }
+
+        _workers = WorkerService.GetAllWorkers();
+        _newWorkerName = "";
+        _newWorkerPin = "";
     }
 
     private void RunBackup()
