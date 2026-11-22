@@ -3,7 +3,8 @@
 @if (Show)
 {
     <div class="modal-backdrop" @onclick="@(() => OnBackdropClick.InvokeAsync())">
-        <div class="modal-box @ExtraClass" @onclick:stopPropagation="true">
+        <div class="modal-box @ExtraClass" @ref="_modalBoxRef" tabindex="-1"
+             @onkeydown="HandleKeyDown" @onclick:stopPropagation="true">
             <div class="modal-header">
                 <h3>@Title</h3>
                 <button class="modal-close" @onclick="@(() => OnBackdropClick.InvokeAsync())">&times;</button>
@@ -21,4 +22,30 @@
     [Parameter] public string ExtraClass { get; set; } = "";
     [Parameter] public RenderFragment? ChildContent { get; set; }
     [Parameter] public EventCallback OnBackdropClick { get; set; }
+
+    private ElementReference _modalBoxRef;
+    private bool _wasShown;
+
+    // Every modal in the app goes through this one component, so handling
+    // Escape here once closes any of them - Settings, New Book Detail, Add
+    // to Pull List, Hold a Copy, cover zoom, etc - without touching each
+    // page individually. tabindex="-1" makes the box programmatically
+    // focusable (so it can actually receive keydown) without it being a
+    // stop on Tab order, which would be a worse experience than having no
+    // tabindex at all.
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (Show && !_wasShown)
+        {
+            try { await _modalBoxRef.FocusAsync(); }
+            catch { /* some browsers/timings can reject an early focus call - not fatal, Escape just won't fire that one time */ }
+        }
+        _wasShown = Show;
+    }
+
+    private async Task HandleKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape")
+            await OnBackdropClick.InvokeAsync();
+    }
 }
