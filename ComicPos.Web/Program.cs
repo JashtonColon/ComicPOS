@@ -39,6 +39,7 @@ builder.Services.AddScoped<IFocReportService, FocReportService>();
 builder.Services.AddScoped<IDashboardService, DashboardService>();
 builder.Services.AddScoped<IBackupService, BackupService>();
 builder.Services.AddScoped<IAutoFetchService, AutoFetchService>();
+builder.Services.AddScoped<IWorkerService, WorkerService>();
 
 // No DbContext dependency - safe (and cheaper) as singletons.
 builder.Services.AddSingleton<IEmailService, EmailService>();
@@ -49,6 +50,8 @@ builder.Services.AddSingleton<IComicListService, ComicListService>();
 builder.Services.AddSingleton<IComicadeFocService, ComicadeFocService>();
 builder.Services.AddSingleton<IGcdService, GcdService>();
 builder.Services.AddSingleton<IMetronService, MetronService>();
+builder.Services.AddSingleton<ILocgService, LocgService>();
+builder.Services.AddScoped<ComicPos.Web.Services.CurrentWorkerContext>();
 
 // Web equivalent of MainForm's hourly maintenance timer - see
 // BackgroundJobsService's own header comment for why this runs in its own
@@ -71,6 +74,40 @@ using (var scope = app.Services.CreateScope())
     {
         Console.Error.WriteLine($"Comic POS could not set up its database and cannot start: {ex.Message}");
         return;
+    }
+
+    // One-time repair for the "wrong era cover" bug fixed 2026-11-21 (see
+    // StoreSettings.WrongEraCoverCleanupApplied and AutoFetchService's new
+    // IssueDateHint) - clears out covers that already got filled in, but
+    // with the wrong decade's image, so the next Re-scan correctly
+    // refetches them using each issue's own release date instead of the
+    // series' often-wrong StartYear. Runs once per store, ever.
+    var storeSettings = scope.ServiceProvider.GetRequiredService<IStoreSettingsService>();
+    var settings = storeSettings.Load();
+    if (!settings.WrongEraCoverCleanupApplied)
+    {
+        // Named here on purpose, not auto-detected - "which series were
+        // affected" isn't something that can be told apart from "a
+        // genuinely correct cover" after the fact. Add a series name here
+        // if another one turns out to have the same problem.
+        var affectedSeriesNames = new[] { "Wonder Woman" };
+
+        var affectedCovers = db.Covers
+            .Include(c => c.Issue)
+            .Where(c => affectedSeriesNames.Contains(c.Issue.Series.Name)
+                        && c.CoverImagePath != null && c.CoverImagePath != "")
+            .ToList();
+
+        if (affectedCovers.Count > 0)
+        {
+            foreach (var cover in affectedCovers)
+                cover.CoverImagePath = null;
+            db.SaveChanges();
+            Console.WriteLine($"One-time cleanup: cleared {affectedCovers.Count} cover(s) saved with the wrong era's image ({string.Join(", ", affectedSeriesNames)}) - run Re-scan Existing Books to refill them correctly.");
+        }
+
+        settings.WrongEraCoverCleanupApplied = true;
+        storeSettings.Save(settings);
     }
 }
 
