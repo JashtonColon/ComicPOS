@@ -37,9 +37,13 @@ static class Program
         }
 
         var inventory = new InventoryService(db);
-        var checkout = new CheckoutService(db, inventory);
-        var history = new SalesHistoryService(db);
         var customers = new CustomerService(db);
+        // customers constructed above checkout now - CheckoutService
+        // needs it (store credit redemption/refund, see
+        // ICheckoutService.ApplyStoreCredit) and didn't exist yet when
+        // this line was still `new CheckoutService(db, inventory)`.
+        var checkout = new CheckoutService(db, inventory, customers);
+        var history = new SalesHistoryService(db);
         var pullLists = new PullListService(db);
         var issueHolds = new IssueHoldService(db);
         var import = new ImportService(db);
@@ -54,7 +58,15 @@ static class Program
         var comicadeFoc = new ComicadeFocService();
         var gcd = new GcdService();
         var metron = new MetronService(storeSettings);
-        var autoFetch = new AutoFetchService(db, comicVine, comicList, comicadeFoc, gcd, metron, storeSettings);
+        // locg wasn't being constructed here at all - AutoFetchService's
+        // constructor already needed it (added when LOCG became a
+        // discovery source) and this call was out of sync with it,
+        // meaning ComicPos.App hasn't actually compiled since then.
+        // Still no WinForms UI for Metron discovery or store credit
+        // (browser mode only gets that) - this is purely keeping the
+        // shared backend wiring here compiling.
+        var locg = new LocgService();
+        var autoFetch = new AutoFetchService(db, comicVine, comicList, comicadeFoc, gcd, metron, locg, storeSettings);
 
         Application.Run(new MainForm(inventory, checkout, history, customers, pullLists, issueHolds, import, focReport, email, emailSettings, dashboard, storeSettings, backupService, autoFetch));
     }
