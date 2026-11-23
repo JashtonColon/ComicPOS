@@ -1,3 +1,4 @@
+using ComicPos.Core;
 using ComicPos.Core.Models;
 using ComicPos.Core.Services;
 using ComicPos.Importers;
@@ -29,6 +30,16 @@ public class ImportService : IImportService
         // SaveChanges finally ran, aborting the entire import with nothing saved.
         var barcodesAddedThisRun = new Dictionary<string, Cover>();
 
+        // Loaded once up front, not re-queried per row - same reasoning
+        // as barcodesAddedThisRun just above: a series created by an
+        // earlier row in THIS SAME import run needs to be visible to a
+        // later row that references it too, and re-running
+        // _db.AllSeries.AsEnumerable() on every row of a large CSV would
+        // also just be a full-table reload each time for no reason.
+        var seriesByKey = _db.AllSeries.ToList()
+            .GroupBy(s => SeriesNameKey.Normalize(s.Name), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+
         foreach (var row in parsed.Rows)
         {
             if (barcodesAddedThisRun.ContainsKey(row.Barcode))
@@ -37,11 +48,17 @@ public class ImportService : IImportService
                 continue;
             }
 
-            var series = _db.AllSeries.FirstOrDefault(s => s.Name == row.SeriesName);
-            if (series == null)
+            // Same normalized-key matching as AddEntriesAsIssues/
+            // InventoryService (see SeriesNameKey) - otherwise importing
+            // a CSV with "The X" when "X" already exists from a weekly
+            // scrape (or the reverse) creates a second, never-merging
+            // Series row for what is really the same series.
+            var seriesKey = SeriesNameKey.Normalize(row.SeriesName);
+            if (!seriesByKey.TryGetValue(seriesKey, out var series))
             {
                 series = new Series { Name = row.SeriesName, StartYear = row.StartYear };
                 _db.AllSeries.Add(series);
+                seriesByKey[seriesKey] = series;
                 seriesCreated++;
             }
 
