@@ -113,7 +113,7 @@ else if (_level == 3)
     {
         <table class="pos-table">
             <thead>
-                <tr><th></th><th>Cover</th><th>Barcode</th><th>Price</th><th>Stock</th><th>Description</th><th></th></tr>
+                <tr><th></th><th>Cover</th><th>Artist/Variant</th><th>Barcode</th><th>Price</th><th>Stock</th><th>Description</th><th></th></tr>
             </thead>
             <tbody>
                 @foreach (var row in _coverRows)
@@ -131,6 +131,7 @@ else if (_level == 3)
                             <InputFile OnChange="@(e => OnCoverImageSelected(row, e))" accept="image/*" class="cover-upload-input" />
                         </td>
                         <td>@row.Cover.CoverLetter</td>
+                        <td><input type="text" value="@row.CoverArtist" @onchange="e => SaveCoverArtist(row, e.Value?.ToString() ?? string.Empty)" /></td>
                         <td><input type="text" value="@row.Barcode" @onchange="e => SaveBarcode(row, e.Value?.ToString() ?? string.Empty)" /></td>
                         <td><input type="text" style="width:70px" value="@row.Price" @onchange="e => SavePrice(row, e.Value?.ToString() ?? string.Empty)" /></td>
                         <td><input type="text" style="width:60px" value="@row.Stock" @onchange="e => SaveStock(row, e.Value?.ToString() ?? string.Empty)" /></td>
@@ -184,6 +185,7 @@ else if (_level == 3)
         public string Price { get; set; } = "";
         public string Stock { get; set; } = "";
         public string Description { get; set; } = "";
+        public string CoverArtist { get; set; } = "";
 
         // Cache-busting key for the <img> src. This used to be a plain
         // incrementing int (ImageVersion++ after a successful upload), but
@@ -274,7 +276,8 @@ else if (_level == 3)
                 Barcode = c.Barcode,
                 Price = c.Price.ToString("0.00"),
                 Stock = c.StockQuantity.ToString(),
-                Description = c.Description ?? ""
+                Description = c.Description ?? "",
+                CoverArtist = c.CoverArtist ?? ""
             }).ToList();
 
         RefreshHoldsLabel();
@@ -379,6 +382,13 @@ else if (_level == 3)
     {
         _saveError = null;
         row.Cover.Description = string.IsNullOrWhiteSpace(newValue) ? null : newValue;
+        SaveCover(row.Cover, false, row.Cover.Barcode);
+    }
+
+    private void SaveCoverArtist(CoverRow row, string newValue)
+    {
+        _saveError = null;
+        row.Cover.CoverArtist = string.IsNullOrWhiteSpace(newValue) ? null : newValue;
         SaveCover(row.Cover, false, row.Cover.Barcode);
     }
 
