@@ -22,15 +22,26 @@ html, body {
     background: var(--bg);
     color: var(--text);
     font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
-    font-size: 15px;
+    font-size: 17px;
 }
 
 a { color: inherit; text-decoration: none; }
 
 button {
     font-family: inherit;
-    font-size: 14px;
+    font-size: 15px;
     cursor: pointer;
+}
+
+/* A plain <input>/<select>/<textarea> with no class on it (every field
+   on the Covers detail grid, Checkout's cash-tendered box, customer
+   search, etc.) otherwise falls back to the browser's own small default
+   font - smaller than the surrounding text with nothing here to fix it,
+   which is most of what made the app read as "small" everywhere at
+   once rather than in any one obviously-wrong spot. */
+input, select, textarea {
+    font-family: inherit;
+    font-size: 1em;
 }
 
 /* ---- Shell: sidebar + main content ---- */
@@ -111,7 +122,7 @@ button {
 .pos-nav-item {
     padding: 10px 12px;
     border-radius: 8px;
-    font-size: 14px;
+    font-size: 15px;
     font-weight: 500;
     color: var(--sidebar-text);
     transition: background 0.12s ease, color 0.12s ease;
@@ -187,7 +198,7 @@ button {
 
 .stat-label {
     color: var(--text-muted);
-    font-size: 13px;
+    font-size: 14px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -218,28 +229,28 @@ button {
 }
 
 .panel h2 {
-    font-size: 15px;
+    font-size: 17px;
     margin: 0 0 12px;
 }
 
 .panel-sub {
     color: var(--text-muted);
     font-weight: 400;
-    font-size: 13px;
+    font-size: 14px;
     margin-left: 6px;
 }
 
 .pos-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 15px;
+    font-size: 16px;
 }
 
 .pos-table th {
     text-align: left;
     color: var(--text-muted);
     font-weight: 600;
-    font-size: 13px;
+    font-size: 14px;
     text-transform: uppercase;
     letter-spacing: 0.03em;
     padding: 10px 10px;
@@ -374,7 +385,7 @@ button {
 
 .form-row label {
     display: block;
-    font-size: 13px;
+    font-size: 14px;
     font-weight: 600;
     color: var(--text-muted);
     margin-bottom: 4px;
@@ -390,7 +401,7 @@ button {
     padding: 9px 10px;
     border: 1px solid var(--border);
     border-radius: 8px;
-    font-size: 14px;
+    font-size: 15px;
     font-family: inherit;
     background: #fff;
     color: var(--text);
@@ -436,7 +447,7 @@ button {
 
 .help-text {
     color: var(--text-muted);
-    font-size: 13px;
+    font-size: 14px;
     margin: 0 0 14px;
 }
 
@@ -504,7 +515,7 @@ button {
 
 .btn-sm {
     padding: 6px 12px;
-    font-size: 13px;
+    font-size: 14px;
     border-radius: 7px;
 }
 
@@ -718,5 +729,5 @@ button {
     .checkout-side { width: 100%; }
 }
 
-.totals-row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 14px; }
-.totals-row.grand { font-weight: 700; font-size: 16px; border-top: 1px solid var(--border); margin-top: 4px; padding-top: 10px; }
+.totals-row { display: flex; justify-content: space-between; padding: 8px 0; font-size: 16px; }
+.totals-row.grand { font-weight: 700; font-size: 19px; border-top: 1px solid var(--border); margin-top: 4px; padding-top: 10px; }
