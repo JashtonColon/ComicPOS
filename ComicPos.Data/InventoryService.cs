@@ -1,3 +1,4 @@
+using ComicPos.Core;
 using ComicPos.Core.Models;
 using ComicPos.Core.Services;
 using Microsoft.EntityFrameworkCore;
@@ -106,7 +107,15 @@ public class InventoryService : IInventoryService
         string colorist = "",
         string letterer = "")
     {
-        var series = _db.AllSeries.FirstOrDefault(s => s.Name == seriesName);
+        // Matched by the same normalized key AddEntriesAsIssues/
+        // ImportService use (see SeriesNameKey) - a plain exact-name
+        // match here would re-split "The Flash" from an already-existing
+        // "Flash" row (or vice versa) the moment a manual add or UPC scan
+        // typed/returned the name with a different "The " prefix than
+        // whatever the weekly scrape already created, recreating the
+        // exact duplicate-series bug AddEntriesAsIssues had.
+        var seriesKey = SeriesNameKey.Normalize(seriesName);
+        var series = _db.AllSeries.AsEnumerable().FirstOrDefault(s => SeriesNameKey.Normalize(s.Name) == seriesKey);
         if (series == null)
         {
             series = new Series { Name = seriesName, StartYear = startYear };
