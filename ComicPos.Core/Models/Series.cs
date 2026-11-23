@@ -13,6 +13,17 @@ public class Series{
     public int? ComicVineVolumeId { get; set; }
     public DateTime? LastCheckedForNewIssues { get; set; }
 
+    // Metron's own numeric id for this exact volume - the most precise
+    // identity this app has for "which real series is this" (no name or
+    // year heuristic involved at all, unlike ComicVineVolumeId's own
+    // matching path via PickBestVolumeMatch). Set the moment an entry
+    // discovered through Metron resolves to this Series (new or already
+    // existing), and preferred over name-based lookup in
+    // AutoFetchService.AddEntriesAsIssues from then on. Null for a series
+    // that predates Metron discovery, or came in through a source that
+    // doesn't carry this (LOCG/ComicList/GCD/Comicade/manual add).
+    public int? MetronSeriesId { get; set; }
+
     // When TryAutoLink last attempted (successfully or not) to match this
     // series to a Comic Vine volume. Many series created from ComicList/
     // Extended Forecast are trade paperbacks, hardcovers, graphic novels,
