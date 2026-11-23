@@ -14,6 +14,7 @@ public class ComicDbContext : DbContext
     public DbSet<PullListEntry> PullListEntries { get; set; } = null!;
     public DbSet<IssueHold> IssueHolds { get; set; } = null!;
     public DbSet<Worker> Workers { get; set; } = null!;
+    public DbSet<StoreCreditTransaction> StoreCreditTransactions { get; set; } = null!;
 
     protected override void OnConfiguring(DbContextOptionsBuilder options)
     {
