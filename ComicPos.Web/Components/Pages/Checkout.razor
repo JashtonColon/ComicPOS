@@ -70,12 +70,35 @@
                     }
                 </div>
             }
+            @if (_sale.CustomerId.HasValue)
+            {
+                <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+                    <div class="totals-row"><span>Store Credit Available</span><span>@_storeCreditBalance.ToString("C")</span></div>
+                    @if (_storeCreditBalance > 0)
+                    {
+                        <div class="form-row" style="margin-top:6px">
+                            <label>Apply Credit:</label>
+                            <input type="text" style="width:90px" value="@_storeCreditToApplyInput" @onchange="OnStoreCreditInputChanged" />
+                            <button class="btn-ghost btn-sm" @onclick="ApplyMaxStoreCredit">Max</button>
+                        </div>
+                        @if (_storeCreditError != null)
+                        {
+                            <p class="error-text" style="margin:4px 0 0">@_storeCreditError</p>
+                        }
+                    }
+                </div>
+            }
         </div>
 
         <div class="panel" style="margin-top:14px">
             <div class="totals-row"><span>Subtotal</span><span>@_subtotal.ToString("C")</span></div>
             <div class="totals-row"><span>Tax</span><span>@_tax.ToString("C")</span></div>
             <div class="totals-row grand"><span>Total</span><span>@_total.ToString("C")</span></div>
+            @if (_sale.StoreCreditUsed > 0)
+            {
+                <div class="totals-row"><span>Store Credit Applied</span><span>-@_sale.StoreCreditUsed.ToString("C")</span></div>
+                <div class="totals-row grand"><span>Amount Due</span><span>@_amountDue.ToString("C")</span></div>
+            }
 
             <div class="form-row" style="margin-top:10px">
                 <label>Cash Tendered:</label>
@@ -132,10 +155,15 @@
     private decimal _subtotal;
     private decimal _tax;
     private decimal _total;
+    private decimal _amountDue;
     private decimal _change;
     private string _changeDisplay = "";
     private string? _completeError;
     private List<string>? _lowStockWarnings;
+
+    private decimal _storeCreditBalance;
+    private string _storeCreditToApplyInput = "";
+    private string? _storeCreditError;
 
     private bool _showReceipt;
     private string _receiptBody = "";
@@ -183,6 +211,13 @@
         _subtotal = GetSubtotal();
         _tax = _subtotal * (GetTaxRate() / 100);
         _total = _subtotal + _tax;
+        // Store credit can never cover more than the total, even if more
+        // was somehow applied earlier against a cart that's since shrunk
+        // (an item removed after credit was applied) - clamped here so
+        // _amountDue/_change can never go negative just from that.
+        if (_sale.StoreCreditUsed > _total)
+            _sale.StoreCreditUsed = _total;
+        _amountDue = _total - _sale.StoreCreditUsed;
         UpdateChangeDue();
     }
 
@@ -190,7 +225,7 @@
     {
         if (decimal.TryParse(_cashTendered, out var tendered))
         {
-            _change = tendered - _total;
+            _change = tendered - _amountDue;
             _changeDisplay = _change.ToString("C");
         }
         else
@@ -273,6 +308,66 @@
         _selectedCustomerName = customer.Name;
         _customerSearch = "";
         _customerResults = new List<Customer>();
+        _storeCreditBalance = Customers.GetStoreCreditBalance(customer.Id);
+        _storeCreditToApplyInput = "";
+        _storeCreditError = null;
+        // Switching customers mid-sale drops any credit already applied
+        // against the PREVIOUS customer's balance - it was never this
+        // new customer's to spend.
+        _sale.StoreCreditUsed = 0;
+        RecalculateTotals();
+    }
+
+    private void OnStoreCreditInputChanged(ChangeEventArgs e)
+    {
+        _storeCreditToApplyInput = e.Value?.ToString() ?? "";
+        _storeCreditError = null;
+
+        if (string.IsNullOrWhiteSpace(_storeCreditToApplyInput))
+        {
+            CheckoutService.ApplyStoreCredit(_sale, 0);
+            RecalculateTotals();
+            return;
+        }
+
+        if (!decimal.TryParse(_storeCreditToApplyInput, out var amount) || amount < 0)
+        {
+            _storeCreditError = "Enter a valid amount.";
+            return;
+        }
+
+        // Never offer to apply more than what's actually owed - clamped
+        // against _total here (before store credit), not _amountDue,
+        // since _amountDue already has any previously-applied credit
+        // subtracted out.
+        var cap = Math.Min(amount, _total);
+        try
+        {
+            CheckoutService.ApplyStoreCredit(_sale, cap);
+            if (cap < amount)
+                _storeCreditToApplyInput = cap.ToString("0.00");
+        }
+        catch (InvalidOperationException ex)
+        {
+            _storeCreditError = ex.Message;
+        }
+        RecalculateTotals();
+    }
+
+    private void ApplyMaxStoreCredit()
+    {
+        var cap = Math.Min(_storeCreditBalance, _total);
+        try
+        {
+            CheckoutService.ApplyStoreCredit(_sale, cap);
+            _storeCreditToApplyInput = cap.ToString("0.00");
+            _storeCreditError = null;
+        }
+        catch (InvalidOperationException ex)
+        {
+            _storeCreditError = ex.Message;
+        }
+        RecalculateTotals();
     }
 
     private void CompleteSaleClicked()
@@ -309,17 +404,21 @@
         var subtotal = completingSale.Lines.Sum(l => l.PriceEach * l.Quantity * (1 - l.DiscountPercent / 100));
         var tax = subtotal * (GetTaxRate() / 100);
         var total = subtotal + tax;
+        var storeCreditUsed = completingSale.StoreCreditUsed;
+        var amountDue = total - storeCreditUsed;
         decimal.TryParse(_cashTendered, out var tendered);
-        var change = tendered - total;
+        var change = tendered - amountDue;
         var customerNameForReceipt = _selectedCustomerName;
         var servedByForReceipt = CurrentWorker.Current?.Name;
 
         var store = StoreSettingsService.Load();
 
         // Complete the sale first so completingSale.Id is assigned by the
-        // database - the receipt wants a real receipt number, not 0.
+        // database (and its store-credit ledger debit, if any, is
+        // written - see CheckoutService.CompleteSale) - the receipt
+        // wants a real receipt number, not 0.
         CheckoutService.CompleteSale(completingSale);
-        var receiptBody = BuildReceipt(completingSale, customerNameForReceipt, servedByForReceipt, subtotal, tax, total, tendered, change);
+        var receiptBody = BuildReceipt(completingSale, customerNameForReceipt, servedByForReceipt, subtotal, tax, total, storeCreditUsed, amountDue, tendered, change);
 
         _sale = CheckoutService.StartSale();
         _customerLabel = "Customer: Walk-in";
@@ -327,6 +426,9 @@
         _customerSearch = "";
         _customerResults = new List<Customer>();
         _cashTendered = "";
+        _storeCreditBalance = 0;
+        _storeCreditToApplyInput = "";
+        _storeCreditError = null;
         RefreshCart();
 
         _receiptBody = receiptBody;
@@ -346,7 +448,7 @@
     // "Served By" comes from CurrentWorker.Current (set at worker login) -
     // left off the receipt entirely when nobody's logged in rather than
     // showing a blank/faked row.
-    private static string BuildReceipt(Sale sale, string? customerName, string? servedBy, decimal subtotal, decimal tax, decimal total, decimal tendered, decimal change)
+    private static string BuildReceipt(Sale sale, string? customerName, string? servedBy, decimal subtotal, decimal tax, decimal total, decimal storeCreditUsed, decimal amountDue, decimal tendered, decimal change)
     {
         var sb = new StringBuilder();
 
@@ -384,6 +486,12 @@
         sb.Append($"<div class=\"receipt-totals-row\"><span>Subtotal</span><span>{subtotal:C}</span></div>");
         sb.Append($"<div class=\"receipt-totals-row\"><span>Tax</span><span>{tax:C}</span></div>");
         sb.Append($"<div class=\"receipt-totals-row receipt-grand\"><span>Total</span><span>{total:C}</span></div>");
+
+        if (storeCreditUsed > 0)
+        {
+            sb.Append($"<div class=\"receipt-totals-row\"><span>Store Credit Applied</span><span>-{storeCreditUsed:C}</span></div>");
+            sb.Append($"<div class=\"receipt-totals-row receipt-grand\"><span>Amount Due</span><span>{amountDue:C}</span></div>");
+        }
 
         if (tendered > 0)
         {
