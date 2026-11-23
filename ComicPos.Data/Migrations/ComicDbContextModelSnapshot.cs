@@ -111,6 +111,9 @@ namespace ComicPos.Data.Migrations
                         .IsRequired()
                         .HasColumnType("TEXT");
 
+                    b.Property<int?>("MetronIssueId")
+                        .HasColumnType("INTEGER");
+
                     b.Property<string>("Penciler")
                         .IsRequired()
                         .HasColumnType("TEXT");
@@ -227,6 +230,9 @@ namespace ComicPos.Data.Migrations
                     b.Property<DateTime>("SoldAt")
                         .HasColumnType("TEXT");
 
+                    b.Property<decimal>("StoreCreditUsed")
+                        .HasColumnType("TEXT");
+
                     b.HasKey("Id");
 
                     b.HasIndex("CustomerId");
@@ -279,6 +285,9 @@ namespace ComicPos.Data.Migrations
                     b.Property<DateTime?>("LastCheckedForNewIssues")
                         .HasColumnType("TEXT");
 
+                    b.Property<int?>("MetronSeriesId")
+                        .HasColumnType("INTEGER");
+
                     b.Property<string>("Name")
                         .IsRequired()
                         .HasColumnType("TEXT");
@@ -289,6 +298,37 @@ namespace ComicPos.Data.Migrations
                     b.HasKey("Id");
 
                     b.ToTable("AllSeries");
+                });
+
+            modelBuilder.Entity("ComicPos.Core.Models.StoreCreditTransaction", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<decimal>("Amount")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("CustomerId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Reason")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<int?>("SaleId")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CustomerId");
+
+                    b.HasIndex("SaleId");
+
+                    b.ToTable("StoreCreditTransactions");
                 });
 
             modelBuilder.Entity("ComicPos.Core.Models.Worker", b =>
@@ -401,9 +441,28 @@ namespace ComicPos.Data.Migrations
                     b.Navigation("Sale");
                 });
 
+            modelBuilder.Entity("ComicPos.Core.Models.StoreCreditTransaction", b =>
+                {
+                    b.HasOne("ComicPos.Core.Models.Customer", "Customer")
+                        .WithMany("StoreCreditTransactions")
+                        .HasForeignKey("CustomerId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("ComicPos.Core.Models.Sale", "Sale")
+                        .WithMany()
+                        .HasForeignKey("SaleId");
+
+                    b.Navigation("Customer");
+
+                    b.Navigation("Sale");
+                });
+
             modelBuilder.Entity("ComicPos.Core.Models.Customer", b =>
                 {
                     b.Navigation("PullListEntries");
+
+                    b.Navigation("StoreCreditTransactions");
                 });
 
             modelBuilder.Entity("ComicPos.Core.Models.Issue", b =>
