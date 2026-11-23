@@ -19,7 +19,23 @@ public class MetronService : IMetronService
 {
     private const string BaseUrl = "https://metron.cloud/api";
     private static readonly HttpClient Http = BuildClient();
-    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+    // AllowReadingFromString is required, not optional - confirmed live
+    // (2026-11-23, EnrichIssueDetails' first real run): Metron's own API
+    // (a Django REST Framework DecimalField) serializes "price" as a
+    // JSON STRING ("3.99"), not a bare number, which System.Text.Json
+    // refuses to deserialize into decimal/decimal? by default ("The JSON
+    // value could not be converted to System.Nullable`1[System.Decimal]").
+    // This silently broke every single EnrichIssueDetails call across an
+    // 809-issue run - every one logged a detail-enrichment error and fell
+    // back to Price=0/a generated barcode instead of Metron's real data.
+    // FindIssueByUpc reads the same detail.price field and would have hit
+    // the exact same failure the first time anything actually called it
+    // live (flagged as untested in IMetronService's own doc comment).
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString
+    };
 
     // Metron's documented limit is 20 requests/minute per account. The
     // first real run against it (2026-11-21) hit a 429 after only ~21
@@ -218,6 +234,62 @@ public class MetronService : IMetronService
         return new MetronCoverLookupResult { ImagePath = allCovers[0].ImagePath, Reason = "found via Metron", AllCovers = allCovers };
     }
 
+    // Same series_name+number search/pick logic as FindAndDownloadCover
+    // above, just returning the matched id instead of downloading
+    // anything - see IMetronService.FindIssueId for why this exists
+    // (recovering a Metron issue id for an issue added before
+    // Issue.MetronIssueId was persisted at all).
+    public int? FindIssueId(string seriesName, float issueNumber, DateOnly? expectedDate)
+    {
+        var settings = _storeSettings.Load();
+        if (string.IsNullOrWhiteSpace(settings.MetronApiToken)) return null;
+
+        var numberText = issueNumber == Math.Floor(issueNumber)
+            ? ((int)issueNumber).ToString(CultureInfo.InvariantCulture)
+            : issueNumber.ToString(CultureInfo.InvariantCulture);
+        var query = $"series_name={Uri.EscapeDataString(seriesName)}&number={Uri.EscapeDataString(numberText)}";
+        var url = $"{BaseUrl}/issue/?{query}";
+
+        string json;
+        try
+        {
+            WaitForRateLimit();
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.MetronApiToken);
+            using var response = Http.Send(request);
+            if (!response.IsSuccessStatusCode) return null;
+            json = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            if (json.TrimStart().StartsWith("<")) return null;
+        }
+        catch
+        {
+            return null;
+        }
+
+        MetronIssueListResponse? list;
+        try
+        {
+            list = JsonSerializer.Deserialize<MetronIssueListResponse>(json, JsonOptions);
+        }
+        catch
+        {
+            return null;
+        }
+
+        var matches = list?.results;
+        if (matches == null || matches.Count == 0) return null;
+
+        var chosen = expectedDate != null
+            ? matches
+                .OrderBy(m => m.cover_date.HasValue
+                    ? Math.Abs(m.cover_date.Value.DayNumber - expectedDate.Value.DayNumber)
+                    : int.MaxValue)
+                .First()
+            : matches[0];
+
+        return chosen.id;
+    }
+
     // Shared by FindAndDownloadCover's per-candidate loop and
     // FindIssueByUpc - downloads one image URL and saves it to the same
     // CoverImages folder every cover image in this app lands in. Never
@@ -399,11 +471,200 @@ public class MetronService : IMetronService
     // ("Cover B", "2nd Printing Cover C Variant" -> "C") - best-effort
     // only, since nothing guarantees a variant name follows this pattern
     // at all (e.g. "Virgin Variant" has no letter in it anywhere).
+    // Now a thin wrapper over the shared parser (ComicPos.Core.
+    // CoverLetterParser) - used to have its own private copy of this
+    // exact regex, now also used by LocgService and AutoFetchService
+    // (see CoverLetterParser's own doc comment for why unanchored).
     private static string? GuessCoverLetterFromVariantName(string? name)
+        => ComicPos.Core.CoverLetterParser.GuessFromName(name);
+
+    // Lists every issue Metron has on file with a store/street date in
+    // [after, before] - see IMetronService for why this exists (the
+    // primary "Check Now" discovery source as of 2026-11-22, replacing
+    // LOCG) and GetUpToDate the pagination/pacing notes. One list call
+    // per page (store_date_range_after/_before - confirmed supported via
+    // Metron's own API-best-practices docs), following "next" until
+    // Metron says there isn't one, each page paced the same as every
+    // other Metron request (WaitForRateLimit). Deliberately does NOT
+    // fetch each issue's own detail endpoint here - Publisher/Price/Upc
+    // live only on that per-issue detail response, and paying for one
+    // extra call per result (hundreds, industry-wide, for any real date
+    // range) would turn one cheap list call into the exact kind of
+    // per-issue cost this method exists to avoid. Those three fields are
+    // left blank here and filled in later, ONLY for genuinely new
+    // issues, by EnrichIssueDetails below (see AutoFetchService.
+    // BuildCoverFromEntry and its blank-Publisher passthrough in
+    // AddEntriesAsIssues).
+    public List<ComicListEntry> GetIssuesInDateRange(DateOnly after, DateOnly before, Action<string>? onProgress = null)
     {
-        if (string.IsNullOrWhiteSpace(name)) return null;
-        var match = Regex.Match(name, @"Cover\s+([A-Za-z])\b", RegexOptions.IgnoreCase);
-        return match.Success ? match.Groups[1].Value.ToUpperInvariant() : null;
+        var entries = new List<ComicListEntry>();
+        var settings = _storeSettings.Load();
+        if (string.IsNullOrWhiteSpace(settings.MetronApiToken))
+        {
+            onProgress?.Invoke("Metron: no API token configured in Settings - nothing fetched.");
+            return entries;
+        }
+
+        var url = $"{BaseUrl}/issue/?store_date_range_after={after:yyyy-MM-dd}&store_date_range_before={before:yyyy-MM-dd}";
+        var page = 1;
+
+        while (!string.IsNullOrWhiteSpace(url))
+        {
+            string json;
+            try
+            {
+                WaitForRateLimit();
+                using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.MetronApiToken);
+                using var response = Http.Send(request);
+                json = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+
+                if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                {
+                    onProgress?.Invoke($"Metron: rate limited (429) on page {page} - stopping here with {entries.Count} issue(s) found so far.");
+                    break;
+                }
+                if (response.StatusCode == HttpStatusCode.Forbidden)
+                {
+                    onProgress?.Invoke($"Metron: blocked (403) on page {page} - stopping here with {entries.Count} issue(s) found so far.");
+                    break;
+                }
+                if (!response.IsSuccessStatusCode)
+                {
+                    onProgress?.Invoke($"Metron: request failed (HTTP {(int)response.StatusCode}) on page {page} - stopping here with {entries.Count} issue(s) found so far.");
+                    break;
+                }
+                if (json.TrimStart().StartsWith("<"))
+                {
+                    onProgress?.Invoke($"Metron: got an HTML page instead of JSON on page {page} (likely bot-protection) - stopping here with {entries.Count} issue(s) found so far.");
+                    break;
+                }
+            }
+            catch (Exception ex)
+            {
+                onProgress?.Invoke($"Metron: request failed on page {page}: {ex.Message} - stopping here with {entries.Count} issue(s) found so far.");
+                break;
+            }
+
+            MetronIssueListResponse? list;
+            try
+            {
+                list = JsonSerializer.Deserialize<MetronIssueListResponse>(json, JsonOptions);
+            }
+            catch (Exception ex)
+            {
+                onProgress?.Invoke($"Metron: page {page} returned unparseable data ({ex.Message}) - stopping here with {entries.Count} issue(s) found so far.");
+                break;
+            }
+
+            foreach (var m in list?.results ?? new List<MetronIssueDto>())
+            {
+                // No series identity at all means nothing to match/create
+                // a local Series row against - skip rather than guess.
+                if (m.series == null || string.IsNullOrWhiteSpace(m.series.name)) continue;
+
+                float.TryParse(m.number, NumberStyles.Float, CultureInfo.InvariantCulture, out var issueNumber);
+
+                entries.Add(new ComicListEntry
+                {
+                    RawTitle = $"{m.series.name} #{m.number}",
+                    SeriesName = m.series.name,
+                    SeriesStartYearHint = m.series.year_began is > 0 ? m.series.year_began : null,
+                    MetronSeriesId = m.series.id,
+                    MetronIssueId = m.id,
+                    IssueNumber = issueNumber,
+                    CoverLetter = "A",
+                    // Left blank on purpose - see this method's own doc
+                    // comment above. AddEntriesAsIssues treats a blank
+                    // Publisher as "unknown, don't filter it out" rather
+                    // than "not tracked."
+                    Publisher = "",
+                    ReleaseDate = m.store_date,
+                    FocDate = m.foc_date,
+                    CoverImageUrl = m.image
+                });
+            }
+
+            onProgress?.Invoke($"Metron: page {page} - {list?.results?.Count ?? 0} issue(s) ({entries.Count} total so far).");
+            url = list?.next;
+            page++;
+        }
+
+        return entries;
+    }
+
+    // Fills in the handful of fields Metron's list call doesn't carry
+    // (Publisher/Price/Upc - see GetIssuesInDateRange) via one detail
+    // call (GET /issue/{id}/) for a single issue Metron's own numeric id
+    // identifies exactly - no name/number ambiguity possible, unlike
+    // FindAndDownloadCover's search. Mirrors ILocgService.
+    // EnrichIssueDetails' contract exactly (same "best-effort per brand-
+    // new issue only, throws on total failure so the caller can log it,
+    // mutates entry in place" shape) so AutoFetchService.
+    // BuildCoverFromEntry can treat both sources the same way.
+    public void EnrichIssueDetails(ComicListEntry entry)
+    {
+        if (!entry.MetronIssueId.HasValue)
+            throw new InvalidOperationException("This entry has no Metron issue id to enrich from.");
+
+        var settings = _storeSettings.Load();
+        if (string.IsNullOrWhiteSpace(settings.MetronApiToken))
+            throw new InvalidOperationException("No Metron API token configured in Settings.");
+
+        var detailUrl = $"{BaseUrl}/issue/{entry.MetronIssueId.Value}/";
+        WaitForRateLimit();
+        using var request = new HttpRequestMessage(HttpMethod.Get, detailUrl);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.MetronApiToken);
+        using var response = Http.Send(request);
+        var json = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Metron detail request failed: HTTP {(int)response.StatusCode} ({detailUrl})");
+        if (json.TrimStart().StartsWith("<"))
+            throw new InvalidOperationException($"Metron returned an HTML page instead of JSON (likely bot-protection) for {detailUrl}");
+
+        MetronIssueDetailDto? detail;
+        try
+        {
+            detail = JsonSerializer.Deserialize<MetronIssueDetailDto>(json, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"Metron detail response was unparseable: {ex.Message} ({detailUrl})");
+        }
+
+        if (detail == null)
+            throw new InvalidOperationException($"Metron detail response was empty ({detailUrl})");
+
+        if (!string.IsNullOrWhiteSpace(detail.upc)) entry.Upc = detail.upc;
+        if (detail.price.HasValue) entry.Price = detail.price;
+        if (!string.IsNullOrWhiteSpace(detail.publisher?.name)) entry.Publisher = detail.publisher!.name!;
+        // store_date/foc_date/image already came from the cheaper list
+        // call in GetIssuesInDateRange - only overwritten here if the
+        // detail endpoint actually has something, never blanked out by
+        // a missing detail field.
+        if (detail.foc_date.HasValue) entry.FocDate = detail.foc_date;
+        if (detail.store_date.HasValue) entry.ReleaseDate = detail.store_date;
+        if (!string.IsNullOrWhiteSpace(detail.image)) entry.CoverImageUrl = detail.image;
+        if (!string.IsNullOrWhiteSpace(detail.desc)) entry.Description = detail.desc;
+
+        // Every other cover Metron has on file for this exact issue -
+        // the list call (GetIssuesInDateRange) never returns these, only
+        // this detail call does. AutoFetchService.BuildCoversFromEntry
+        // turns each one into its own Cover row (own image/UPC/price),
+        // right after this call returns. Skips a variant with no image
+        // at all - nothing to show, and no point creating a blank Cover
+        // row for it.
+        entry.Variants = (detail.variants ?? new List<MetronVariantDto>())
+            .Where(v => !string.IsNullOrWhiteSpace(v.image))
+            .Select(v => new MetronVariantInfo
+            {
+                Name = v.name,
+                Upc = v.upc,
+                Price = v.price,
+                ImageUrl = v.image
+            })
+            .ToList();
     }
 
     private static MetronUpcLookupResult UpcFail(string reason, string? detail) =>
@@ -453,6 +714,18 @@ public class MetronService : IMetronService
         // ("yyyy-MM-dd"); System.Text.Json deserializes that straight
         // into a DateOnly natively on .NET 7+, no custom converter needed.
         public DateOnly? cover_date { get; set; }
+
+        // The rest of these are only populated when this DTO is used for
+        // the LIST shape mokkari calls BaseIssue (store_date/foc_date are
+        // actually on CommonIssue itself and so were always present on
+        // every /issue/ list call - just never read until
+        // GetIssuesInDateRange needed them; series is BaseIssue's own
+        // addition over CommonIssue). FindAndDownloadCover's existing
+        // series_name+number search never reads any of these - adding
+        // them here is purely additive.
+        public DateOnly? store_date { get; set; }
+        public DateOnly? foc_date { get; set; }
+        public MetronIssueSeriesDto? series { get; set; }
     }
 
     // The per-issue DETAIL view (GET /issue/{id}/) - a much richer shape
@@ -475,6 +748,12 @@ public class MetronService : IMetronService
         public string? upc { get; set; }
         public List<MetronCreditDto>? credits { get; set; }
         public List<MetronVariantDto>? variants { get; set; }
+        // The solicitation/summary text - Metron calls this field "desc"
+        // (confirmed via mokkari's own Issue schema). This is what the
+        // New Books detail popup shows as an issue's description -
+        // previously only comicade.com had an equivalent, so Metron-
+        // sourced issues always showed a blank description.
+        public string? desc { get; set; }
     }
 
     // Metron's generic {id, name} shape, reused for publisher/rating/role
@@ -489,6 +768,15 @@ public class MetronService : IMetronService
     // mokkari documents elsewhere for other endpoints).
     private class MetronIssueSeriesDto
     {
+        // Metron's own numeric id for this exact volume - present on the
+        // LIST shape's nested series (mokkari's BasicSeries) and used by
+        // GetIssuesInDateRange as Series.MetronSeriesId's source; this
+        // class is also reused for the DETAIL response's own nested
+        // series object (mokkari's IssueSeries), which may or may not
+        // carry this same field - left null there rather than assumed,
+        // since nothing in this app currently depends on it being set
+        // from a detail call.
+        public int? id { get; set; }
         public string? name { get; set; }
 
         // Nullable, unlike mokkari's own "int" - defensive against Metron
@@ -514,5 +802,11 @@ public class MetronService : IMetronService
         public string? name { get; set; }
         public string? upc { get; set; }
         public string? image { get; set; }
+        // Confirmed on Metron's own Variant schema (mokkari) - each
+        // variant can carry its own price, distinct from the primary
+        // issue's price (a foil/virgin variant is almost always priced
+        // higher). Was being silently discarded before - the only place
+        // a variant's price was captured at all.
+        public decimal? price { get; set; }
     }
 }
