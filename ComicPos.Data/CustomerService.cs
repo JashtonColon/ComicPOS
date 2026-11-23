@@ -59,4 +59,34 @@ public class CustomerService : ICustomerService
             UpdateCustomer(customer);
         }
     }
+
+    public decimal GetStoreCreditBalance(int customerId)
+    {
+        return _db.StoreCreditTransactions
+            .Where(t => t.CustomerId == customerId)
+            .Sum(t => (decimal?)t.Amount) ?? 0m;
+    }
+
+    public List<StoreCreditTransaction> GetStoreCreditHistory(int customerId)
+    {
+        return _db.StoreCreditTransactions
+            .Where(t => t.CustomerId == customerId)
+            .OrderByDescending(t => t.CreatedAt)
+            .ToList();
+    }
+
+    public StoreCreditTransaction AdjustStoreCredit(int customerId, decimal amount, string reason, int? saleId = null)
+    {
+        var transaction = new StoreCreditTransaction
+        {
+            CustomerId = customerId,
+            Amount = amount,
+            Reason = reason,
+            SaleId = saleId,
+            CreatedAt = DateTime.Now
+        };
+        _db.StoreCreditTransactions.Add(transaction);
+        _db.SaveChanges();
+        return transaction;
+    }
 }
