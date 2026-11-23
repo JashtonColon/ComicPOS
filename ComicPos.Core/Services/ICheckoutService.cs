@@ -18,6 +18,22 @@ public interface ICheckoutService
     // transaction (per the SaveChanges discussion above).
     void CompleteSale(Sale sale);
 
+    // Redeems up to `amount` of this sale's customer's store credit
+    // balance toward it. Throws if the sale has no customer attached
+    // (store credit is always tied to a specific customer's own ledger),
+    // if amount is negative, or if amount exceeds that customer's
+    // current balance - does NOT silently clamp down to the balance, so
+    // a caller's UI can't accidentally apply less than what it told the
+    // person it was applying. Does NOT check against the sale's own
+    // total either (CheckoutService has no concept of tax at all - see
+    // Checkout.razor's own GetTaxRate) - a caller that wants "never
+    // apply more than what's owed" enforces that itself before calling
+    // this, using whatever total it already computed. Only sets
+    // sale.StoreCreditUsed on the in-memory sale; the actual ledger
+    // debit is written by CompleteSale once the sale (and its real Id)
+    // actually exist.
+    void ApplyStoreCredit(Sale sale, decimal amount);
+
 
     List<string> GetLowStockWarnings(Sale sale);
 
