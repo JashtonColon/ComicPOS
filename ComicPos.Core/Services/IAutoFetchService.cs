@@ -73,5 +73,41 @@ public interface IAutoFetchService
     // single real browser session is kept open for the whole run rather
     // than one per week - meant to be kicked off and left running in the
     // background, not something to repeat casually.
-    AutoFetchResult BackfillYearFromLocg(int year);
+    //
+    // onProgress, when given, is called after every single week (success
+    // or failure) with a short one-line status - this is a long enough
+    // run (hours, now that EnrichIssueDetails adds a detail-page fetch
+    // per brand-new issue/cover too) that a caller with no feedback at
+    // all until the very end looks hung even when it's working fine.
+    // Called from a background thread (see NewBooks.razor's
+    // Task.Run(() => AutoFetch.BackfillYearFromLocg(...))) - a caller on
+    // Blazor Server's synchronization context needs to marshal back with
+    // InvokeAsync(StateHasChanged) itself; this never assumes any
+    // particular thread.
+    AutoFetchResult BackfillYearFromLocg(int year, Action<string>? onProgress = null);
+
+    // The PRIMARY discovery call as of 2026-11-22 (see IMetronService for
+    // why Metron replaced LOCG in this role) - NewBooks.razor's "Check
+    // Now" button calls this with a rolling window (recent past through
+    // several weeks/months out, long enough to surface FOC deadlines
+    // before they pass), and its "Backfill Year" button calls it with a
+    // full calendar year to rebuild history after a catalog reset.
+    // Internally chunked into weekly spans against Metron (even though
+    // Metron's own pagination could do the whole range in one logical
+    // call) purely so a failure partway through only loses that one
+    // week's results, not the whole run, and so progress can be reported
+    // the same granular way as BackfillYearFromLocg above. onProgress
+    // fires once per week-chunk processed; same threading contract as
+    // BackfillYearFromLocg (assume nothing about which thread calls this
+    // on - marshal back to the UI thread yourself).
+    AutoFetchResult CheckForNewIssuesViaMetron(DateOnly after, DateOnly before, Action<string>? onProgress = null);
+
+    // One-time catch-up pass for Metron-sourced issues whose per-issue
+    // detail call failed when they were first added (see
+    // AutoFetchService.RetryMetronEnrichment's own doc comment - the
+    // 2026-11-22 decimal-as-string bug is the concrete case this exists
+    // for) - fills in real Price/UPC/Publisher/Description and adds any
+    // cover variants Metron has on file that never got pulled in. Never
+    // run automatically, same spirit as RescanExistingBooks above.
+    AutoFetchResult RetryMetronEnrichment(Action<string>? onProgress = null);
 }
