@@ -1,5 +1,6 @@
 using System.Text.RegularExpressions;
 using System.Threading;
+using ComicPos.Core;
 using ComicPos.Core.Models;
 using ComicPos.Core.Services;
 using Microsoft.EntityFrameworkCore;
@@ -453,60 +454,40 @@ public class AutoFetchService : IAutoFetchService
         var exact = matches.Where(m => string.Equals(m.Name, seriesName, StringComparison.OrdinalIgnoreCase)).ToList();
         if (exact.Count == 0) return null;
 
-        var best = exact.FirstOrDefault(m => m.StartYear == seriesStartYear);
-
-        // A StartYear coincidence alone isn't trustworthy: seriesStartYear
-        // is often just a wrong placeholder (see the comment below), and
-        // even a previously-synced StartYear can still land on it by pure
-        // chance - every volume (legacy or current) has its own real
-        // StartYear, and nothing stops a stale/placeholder value from
-        // matching the WRONG one exactly. Confirmed live: Batman's
-        // StartYear was left at 1940 from an earlier bad link, and 1940
-        // really is Comic Vine volume 796's own StartYear - so this check
-        // kept re-selecting 796 every single time, completely bypassing
-        // the issue-count logic below that exists specifically to catch
-        // this. Same VolumeCoversIssue test as the fallback further down:
-        // a StartYear match only counts if it can plausibly cover the
-        // issue numbers already on file - otherwise it's treated exactly
-        // like "no StartYear match" and falls through to that logic too.
-        if (best != null && knownIssues.Count > 0 && !VolumeCoversIssue(best, knownIssues.Max(i => i.IssueNumber)))
-            best = null;
-
-        if (best == null && knownIssues.Count > 0)
+        // Issue-count evidence is checked FIRST, before StartYear, not as
+        // a fallback for when StartYear fails to match - and this order
+        // matters. A StartYear coincidence used to be trusted outright,
+        // but a decades-spanning legacy volume's issue count is always
+        // huge, so it ALWAYS numerically "covers" any modest known issue
+        // number - a plain issue-count sanity check on the StartYear
+        // match can never catch it that way (tried that; confirmed live,
+        // it changed nothing - Batman/Superman/Wonder Woman all landed
+        // right back on their old legacy volumes). The only thing that
+        // reliably beats the legacy volume is comparing it AGAINST every
+        // other qualifying candidate and taking the SMALLEST qualifying
+        // issue count - the current/ongoing volume for a character with
+        // a long publishing history almost always has far fewer issues
+        // on file than the original run, even once both "qualify". That
+        // comparison has to happen before StartYear ever gets consulted,
+        // or a StartYear match (especially one stamped by an earlier
+        // WRONG link - see SyncStartYear - which makes it coincide with
+        // that exact wrong volume's own real StartYear forever after, a
+        // self-reinforcing trap) short-circuits it every time, exactly
+        // as it did for Wonder Woman #42 even after the first fix above.
+        if (knownIssues.Count > 0)
         {
-            // seriesStartYear is often just a creation-time placeholder
-            // (the real-world year the row was first created, not Comic
-            // Vine's actual start year) for anything first discovered from
-            // a scraped new-release source rather than Comic Vine itself -
-            // see AddEntriesAsIssues. When that placeholder doesn't match
-            // any candidate, blindly taking Comic Vine's first search
-            // result tends to grab the oldest/highest-profile volume with
-            // the same name (e.g. the original 1939 Superman run) instead
-            // of whichever one is actually publishing the issue number
-            // already on file (e.g. the current Superman relaunch, issue
-            // #46). Comic Vine's count_of_issues is a much better signal
-            // here: prefer a volume whose issue count already covers the
-            // highest issue number this series carries - but among those,
-            // the SMALLEST qualifying count wins, not merely the closest
-            // one. "Closest by absolute distance" still loses for a
-            // character with a long publishing history: confirmed live,
-            // Wonder Woman's real current volume (a couple dozen issues)
-            // lost to the original 1942 volume (hundreds of issues)
-            // because 1942's count happened to sit closer in raw terms
-            // than some other old volume's, even though BOTH were wrong
-            // and the right volume was in the candidate list the whole
-            // time. A volume still actively publishing a recent issue
-            // number almost always has the SMALLEST issue count that
-            // still covers it - a decades-spanning legacy volume always
-            // has drastically more, never fewer.
             var maxKnownIssue = knownIssues.Max(i => i.IssueNumber);
             var qualifying = exact.Where(m => VolumeCoversIssue(m, maxKnownIssue)).ToList();
-            best = qualifying.Count > 0
-                ? qualifying.OrderBy(m => m.IssueCount).First()
-                : exact.OrderByDescending(m => m.IssueCount).First(); // nothing covers it yet - best guess is whichever has the most issues so far
+            if (qualifying.Count > 0)
+                return qualifying.OrderBy(m => m.IssueCount).First();
         }
 
-        return best ?? exact[0];
+        // No issue-count evidence at all (nothing qualifies yet, or this
+        // series has no issues on file to judge by) - StartYear is the
+        // next-best signal, then "most issues so far" as a last resort
+        // guess when even that comes up empty.
+        return exact.FirstOrDefault(m => m.StartYear == seriesStartYear)
+            ?? exact.OrderByDescending(m => m.IssueCount).First();
     }
 
     // Comic Vine's own StartYear for a matched volume is the one
@@ -604,8 +585,24 @@ public class AutoFetchService : IAutoFetchService
 
         if (string.IsNullOrWhiteSpace(imagePath)) return;
 
-        foreach (var cover in missingCovers)
-            cover.CoverImagePath = imagePath;
+        // Comic Vine's own per-issue API gives exactly ONE image
+        // (cvIssue.ImageUrl) - unlike Metron/GCD's CoverCandidate list,
+        // there's no label saying whether it's Cover A or a B/C/D
+        // variant. The old code stamped it onto every still-missing
+        // Cover row for the issue, duplicating one image across all of
+        // them - confirmed live: Absolute Flash #21's Covers B, C and D
+        // all ended up with the IDENTICAL file once Metron had already
+        // filled A in an earlier run. The honest read is that this one
+        // image is the issue's main (Cover A) art: it goes there if A
+        // still needs it, or to the sole missing cover when there's only
+        // one row total - never duplicated across multiple still-blank
+        // variant letters, which are left blank for Metron/GCD (which DO
+        // return genuinely distinct art per variant) to fill properly.
+        var mainCover = missingCovers.FirstOrDefault(c => string.Equals(c.CoverLetter?.Trim(), "A", StringComparison.OrdinalIgnoreCase))
+            ?? (missingCovers.Count == 1 ? missingCovers[0] : null);
+        if (mainCover == null) return; // multiple non-A variants still missing - nothing sensible to assign a single unlabeled image to
+
+        mainCover.CoverImagePath = imagePath;
 
         // Previously silent - Check Now's own trace never said which
         // exact issue got touched here, only a run-wide "added N new
@@ -614,7 +611,7 @@ public class AutoFetchService : IAutoFetchService
         // can answer "what exactly changed" issue by issue, not just
         // "something happened."
         result.CoversBackfilled++;
-        result.Added.Add($"{series.Name} #{cvIssue.IssueNumber:0.##}: cover backfilled from Comic Vine ({missingCovers.Count} cover variant(s) updated).");
+        result.Added.Add($"{series.Name} #{cvIssue.IssueNumber:0.##}: cover backfilled from Comic Vine (Cover {mainCover.CoverLetter} updated).");
     }
 
     private static (DateOnly since, DateOnly until) DiscoveryWindow() =>
@@ -850,7 +847,7 @@ public class AutoFetchService : IAutoFetchService
     // of a bare literal buried in a loop.
     private static readonly TimeSpan LocgCrawlDelay = TimeSpan.FromSeconds(30);
 
-    public AutoFetchResult BackfillYearFromLocg(int year)
+    public AutoFetchResult BackfillYearFromLocg(int year, Action<string>? onProgress = null)
     {
         var result = new AutoFetchResult();
         var trace = new System.Text.StringBuilder();
@@ -859,7 +856,7 @@ public class AutoFetchService : IAutoFetchService
 
         try
         {
-            RunBackfillYearFromLocg(year, result, trace);
+            RunBackfillYearFromLocg(year, result, trace, onProgress);
             return result;
         }
         finally
@@ -900,7 +897,7 @@ public class AutoFetchService : IAutoFetchService
     // far worse than a gap in the results that a second run (same year)
     // can simply fill back in, since already-known issues are
     // skipped/merged rather than duplicated either way.
-    private void RunBackfillYearFromLocg(int year, AutoFetchResult result, System.Text.StringBuilder trace)
+    private void RunBackfillYearFromLocg(int year, AutoFetchResult result, System.Text.StringBuilder trace, Action<string>? onProgress = null)
     {
         var allSeries = _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers).ToList();
 
@@ -926,18 +923,37 @@ public class AutoFetchService : IAutoFetchService
         for (var i = 0; i < mondays.Count; i++)
         {
             var week = mondays[i];
+            string progressLine;
             try
             {
                 var entries = _locg.GetWeekEntries(week);
                 var beforeCount = result.NewIssuesAdded;
                 AddEntriesAsIssues(allSeries, entries, week, "LOCG", result);
-                trace.AppendLine($"Week of {week:MM/dd/yyyy}: {entries.Count} entries from LOCG, +{result.NewIssuesAdded - beforeCount} new issue(s).");
+                var added = result.NewIssuesAdded - beforeCount;
+                progressLine = $"Week {i + 1}/{mondays.Count} ({week:MM/dd/yyyy}): {entries.Count} entries from LOCG, +{added} new issue(s).";
+                trace.AppendLine(progressLine);
                 _db.SaveChanges(); // persist incrementally - a later week's failure shouldn't lose earlier weeks' work
             }
             catch (Exception ex)
             {
+                progressLine = $"Week {i + 1}/{mondays.Count} ({week:MM/dd/yyyy}): FAILED - {ex.Message}";
                 result.Errors.Add($"LOCG week of {week:MM/dd/yyyy}: {ex.Message}");
             }
+
+            // So a caller watching this run (NewBooks.razor's status
+            // line) can tell it's actually making progress rather than
+            // hung - this is now a multi-hour operation (LOCG's own
+            // quota, plus a detail-page fetch per brand-new issue/cover -
+            // see EnrichIssueDetails), long enough that silence until the
+            // very end would be indistinguishable from stuck.
+            onProgress?.Invoke(progressLine);
+            // Also flushed to disk every week, not just at the very end -
+            // readable even if the browser tab/circuit that started this
+            // run gets navigated away from or closed (see RescanExisting-
+            // Books' own SaveChanges-at-the-end risk for why that
+            // matters: this run's progress shouldn't only ever live in
+            // one in-memory StringBuilder).
+            DebugLog.WriteCheckNowLog(trace.ToString());
 
             // No delay after the very last week - nothing left to be
             // polite to LOCG about once the run is finished.
@@ -946,6 +962,198 @@ public class AutoFetchService : IAutoFetchService
         }
 
         trace.AppendLine($"Pulled {mondays.Count} week(s) from LOCG for {year}.");
+    }
+
+    public AutoFetchResult CheckForNewIssuesViaMetron(DateOnly after, DateOnly before, Action<string>? onProgress = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Metron discovery for {after:yyyy-MM-dd} .. {before:yyyy-MM-dd} run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
+
+        try
+        {
+            RunCheckForNewIssuesViaMetron(after, before, result, trace, onProgress);
+            return result;
+        }
+        finally
+        {
+            trace.AppendLine();
+            trace.AppendLine(new string('=', 60));
+            trace.AppendLine($"Final: added {result.NewIssuesAdded} new issue(s).");
+            if (result.Added.Count > 0)
+            {
+                trace.AppendLine();
+                trace.AppendLine("Added:");
+                foreach (var line in result.Added) trace.AppendLine("  " + line);
+            }
+            if (result.Errors.Count > 0)
+            {
+                trace.AppendLine();
+                trace.AppendLine("Errors:");
+                foreach (var line in result.Errors) trace.AppendLine("  " + line);
+            }
+            var metronTraceText = trace.ToString();
+            result.Trace = metronTraceText;
+            DebugLog.WriteCheckNowLog(metronTraceText);
+        }
+    }
+
+    // Walks [after, before] in weekly chunks against Metron's own
+    // GetIssuesInDateRange and feeds each chunk through the same
+    // AddEntriesAsIssues logic every other source uses. Chunked purely
+    // so one bad week can't lose a whole multi-month run and so progress
+    // reports at the same granularity BackfillYearFromLocg's callers are
+    // already used to - Metron's own list endpoint could just as well
+    // handle the entire range in one paginated call, unlike LOCG's
+    // genuinely weekly-only page.
+    private void RunCheckForNewIssuesViaMetron(DateOnly after, DateOnly before, AutoFetchResult result, System.Text.StringBuilder trace, Action<string>? onProgress = null)
+    {
+        var allSeries = _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers).ToList();
+
+        var chunks = new List<(DateOnly Start, DateOnly End)>();
+        var cursor = after;
+        while (cursor <= before)
+        {
+            var end = cursor.AddDays(6);
+            if (end > before) end = before;
+            chunks.Add((cursor, end));
+            cursor = end.AddDays(1);
+        }
+        if (chunks.Count == 0) chunks.Add((after, before));
+
+        for (var i = 0; i < chunks.Count; i++)
+        {
+            var (start, end) = chunks[i];
+            string progressLine;
+            try
+            {
+                var entries = _metron.GetIssuesInDateRange(start, end);
+                var beforeCount = result.NewIssuesAdded;
+                AddEntriesAsIssues(allSeries, entries, start, "MTR", result);
+                var added = result.NewIssuesAdded - beforeCount;
+                progressLine = $"Week {i + 1}/{chunks.Count} ({start:MM/dd/yyyy}-{end:MM/dd/yyyy}): {entries.Count} issue(s) from Metron, +{added} new issue(s).";
+                trace.AppendLine(progressLine);
+                _db.SaveChanges(); // persist incrementally - a later chunk's failure shouldn't lose earlier chunks' work
+            }
+            catch (Exception ex)
+            {
+                progressLine = $"Week {i + 1}/{chunks.Count} ({start:MM/dd/yyyy}-{end:MM/dd/yyyy}): FAILED - {ex.Message}";
+                result.Errors.Add($"Metron {start:MM/dd/yyyy}-{end:MM/dd/yyyy}: {ex.Message}");
+            }
+
+            onProgress?.Invoke(progressLine);
+            DebugLog.WriteCheckNowLog(trace.ToString());
+        }
+
+        trace.AppendLine($"Pulled {chunks.Count} week-chunk(s) from Metron for {after:yyyy-MM-dd} .. {before:yyyy-MM-dd}.");
+    }
+
+    // A second pass over issues Metron already added whose Cover A still
+    // shows a generated placeholder barcode and $0 price - i.e. the
+    // per-issue detail call failed when the issue was first created and
+    // never got retried, since BuildCoversFromEntry/AddMissingCoverVariants
+    // only ever enrich a BRAND NEW cover. This is what a store actually
+    // needs after a bug like 2026-11-22's DRF decimal-as-string one (now
+    // fixed - see MetronService.JsonOptions): every issue added during
+    // the outage window is stuck exactly like this forever unless
+    // something explicitly goes back for it. Also picks up any cover
+    // variants Metron has on file that a Check Now run never saw at all,
+    // since variant expansion (ComicListEntry.Variants) only exists on
+    // this same per-issue detail call too. Never run automatically -
+    // same "store initiates this, not every Check Now" spirit as
+    // RescanExistingBooks, since it's an explicit one-time catch-up
+    // pass, not routine discovery.
+    //
+    // Matches on the "MTR-" placeholder barcode, not Issue.MetronIssueId -
+    // that column didn't exist until 2026-11-23, so every issue added
+    // during the actual outage (barcode-prefix "MTR", the whole reason
+    // this method exists) has it null. For those, FindIssueId re-finds
+    // the same issue on Metron by series name + number first (the exact
+    // search AddEntriesAsIssues/Check Now itself never ran for this issue
+    // because it was matched on MetronSeriesId/name instead) before the
+    // usual per-id detail call can happen at all.
+    public AutoFetchResult RetryMetronEnrichment(Action<string>? onProgress = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+
+        var candidates = _db.Issues
+            .Include(i => i.Series)
+            .Include(i => i.Covers)
+            .ToList()
+            .Where(i => i.Covers.Any(c => c.Price == 0 && c.Barcode.StartsWith("MTR-")))
+            .ToList();
+
+        onProgress?.Invoke($"Found {candidates.Count} Metron-sourced issue(s) still showing placeholder price/barcode.");
+
+        var done = 0;
+        foreach (var issue in candidates)
+        {
+            done++;
+            var seriesName = issue.Series.Name;
+            try
+            {
+                if (!issue.MetronIssueId.HasValue)
+                {
+                    // Added before Issue.MetronIssueId was persisted at
+                    // all (the exact outage window this method exists
+                    // for) - re-find it by the same series_name+number
+                    // search Check Now originally used to match this
+                    // issue against Metron in the first place.
+                    var foundId = _metron.FindIssueId(seriesName, issue.IssueNumber, issue.ReleaseDate);
+                    if (!foundId.HasValue)
+                    {
+                        result.Errors.Add($"{seriesName} #{issue.IssueNumber:0.##}: couldn't re-find this issue on Metron by series name/number - skipped.");
+                        continue;
+                    }
+                    issue.MetronIssueId = foundId;
+                }
+
+                var tempEntry = new ComicListEntry { MetronIssueId = issue.MetronIssueId };
+                _metron.EnrichIssueDetails(tempEntry);
+
+                var staleCover = issue.Covers.FirstOrDefault(c => c.Price == 0 && c.Barcode.StartsWith("MTR-"));
+                if (staleCover != null)
+                {
+                    if (!string.IsNullOrWhiteSpace(tempEntry.Upc)) staleCover.Barcode = tempEntry.Upc!;
+                    if (tempEntry.Price.HasValue) staleCover.Price = tempEntry.Price.Value;
+                    if (!string.IsNullOrWhiteSpace(tempEntry.Description)) staleCover.Description = tempEntry.Description;
+                }
+                if (!string.IsNullOrWhiteSpace(tempEntry.Publisher) && string.IsNullOrWhiteSpace(issue.Publisher))
+                    issue.Publisher = tempEntry.Publisher;
+
+                // Reuses AddMissingCoverVariants' exact dedup logic to add
+                // any variant covers this issue was missing - clearing
+                // MetronIssueId first so BuildCoversFromEntry (called
+                // inside it) doesn't pay for a second, redundant detail
+                // call for data tempEntry already carries from the one
+                // above.
+                var variantsFound = tempEntry.Variants.Count;
+                tempEntry.MetronIssueId = null;
+                AddMissingCoverVariants(issue, new List<ComicListEntry> { tempEntry }, seriesName, "MTR", result);
+
+                result.Added.Add($"{seriesName} #{issue.IssueNumber:0.##}: re-enriched from Metron ({variantsFound} variant(s) on file there).");
+            }
+            catch (Exception ex)
+            {
+                result.Errors.Add($"{seriesName} #{issue.IssueNumber:0.##}: retry enrichment failed: {ex.Message}");
+            }
+
+            if (done % 5 == 0 || done == candidates.Count)
+            {
+                _db.SaveChanges();
+                var line = $"Re-enriched {done}/{candidates.Count} issue(s) from Metron.";
+                trace.AppendLine(line);
+                onProgress?.Invoke(line);
+                DebugLog.WriteCheckNowLog(trace.ToString());
+            }
+        }
+
+        _db.SaveChanges();
+        if (trace.Length == 0) trace.AppendLine("No issues needed retrying.");
+        result.Trace = trace.ToString();
+        return result;
     }
 
     // Scans every cover image already on file, groups them by the
@@ -1471,26 +1679,118 @@ public class AutoFetchService : IAutoFetchService
         var entries = rawEntries.Where(e => e.SeriesName != null && e.IssueNumber != null);
         if (trackedPublishers.Count > 0)
         {
-            entries = entries.Where(e => trackedPublishers.Any(p =>
+            // A blank Publisher passes through untouched rather than
+            // getting filtered out - Metron's own weekly discovery call
+            // (GetIssuesInDateRange) deliberately doesn't carry Publisher
+            // at all (that field only exists on Metron's per-issue DETAIL
+            // response, and paying for a detail call on every single
+            // industry-wide result just to filter it would undo the
+            // whole point of that call being cheap - see IMetronService).
+            // Silently excluding every Metron-sourced entry whenever a
+            // store has TrackedPublishers configured would break
+            // discovery entirely for anyone using that setting, so an
+            // unknown publisher is treated as "don't know yet, let it
+            // through" rather than "assume not tracked."
+            entries = entries.Where(e => string.IsNullOrWhiteSpace(e.Publisher) || trackedPublishers.Any(p =>
                 e.Publisher.Contains(p, StringComparison.OrdinalIgnoreCase)));
         }
 
         var groups = entries.GroupBy(e => (e.SeriesName!.Trim(), e.IssueNumber!.Value));
 
+        // Grouped/looked-up by a NORMALIZED key, not the raw name - a
+        // leading "The " is the one difference between two names that
+        // are, in every way that matters here, the same series, and
+        // different sources disagree on whether they include it (one
+        // week's source calls it "Flash", another calls it "The Flash")
+        // with nothing else to tell them apart. Confirmed live: this
+        // split "Flash" into two separate Series rows - "Flash" and "The
+        // Flash" - that each separately auto-linked to a DIFFERENT wrong
+        // Comic Vine volume and each carried their own (different) copy
+        // of issue #39, neither aware the other existed. The stored
+        // Series.Name itself is left exactly as first created (the
+        // dictionary keeps whichever row was already in allSeries, or the
+        // raw seriesName typed in for a genuinely new one) - only the
+        // MATCHING key is normalized, so this never renames an existing,
+        // already-linked series out from under itself.
         var seriesByName = allSeries
-            .GroupBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+            .GroupBy(s => SeriesNameKey.Normalize(s.Name), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+
+        // Metron's own volume id is a precise identity with no name/year
+        // guessing involved at all (see Series.MetronSeriesId) - checked
+        // FIRST, ahead of the name-based dictionary above, whenever an
+        // entry carries one. A series that predates Metron discovery
+        // (created via LOCG/ComicList/GCD/Comicade/a manual add) simply
+        // has no MetronSeriesId yet and falls through to the name-based
+        // match below exactly as before, which then BACKFILLS this id
+        // onto it so every later run matches by id from then on.
+        var seriesByMetronId = allSeries
+            .Where(s => s.MetronSeriesId.HasValue)
+            .GroupBy(s => s.MetronSeriesId!.Value)
+            .ToDictionary(g => g.Key, g => g.First());
 
         foreach (var group in groups)
         {
             var (seriesName, issueNumber) = group.Key;
+            var seriesKey = SeriesNameKey.Normalize(seriesName);
+            var metronSeriesId = group.First().MetronSeriesId;
+            var startYearHint = group.First().SeriesStartYearHint;
 
-            if (!seriesByName.TryGetValue(seriesName, out var series))
+            Series? series = null;
+            if (metronSeriesId.HasValue)
+                seriesByMetronId.TryGetValue(metronSeriesId.Value, out series);
+            if (series == null)
+                seriesByName.TryGetValue(seriesKey, out series);
+
+            if (series == null)
             {
-                series = new Series { Name = seriesName, StartYear = DateTime.Today.Year };
+                // StartYear used to be hardcoded to DateTime.Today.Year
+                // for every brand-new series discovered from a weekly
+                // scrape, regardless of how old the real series actually
+                // is - a 1940s character's latest issue, discovered this
+                // week, got stamped with THIS week's year as its "start
+                // year." That placeholder then fed straight into
+                // PickBestVolumeMatch's own StartYear fallback and could
+                // coincidentally match an unrelated same-named volume
+                // that really did start this year, which is exactly the
+                // "pulling from the wrong series" bug class this is
+                // fixing. Metron's own series.year_began (surfaced here
+                // as SeriesStartYearHint) is the real answer whenever a
+                // source provides it; falling back to this issue's own
+                // release year is still a guess, but a far closer one
+                // than "whatever year this Check Now run happens to be
+                // running in" for sources that don't carry a real year
+                // (LOCG/ComicList/GCD/Comicade).
+                var fallbackYear = group.First().ReleaseDate?.Year ?? releaseDate.Year;
+                series = new Series
+                {
+                    Name = seriesName,
+                    StartYear = startYearHint ?? fallbackYear,
+                    MetronSeriesId = metronSeriesId
+                };
                 _db.AllSeries.Add(series);
-                seriesByName[seriesName] = series;
+                seriesByName[seriesKey] = series;
+                if (metronSeriesId.HasValue) seriesByMetronId[metronSeriesId.Value] = series;
                 allSeries.Add(series); // so later discovery steps see it as already-known
+            }
+            else
+            {
+                // Backfill a precise identity and/or a real start year
+                // onto a series this run now has better information
+                // about, now that an authoritative source (Metron) has
+                // actually weighed in on it - but never overwrite a
+                // StartYear that Comic Vine has already independently
+                // confirmed (ComicVineVolumeId set), since that value has
+                // already survived PickBestVolumeMatch's own issue-count
+                // validation and is more trustworthy than a bare year
+                // number with nothing else checked against it.
+                if (metronSeriesId.HasValue && series.MetronSeriesId != metronSeriesId)
+                {
+                    series.MetronSeriesId = metronSeriesId;
+                    seriesByMetronId[metronSeriesId.Value] = series;
+                }
+                if (startYearHint is int y && y > 0 && series.StartYear != y && series.ComicVineVolumeId == null)
+                    series.StartYear = y;
             }
 
             // Used to just skip the whole group here whenever the issue
@@ -1513,9 +1813,22 @@ public class AutoFetchService : IAutoFetchService
             // A plain LINQ projection won't do here - downloading a cover
             // image (comicade.com entries only) is a side effect, and a
             // failed download for one variant shouldn't lose the others.
-            var covers = new List<Cover>();
+            // Each entry in the group can now expand into SEVERAL covers
+            // (a Metron entry's own Variants list - see
+            // BuildCoversFromEntry), so this collects every candidate
+            // across the whole group first and only resolves final
+            // letters once all of them are known - see
+            // ResolveCoverLetters for why that matters (confirmed live:
+            // Action Comics #1104 getting only Cover A from Metron, and
+            // Ultimates #19 getting three/four different LOCG variants
+            // all labeled Cover B, were the same underlying gap - no
+            // step that both expanded every variant AND gave each one
+            // its own non-colliding letter).
+            var coverCandidates = new List<(Cover Cover, bool IsGuess)>();
             foreach (var e in group)
-                covers.Add(BuildCoverFromEntry(e, seriesName, issueNumber, barcodePrefix, result));
+                coverCandidates.AddRange(BuildCoversFromEntry(e, seriesName, issueNumber, barcodePrefix, result));
+            ResolveCoverLetters(coverCandidates, Enumerable.Empty<string>());
+            var covers = coverCandidates.Select(c => c.Cover).ToList();
 
             // Extended Forecast/Comicade FOC entries each carry their own
             // ship date (they span weeks to months, not one shared week) -
@@ -1535,6 +1848,12 @@ public class AutoFetchService : IAutoFetchService
                 Series = series,
                 IssueNumber = issueNumber,
                 Publisher = group.First().Publisher,
+                // Kept around specifically so RetryMetronEnrichment can
+                // come back and re-fetch this exact issue's detail call
+                // later, for an issue that's already on file by the time
+                // a fix like the 2026-11-22 decimal-parsing one lands -
+                // see Issue.MetronIssueId's own doc comment.
+                MetronIssueId = group.First().MetronIssueId,
                 // Used to be hardcoded SingleIssue regardless of what the
                 // scraped title actually is - a "Giant Days Volume 1 TP"
                 // or "...Omnibus Volume 1 HC" solicitation got filed under
@@ -1561,9 +1880,68 @@ public class AutoFetchService : IAutoFetchService
     // AddEntriesAsIssues - downloading a cover image (comicade.com
     // entries only) is a side effect that can fail independently per
     // variant, so this is its own method rather than inline in either
-    // caller.
-    private Cover BuildCoverFromEntry(ComicListEntry e, string seriesName, float issueNumber, string barcodePrefix, AutoFetchResult result)
+    // caller. Returns one or more candidate covers for this single
+    // ComicListEntry: the entry's own primary cover, PLUS one more per
+    // Metron "Variants" entry (see ComicListEntry.Variants) when this is
+    // a Metron-sourced entry whose detail enrichment found any - Metron's
+    // cheap list call only ever returns the primary/Cover-A edition, so
+    // a brand-new Metron issue used to only ever get one cover no matter
+    // how many the real book actually has (confirmed live: Action Comics
+    // #1104 showed a real Cover A, B, C and E on Metron's own site but
+    // only Cover A ever made it into this app). Each candidate comes
+    // back paired with whether its letter is a confident read off the
+    // source or a guess with no real letter behind it yet - the caller
+    // (ResolveCoverLetters) is what turns that into a final, non-
+    // colliding CoverLetter for every candidate in the batch.
+    private List<(Cover Cover, bool IsGuess)> BuildCoversFromEntry(ComicListEntry e, string seriesName, float issueNumber, string barcodePrefix, AutoFetchResult result)
     {
+        // LOCG's weekly list has no UPC or real FOC date at all - only
+        // its own per-issue detail page does (see
+        // ILocgService.EnrichIssueDetails) - so this is the one place
+        // that fetches it, right before building the Cover row that
+        // needs it. Only ever reached for a BRAND NEW issue/cover (both
+        // call sites - the "new issue" path and AddMissingCoverVariants -
+        // only call this for something not already on file), so an
+        // already-known cover never pays for a repeat detail-page fetch.
+        if (!string.IsNullOrWhiteSpace(e.DetailUrl))
+        {
+            try
+            {
+                _locg.EnrichIssueDetails(e);
+            }
+            catch (Exception ex)
+            {
+                // Best-effort (see ILocgService.EnrichIssueDetails) - a
+                // failure here still leaves the issue/cover itself fully
+                // usable, just without a real UPC/FOC date.
+                result.Errors.Add($"{seriesName} #{issueNumber:0.##} ({e.CoverLetter}): LOCG detail page enrichment failed: {ex.Message}");
+            }
+        }
+        else if (e.MetronIssueId.HasValue)
+        {
+            // Metron's own weekly discovery list (GetIssuesInDateRange)
+            // already carries a release date, FOC date, and cover image
+            // directly, cheaply, with no per-issue call at all - this one
+            // extra detail-endpoint call is for the handful of fields
+            // that list response doesn't have (UPC, price, publisher,
+            // description) AND for every other cover Metron has on file
+            // (e.Variants, populated by this same call - see
+            // IMetronService.EnrichIssueDetails), same "only for a
+            // brand-new issue/cover, never repeated" timing as LOCG's
+            // enrichment above, just a lot cheaper per call (Metron's own
+            // paced rate limit, ~3.5s, vs LOCG's 30s-per-issue crawl
+            // delay) and with nothing to click through (no Cloudflare
+            // check - Metron is a plain token-authenticated REST API).
+            try
+            {
+                _metron.EnrichIssueDetails(e);
+            }
+            catch (Exception ex)
+            {
+                result.Errors.Add($"{seriesName} #{issueNumber:0.##} ({e.CoverLetter}): Metron detail enrichment failed: {ex.Message}");
+            }
+        }
+
         string? coverImagePath = null;
         if (!string.IsNullOrWhiteSpace(e.CoverImageUrl))
         {
@@ -1578,10 +1956,11 @@ public class AutoFetchService : IAutoFetchService
             }
         }
 
-        return new Cover
+        var primary = new Cover
         {
             CoverLetter = e.CoverLetter,
-            // A real UPC when the source gives one (comicade.com) - the
+            // A real UPC when the source gives one (comicade.com, or now
+            // LOCG's own detail page via EnrichIssueDetails above) - the
             // same generated placeholder as every other source
             // otherwise. The store sets the real barcode once the book
             // physically arrives either way (Inventory's cover-detail
@@ -1590,39 +1969,162 @@ public class AutoFetchService : IAutoFetchService
             Price = e.Price ?? 0,
             StockQuantity = 0,
             CoverImagePath = coverImagePath,
-            // comicade.com's solicit blurb (the only source that has
-            // one) - this is what the New Books detail popup shows as
-            // the issue's description. Null for every other source,
-            // same as every other Comicade-only field on ComicListEntry.
+            // LOCG's own raw variant text when this entry IS a variant
+            // ("Cover B Ryan Sook", "Ryan Sook Variant") - useful on its
+            // own (the New Books/Covers grid otherwise shows nothing but
+            // a bare letter for one of these) and also what
+            // AddMissingCoverVariants matches a guessed variant against
+            // on a later re-scrape, since it has no UPC to match by.
+            CoverArtist = e.VariantLabel,
+            // comicade.com's solicit blurb, or now Metron's own issue
+            // description (EnrichIssueDetails above) - this is what the
+            // New Books detail popup shows as the issue's description.
+            // Null for every other source.
             Description = string.IsNullOrWhiteSpace(e.Description) ? null : e.Description
         };
+
+        var results = new List<(Cover, bool)> { (primary, e.CoverLetterIsGuess) };
+
+        foreach (var v in e.Variants)
+        {
+            // Nothing to show for a variant with no cover image at all -
+            // not worth a blank Cover row.
+            if (string.IsNullOrWhiteSpace(v.ImageUrl)) continue;
+
+            string? variantImagePath = null;
+            try
+            {
+                var hint = $"{seriesName}_{issueNumber:0.##}_variant_{Guid.NewGuid():N}".Replace(" ", "_");
+                variantImagePath = _comicVine.DownloadCoverImage(v.ImageUrl!, hint);
+            }
+            catch (Exception ex)
+            {
+                result.Errors.Add($"{seriesName} #{issueNumber:0.##} (variant \"{v.Name}\"): cover image download failed: {ex.Message}");
+            }
+
+            var guessedLetter = CoverLetterParser.GuessFromName(v.Name);
+            var variantCover = new Cover
+            {
+                // A provisional value only - ResolveCoverLetters below
+                // overwrites this for every guessed (IsGuess=true)
+                // candidate once the whole batch is known, exactly like
+                // the primary cover's own CoverLetter above.
+                CoverLetter = guessedLetter ?? "A",
+                Barcode = !string.IsNullOrWhiteSpace(v.Upc) ? v.Upc! : $"{barcodePrefix}-{Guid.NewGuid():N}",
+                // A variant's own price when Metron has one (a foil/
+                // virgin variant is almost always priced higher) -
+                // falling back to the primary issue's price, then 0,
+                // same as every other source's own missing-price
+                // fallback.
+                Price = v.Price ?? e.Price ?? 0,
+                StockQuantity = 0,
+                CoverImagePath = variantImagePath,
+                CoverArtist = v.Name,
+                Description = string.IsNullOrWhiteSpace(e.Description) ? null : e.Description
+            };
+            results.Add((variantCover, guessedLetter == null));
+        }
+
+        return results;
+    }
+
+    // Assigns final, non-colliding cover letters across a batch of
+    // candidate covers that may share provisional/guessed letters (see
+    // BuildCoversFromEntry) - confirmed live this was the actual gap
+    // behind two different-looking symptoms: Ultimates #19 showing
+    // three/four LOCG variants all labeled Cover B (nothing deduped a
+    // batch of same-issue GUESSES against each other), and Action Comics
+    // #1104 only ever getting Cover A from Metron even once variant
+    // expansion existed (nothing assigned the newly-expanded variants
+    // their own letters at all). A confidently-read letter always claims
+    // its own slot first; a guess (or a confident letter that collides
+    // with one already claimed - two sources both confidently saying
+    // "Cover B" for the same issue, say) only ever fills whatever's left
+    // over, A through Z and then V2, V3... beyond that (an issue with
+    // more than 26 covers is not realistic, but this still has to not
+    // crash/overwrite if it somehow happens).
+    private static void ResolveCoverLetters(List<(Cover Cover, bool IsGuess)> candidates, IEnumerable<string> alreadyUsedLetters)
+    {
+        var used = new HashSet<string>(alreadyUsedLetters, StringComparer.OrdinalIgnoreCase);
+        var pending = new List<Cover>();
+
+        foreach (var (cover, isGuess) in candidates)
+        {
+            var letter = cover.CoverLetter?.Trim();
+            if (!isGuess && !string.IsNullOrEmpty(letter) && used.Add(letter))
+                continue; // confidently-known letter, slot claimed
+            pending.Add(cover); // a guess, or a confident letter that collided
+        }
+
+        foreach (var cover in pending)
+        {
+            var next = NextFreeLetter(used);
+            cover.CoverLetter = next;
+            used.Add(next);
+        }
+    }
+
+    private static string NextFreeLetter(HashSet<string> used)
+    {
+        for (var c = 'A'; c <= 'Z'; c++)
+        {
+            var s = c.ToString();
+            if (!used.Contains(s)) return s;
+        }
+        for (var n = 2; ; n++)
+        {
+            var s = $"V{n}";
+            if (!used.Contains(s)) return s;
+        }
     }
 
     // An issue we already carry can still be missing cover variants that
     // a later week's scrape now knows about - a retailer-exclusive or
     // incentive cover in particular is often announced well after the
-    // issue's initial solicit. This adds whatever cover letters aren't
-    // already on the existing issue instead of the old behavior of
-    // skipping the whole group just because the issue number itself was
-    // already known.
+    // issue's initial solicit. This adds whatever covers aren't already
+    // on the existing issue instead of the old behavior of skipping the
+    // whole group just because the issue number itself was already
+    // known. A confidently-known letter (or a real UPC, when the source
+    // has one) is how a cover already on file is recognized and not
+    // re-added; a GUESSED variant with no UPC at all (LOCG essentially
+    // never has one) has nothing that reliable to match against, so it
+    // falls back to matching by CoverArtist (the raw variant text/name -
+    // see BuildCoversFromEntry) - not perfect (a variant whose text
+    // changes slightly between scrapes could still re-add), but far
+    // better than the old behavior of every guess colliding on a single
+    // hardcoded "B" and never growing past one slot at all.
     private void AddMissingCoverVariants(Issue existingIssue, IEnumerable<ComicListEntry> group, string seriesName, string barcodePrefix, AutoFetchResult result)
     {
-        var knownLetters = existingIssue.Covers
+        var existingLetters = existingIssue.Covers
             .Select(c => c.CoverLetter)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var existingBarcodes = existingIssue.Covers
+            .Select(c => c.Barcode)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var existingArtists = existingIssue.Covers
+            .Where(c => !string.IsNullOrWhiteSpace(c.CoverArtist))
+            .Select(c => c.CoverArtist!)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        var added = 0;
+        var candidates = new List<(Cover Cover, bool IsGuess)>();
         foreach (var e in group)
         {
-            if (knownLetters.Contains(e.CoverLetter)) continue;
-
-            existingIssue.Covers.Add(BuildCoverFromEntry(e, seriesName, existingIssue.IssueNumber, barcodePrefix, result));
-            knownLetters.Add(e.CoverLetter);
-            added++;
+            foreach (var (cover, isGuess) in BuildCoversFromEntry(e, seriesName, existingIssue.IssueNumber, barcodePrefix, result))
+            {
+                if (existingBarcodes.Contains(cover.Barcode)) continue;
+                if (!isGuess && existingLetters.Contains(cover.CoverLetter)) continue;
+                if (isGuess && !string.IsNullOrWhiteSpace(cover.CoverArtist) && existingArtists.Contains(cover.CoverArtist)) continue;
+                candidates.Add((cover, isGuess));
+            }
         }
 
-        if (added > 0)
-            result.Added.Add($"{seriesName} #{existingIssue.IssueNumber:0.##}: +{added} new cover variant(s) found on a later scrape.");
+        if (candidates.Count == 0) return;
+
+        ResolveCoverLetters(candidates, existingLetters);
+        foreach (var (cover, _) in candidates)
+            existingIssue.Covers.Add(cover);
+
+        result.Added.Add($"{seriesName} #{existingIssue.IssueNumber:0.##}: +{candidates.Count} new cover variant(s) found on a later scrape.");
     }
 
     private void DiscoverNewNumberOnes(List<Series> allSeries, AutoFetchResult result)
