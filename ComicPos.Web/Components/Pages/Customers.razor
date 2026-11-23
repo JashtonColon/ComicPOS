@@ -55,13 +55,61 @@ else if (_screen == Screen.Detail && _selectedCustomer != null)
 {
     <p class="help-text">Email: @(_selectedCustomer.Email ?? "(none)")</p>
     <p class="help-text">Phone: @(_selectedCustomer.Phone ?? "(none)")</p>
+    <p class="help-text">Store Credit: @_storeCreditBalance.ToString("C")</p>
 
     <div class="btn-row">
         <button class="btn-ghost btn-sm" @onclick="ShowEdit">Edit</button>
         <button class="btn-ghost btn-sm" @onclick="OpenSaleHistory">Sale History</button>
         <button class="btn-ghost btn-sm" @onclick="@(() => GoToPullList())">Pull List</button>
+        <button class="btn-ghost btn-sm" @onclick="OpenStoreCredit">Store Credit</button>
         <button class="btn-ghost btn-sm" @onclick="ToggleActive">@(_selectedCustomer.IsActive ? "Deactivate" : "Activate")</button>
     </div>
+}
+else if (_screen == Screen.StoreCredit && _selectedCustomer != null)
+{
+    <p class="list-row-title">Current Balance: @_storeCreditBalance.ToString("C")</p>
+
+    <div class="panel" style="margin-top:10px;max-width:420px">
+        <p class="list-row-title">Adjust Balance</p>
+        <div class="form-row">
+            <label>Amount:</label>
+            <input type="text" value="@_creditAdjustAmount" @oninput="e => _creditAdjustAmount = e.Value?.ToString() ?? string.Empty" placeholder="e.g. 20.00" />
+        </div>
+        <div class="form-row">
+            <label>Reason:</label>
+            <input type="text" value="@_creditAdjustReason" @oninput="e => _creditAdjustReason = e.Value?.ToString() ?? string.Empty" placeholder="e.g. Refund for damaged item" />
+        </div>
+        @if (_creditAdjustError != null)
+        {
+            <p class="error-text">@_creditAdjustError</p>
+        }
+        <div class="form-actions">
+            <button class="btn-ghost" @onclick="@(() => AdjustCredit(negate: true))">Remove Credit</button>
+            <button class="btn-primary" @onclick="@(() => AdjustCredit(negate: false))">Add Credit</button>
+        </div>
+    </div>
+
+    <p class="list-row-title" style="margin-top:20px">History</p>
+    @if (_creditHistory.Count == 0)
+    {
+        <p class="empty-state">No store credit activity yet.</p>
+    }
+    else
+    {
+        <table class="pos-table">
+            <thead><tr><th>Date</th><th>Reason</th><th>Amount</th></tr></thead>
+            <tbody>
+                @foreach (var t in _creditHistory)
+                {
+                    <tr>
+                        <td>@t.CreatedAt.ToString("g")</td>
+                        <td>@t.Reason</td>
+                        <td style="@(t.Amount < 0 ? "color:var(--danger)" : "")">@(t.Amount >= 0 ? "+" : "")@t.Amount.ToString("C")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
 }
 else if (_screen == Screen.Edit && _selectedCustomer != null)
 {
@@ -229,7 +277,7 @@ else if (_screen == Screen.PullList && _selectedCustomer != null)
 }
 
 @code {
-    private enum Screen { List, Detail, Edit, HistorySeries, HistoryIssues, HistoryLines, PullList }
+    private enum Screen { List, Detail, Edit, HistorySeries, HistoryIssues, HistoryLines, PullList, StoreCredit }
 
     private Screen _screen = Screen.List;
     private string _search = "";
@@ -266,6 +314,12 @@ else if (_screen == Screen.PullList && _selectedCustomer != null)
     private int? _pullModalEditingEntryId;
     private int _pullModalSeriesId;
 
+    private decimal _storeCreditBalance;
+    private List<StoreCreditTransaction> _creditHistory = new();
+    private string _creditAdjustAmount = "";
+    private string _creditAdjustReason = "";
+    private string? _creditAdjustError;
+
     private class HistoryIssueRow
     {
         public float IssueNumber { get; set; }
@@ -284,6 +338,7 @@ else if (_screen == Screen.PullList && _selectedCustomer != null)
         Screen.HistoryIssues => $"{_selectedCustomer?.Name} — {_selectedSeriesName} — Issues",
         Screen.HistoryLines => $"{_selectedCustomer?.Name} — {_selectedSeriesName} #{_selectedIssueNumber:0.##} — Sales",
         Screen.PullList => $"{_selectedCustomer?.Name} — Pull List",
+        Screen.StoreCredit => $"{_selectedCustomer?.Name} — Store Credit",
         _ => ""
     };
 
@@ -310,6 +365,48 @@ else if (_screen == Screen.PullList && _selectedCustomer != null)
     {
         if (_selectedCustomer == null) { LoadList(); return; }
         _screen = Screen.Detail;
+        _storeCreditBalance = CustomersService.GetStoreCreditBalance(_selectedCustomer.Id);
+    }
+
+    private void OpenStoreCredit()
+    {
+        if (_selectedCustomer == null) return;
+        _screen = Screen.StoreCredit;
+        _creditAdjustAmount = "";
+        _creditAdjustReason = "";
+        _creditAdjustError = null;
+        RefreshStoreCredit();
+    }
+
+    private void RefreshStoreCredit()
+    {
+        if (_selectedCustomer == null) return;
+        _storeCreditBalance = CustomersService.GetStoreCreditBalance(_selectedCustomer.Id);
+        _creditHistory = CustomersService.GetStoreCreditHistory(_selectedCustomer.Id);
+    }
+
+    private void AdjustCredit(bool negate)
+    {
+        _creditAdjustError = null;
+        if (_selectedCustomer == null) return;
+
+        if (!decimal.TryParse(_creditAdjustAmount, out var amount) || amount <= 0)
+        {
+            _creditAdjustError = "Enter a positive amount.";
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(_creditAdjustReason))
+        {
+            _creditAdjustError = "A reason is required - this becomes part of the customer's permanent credit history.";
+            return;
+        }
+
+        var signedAmount = negate ? -amount : amount;
+        CustomersService.AdjustStoreCredit(_selectedCustomer.Id, signedAmount, _creditAdjustReason);
+
+        _creditAdjustAmount = "";
+        _creditAdjustReason = "";
+        RefreshStoreCredit();
     }
 
     private void OnCustomerAdded()
@@ -548,6 +645,9 @@ else if (_screen == Screen.PullList && _selectedCustomer != null)
                 _screen = Screen.HistoryIssues;
                 break;
             case Screen.PullList:
+                ShowDetail();
+                break;
+            case Screen.StoreCredit:
                 ShowDetail();
                 break;
             default:
