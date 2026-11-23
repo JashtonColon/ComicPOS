@@ -8,11 +8,27 @@ public class CheckoutService : ICheckoutService
 {
     private readonly ComicDbContext _db;
     private readonly IInventoryService _inventory;
+    private readonly ICustomerService _customers;
 
-    public CheckoutService(ComicDbContext db, IInventoryService inventory)
+    public CheckoutService(ComicDbContext db, IInventoryService inventory, ICustomerService customers)
     {
         _db = db;
         _inventory = inventory;
+        _customers = customers;
+    }
+
+    public void ApplyStoreCredit(Sale sale, decimal amount)
+    {
+        if (!sale.CustomerId.HasValue)
+            throw new InvalidOperationException("Store credit can only be applied to a sale with a customer attached.");
+        if (amount < 0)
+            throw new InvalidOperationException("Store credit amount can't be negative.");
+
+        var balance = _customers.GetStoreCreditBalance(sale.CustomerId.Value);
+        if (amount > balance)
+            throw new InvalidOperationException($"This customer only has {balance:C} in store credit available.");
+
+        sale.StoreCreditUsed = amount;
     }
 
     public Sale StartSale(int? customerId = null)
@@ -60,6 +76,21 @@ public class CheckoutService : ICheckoutService
 
         _db.Sales.Add(sale);
         _db.SaveChanges();
+
+        // The ledger debit is written AFTER the sale itself is saved, not
+        // before - StoreCreditTransaction.SaleId wants the sale's real,
+        // database-assigned Id, which doesn't exist until this
+        // SaveChanges above runs. ApplyStoreCredit already validated the
+        // amount against the customer's balance at the time it was
+        // applied in the UI, but the balance is re-checked against
+        // nothing here - between ApplyStoreCredit and CompleteSale
+        // there's no further opportunity for it to have changed in this
+        // single-checkout-screen app, so this just writes what was
+        // already validated.
+        if (sale.StoreCreditUsed > 0 && sale.CustomerId.HasValue)
+        {
+            _customers.AdjustStoreCredit(sale.CustomerId.Value, -sale.StoreCreditUsed, "Used on sale", sale.Id);
+        }
     }
 
     public List<string> GetLowStockWarnings(Sale sale)
@@ -93,5 +124,13 @@ public class CheckoutService : ICheckoutService
 
         sale.IsVoided = true;
         _db.SaveChanges();
+
+        // Symmetric with CompleteSale's debit above - any store credit
+        // this sale used comes back to the customer the same way stock
+        // comes back to inventory, rather than being quietly lost.
+        if (sale.StoreCreditUsed > 0 && sale.CustomerId.HasValue)
+        {
+            _customers.AdjustStoreCredit(sale.CustomerId.Value, sale.StoreCreditUsed, "Refunded from voided sale", sale.Id);
+        }
     }
 }
