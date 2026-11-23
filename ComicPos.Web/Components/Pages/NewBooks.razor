@@ -22,8 +22,24 @@
             <option value="@SortTitle">Title</option>
         </select>
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRescan">Re-scan Existing</button>
-        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunLocgBackfill" title="Pulls every week of @DateTime.Today.Year from League of Comic Geeks. Opens a real Chrome window - LOCG only lets a request through every few minutes, so a full year can take several hours. Safe to leave running in the background.">Backfill @DateTime.Today.Year (LOCG)</button>
-        <button class="btn-primary btn-sm" disabled="@_checking" @onclick="RunCheckNow">Check Now</button>
+        <!-- Metron is now the primary discovery source (2026-11-22),
+             replacing LOCG in that role - a plain token-authenticated
+             REST API with no Cloudflare check to click through and a
+             far gentler, documented rate limit than LOCG's own ~4-5
+             minute AJAX quota window. Pulls a rolling window (recent
+             past through several months out) so FOC deadlines surface
+             with real lead time, not just this week's shipping books.
+             Re-scan Existing (Comic Vine/Metron/GCD) still runs
+             separately as the cover-art/volume-link fallback for
+             already-known series. RunCheckNow/AutoFetch.
+             CheckForNewIssues (the original ComicList-based path) and
+             RunLocgBackfill are both still here in code, just not the
+             primary button any more - LOCG is kept as a manual fallback
+             underneath for whatever Metron doesn't have on file. -->
+        <button class="btn-primary btn-sm" disabled="@_checking" @onclick="RunMetronCheckNow" title="Pulls every issue Metron has on file with a street date from 2 weeks ago through 4 months out - recent misses plus enough lead time to see FOC deadlines coming. A plain REST API call, no browser window needed.">Check Now (Metron)</button>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunMetronBackfillYear" title="Pulls all of @DateTime.Today.Year from Metron in one go - for rebuilding history after a catalog reset, not routine use.">Backfill @DateTime.Today.Year (Metron)</button>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunLocgBackfill" title="Fallback only - pulls every week of @DateTime.Today.Year from League of Comic Geeks. Opens a real Chrome window and needs an occasional manual Cloudflare click; LOCG only lets a request through every few minutes, so a full year can take several hours.">Check Now (LOCG, fallback)</button>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRetryMetronEnrichment" title="One-time catch-up for issues Metron already added whose price/UPC/description never came through (a detail-call failure when they were first added) - fills those in and pulls in any cover variants that were missed too. Only needs running once per affected batch, not routine.">Retry Metron Enrichment</button>
     </div>
 </div>
 
@@ -294,6 +310,143 @@ else
         RefreshGrid();
     }
 
+    private async Task RunMetronCheckNow()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        var after = DateOnly.FromDateTime(DateTime.Today.AddDays(-14));
+        var before = DateOnly.FromDateTime(DateTime.Today.AddDays(120));
+        _status = $"Checking Metron for issues from {after:MM/dd/yyyy} through {before:MM/dd/yyyy}...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.CheckForNewIssuesViaMetron(after, before, progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Metron check failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Added {result.NewIssuesAdded} new issue(s) from Metron ({after:MM/dd/yyyy} - {before:MM/dd/yyyy}).";
+            if (result.Errors.Count > 0)
+                summary += " Some weeks had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    private async Task RunMetronBackfillYear()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        var year = DateTime.Today.Year;
+        var after = new DateOnly(year, 1, 1);
+        var before = new DateOnly(year, 12, 31);
+        _status = $"Backfilling {year} from Metron...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.CheckForNewIssuesViaMetron(after, before, progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Metron backfill failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Added {result.NewIssuesAdded} new issue(s) from Metron for {year}.";
+            if (result.Errors.Count > 0)
+                summary += " Some weeks had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    private async Task RunRetryMetronEnrichment()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Re-checking Metron for issues whose price/UPC/description never came through...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.RetryMetronEnrichment(progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Metron retry-enrichment failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Re-enriched {result.Added.Count} issue(s) from Metron.";
+            if (result.Errors.Count > 0)
+                summary += " Some issues had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
     private async Task RunLocgBackfill()
     {
         if (_checking) return;
@@ -301,13 +454,28 @@ else
         _resultMessage = null;
         _resultTrace = null;
         var year = DateTime.Today.Year;
-        _status = $"Backfilling {year} from League of Comic Geeks... this opens a real Chrome window. LOCG only lets a request through every few minutes, so a full year can take several hours - leave it running in the background.";
+        _status = $"Backfilling {year} from League of Comic Geeks... this opens a real Chrome window. LOCG only lets a request through every few minutes, so a full year can take several hours - leave it running in the background. Starting with the first week...";
 
         AutoFetchResult? result = null;
         Exception? error = null;
         try
         {
-            result = await Task.Run(() => AutoFetch.BackfillYearFromLocg(year));
+            // onProgress fires on the background Task.Run thread, not
+            // Blazor Server's own synchronization context - InvokeAsync
+            // marshals the _status update (and the re-render it needs)
+            // back onto the circuit's thread, the same way any other
+            // cross-thread UI update has to in Blazor Server. Without
+            // this, the status line would just sit on its one starting
+            // message for the entire multi-hour run - indistinguishable
+            // from actually being stuck.
+            result = await Task.Run(() => AutoFetch.BackfillYearFromLocg(year, progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
         }
         catch (Exception ex)
         {
