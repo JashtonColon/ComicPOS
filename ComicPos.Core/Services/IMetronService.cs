@@ -7,7 +7,16 @@ namespace ComicPos.Core.Services;
 // rate limit (confirmed on its own documentation: 20 requests/minute, 5,000
 // requests/day for an authenticated account - there is no anonymous tier,
 // unlike GCD, so this always needs a Settings-configured account to do
-// anything at all). Tried as the PRIMARY cover-art fallback for
+// anything at all). As of 2026-11-22 this is also the PRIMARY source for
+// discovering new issues at all (NewBooks.razor's "Check Now" button -
+// see GetIssuesInDateRange), replacing the LOCG scraper that held that
+// role briefly before it: Metron is a plain token-authenticated REST API
+// with no Cloudflare or other bot-protection to click through, its own
+// series data carries a real year_began directly (used as
+// Series.MetronSeriesId/StartYear, eliminating the name+year guessing
+// PickBestVolumeMatch otherwise needs), and its documented rate limit is
+// far gentler than LOCG's empirically-discovered ~4-5 minute AJAX quota
+// window. Also still used as the PRIMARY cover-art fallback for
 // RescanExistingBooks (GCD only runs after this one misses or is rate-
 // limited - see AutoFetchService) - richer per-issue data than GCD
 // (exact cover/in-store/FOC dates, full creator credits) and a far more
@@ -19,6 +28,40 @@ namespace ComicPos.Core.Services;
 // dance.
 public interface IMetronService
 {
+    // Lists every issue Metron has on file with a store/street date
+    // between after and before (inclusive), used as the primary source
+    // for "what's new/upcoming" discovery instead of LOCG's weekly-page
+    // scrape. One cheap list call per page (Metron's own pagination,
+    // followed via its "next" link) rather than one call per week like
+    // the old LOCG backfill needed - a whole year is one logical
+    // request here, just paginated. onProgress fires once per page
+    // fetched, the same live-progress hookup NewBooks.razor already
+    // wires up for the LOCG button, so a long date range still shows
+    // it's moving instead of looking stuck.
+    //
+    // Deliberately does NOT fetch Publisher/Price/Upc for every result -
+    // those only exist on Metron's per-issue DETAIL endpoint, and a
+    // detail call for every one of a date range's results (hundreds,
+    // industry-wide, for any real span) would turn one cheap list call
+    // into exactly the kind of per-issue cost this method exists to
+    // avoid. Those three fields come back blank here; EnrichIssueDetails
+    // below fills them in later, but only for an issue AddEntriesAsIssues
+    // has confirmed is genuinely brand new - see AutoFetchService.
+    // BuildCoverFromEntry.
+    List<ComicListEntry> GetIssuesInDateRange(DateOnly after, DateOnly before, Action<string>? onProgress = null);
+
+    // Fills in Publisher/Price/Upc (and double-checks FocDate/
+    // ReleaseDate/CoverImageUrl, though GetIssuesInDateRange's list call
+    // already has those) for one issue, via Metron's own numeric
+    // MetronIssueId - no name/number search involved, unlike
+    // FindAndDownloadCover, so there's no ambiguity to resolve at all.
+    // Mirrors ILocgService.EnrichIssueDetails' exact contract: mutates
+    // entry in place, best-effort in spirit (meant to be called only for
+    // a brand-new issue/cover, never repeated for one already on file),
+    // but THROWS on failure rather than swallowing it, so a caller's
+    // try/catch (see AutoFetchService.BuildCoverFromEntry) can actually
+    // log what went wrong instead of silently leaving fields blank.
+    void EnrichIssueDetails(ComicListEntry entry);
     // Never throws - see GcdCoverLookupResult's sibling, MetronCoverLookupResult,
     // for the same "always say why" contract.
     //
@@ -72,6 +115,18 @@ public interface IMetronService
     // one actually matched, with a best-effort guess at that variant's
     // cover letter parsed from its name (e.g. "Cover B" -> "B").
     MetronUpcLookupResult FindIssueByUpc(string upc);
+
+    // Same series_name+number search FindAndDownloadCover uses, but
+    // returns just Metron's own numeric issue id instead of downloading
+    // anything - for an issue that's already on file in this app but
+    // predates Issue.MetronIssueId existing at all (added before
+    // 2026-11-23), so RetryMetronEnrichment has no id to call
+    // EnrichIssueDetails with yet and has to re-find it by name/number
+    // first, one time, the same way the issue was originally matched
+    // during discovery. Null when nothing matches - same "no match"
+    // outcome as FindAndDownloadCover's own Fail(), just without a
+    // Reason/Detail string since this is only ever used internally.
+    int? FindIssueId(string seriesName, float issueNumber, DateOnly? expectedDate);
 }
 
 // One downloaded cover image, as part of a multi-cover result (see
