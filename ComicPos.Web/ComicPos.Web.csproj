@@ -15,4 +15,18 @@
     <ProjectReference Include="..\ComicPos.Importers\ComicPos.Importers.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- dotnet-ef's tooling (migrations add/remove/script, etc.) needs
+         this on the STARTUP project specifically, not just the project
+         that actually holds the DbContext/Migrations (ComicPos.Data) -
+         confirmed live: "Your startup project 'ComicPos.Web' doesn't
+         reference Microsoft.EntityFrameworkCore.Design." Build-time only
+         (PrivateAssets="all"), same as ComicPos.Data's own reference -
+         this never ships in the published app. -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.13">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
 </Project>
