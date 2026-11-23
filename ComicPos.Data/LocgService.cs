@@ -3,6 +3,7 @@ using System.Text;
 using System.Threading;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using ComicPos.Core;
 using ComicPos.Core.Models;
 using ComicPos.Core.Services;
 using HtmlAgilityPack;
@@ -57,6 +58,140 @@ public class LocgService : ILocgService, IDisposable
         finally
         {
             _gate.Release();
+        }
+    }
+
+    public void EnrichIssueDetails(ComicListEntry entry)
+    {
+        EnrichIssueDetailsAsync(entry).GetAwaiter().GetResult();
+    }
+
+    // LOCG's robots.txt crawl-delay (30s) - the same constraint
+    // AutoFetchService's week-to-week loop already honors for the
+    // weekly list page. Applied here, not left to the caller, since this
+    // is called once per brand-new issue/cover deep inside
+    // AutoFetchService.BuildCoverFromEntry's per-entry loop - that
+    // caller shouldn't need to know LOCG's own pacing rule to get it
+    // right.
+    private static readonly TimeSpan LocgDetailPageCrawlDelay = TimeSpan.FromSeconds(30);
+
+    private async Task EnrichIssueDetailsAsync(ComicListEntry entry)
+    {
+        if (string.IsNullOrWhiteSpace(entry.DetailUrl)) return;
+
+        await _gate.WaitAsync();
+        try
+        {
+            await EnsureBrowserLaunchedAsync();
+
+            // A normal server-rendered page, not the special AJAX
+            // endpoint that turned out to have its own harsh ~5-minute
+            // quota (see FetchWeekJsonWithRetryAsync) - never actually
+            // confirmed live whether this endpoint shares that same
+            // limit, so this still retries defensively on a failure, but
+            // with a much lighter budget than a whole week's list: this
+            // is enrichment, called once per issue, not the one
+            // make-or-break fetch for an entire week.
+            const int maxAttempts = 3;
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    await NavigateAndWaitForCloudflareAsync(entry.DetailUrl);
+                    var html = await _page!.ContentAsync();
+                    ParseIssueDetailPage(html, entry);
+                    return;
+                }
+                catch when (attempt < maxAttempts)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(10));
+                }
+                catch
+                {
+                    // Best-effort only (see ILocgService.EnrichIssueDetails) -
+                    // a failure here leaves entry.Upc/FocDate unset rather
+                    // than failing the whole issue/week import.
+                    return;
+                }
+            }
+        }
+        finally
+        {
+            // Paid even on failure/early return - whatever just happened
+            // still counted as a request against LOCG's crawl-delay.
+            await Task.Delay(LocgDetailPageCrawlDelay);
+            _gate.Release();
+        }
+    }
+
+    private static readonly Regex FocDateTextPattern = new(@"^([A-Za-z]+)\s+(\d{1,2})", RegexOptions.Compiled);
+
+    private static void ParseIssueDetailPage(string html, ComicListEntry entry)
+    {
+        var doc = new HtmlDocument();
+        doc.LoadHtml(html);
+
+        // Confirmed live (see ILocgService.EnrichIssueDetails): each
+        // field on this page - UPC, Distributor SKU, Final Order
+        // Cutoff, Cover Date - is its own
+        // "details-addtl-block" div containing a "name" div (the label)
+        // and a "value" div (the actual text). Matched on the class
+        // shape rather than any more specific selector, same defensive
+        // approach as the weekly-list parsing above.
+        var blocks = doc.DocumentNode.SelectNodes(
+            "//div[contains(concat(' ', normalize-space(@class), ' '), ' details-addtl-block ')]");
+        if (blocks == null) return;
+
+        foreach (var block in blocks)
+        {
+            var name = block.SelectSingleNode(".//div[contains(@class,'name')]")?.InnerText?.Trim();
+            var value = block.SelectSingleNode(".//div[contains(@class,'value')]")?.InnerText?.Trim();
+            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(value)) continue;
+
+            if (string.Equals(name, "UPC", StringComparison.OrdinalIgnoreCase))
+            {
+                entry.Upc = value;
+            }
+            else if (name.Contains("Final Order Cutoff", StringComparison.OrdinalIgnoreCase))
+            {
+                // "Oct 26th" - a month name, a day, and an ordinal suffix,
+                // but critically NO YEAR at all, so DateOnly.TryParse on
+                // this text alone can't work. entry.ReleaseDate is
+                // already known (from the weekly list, parsed before this
+                // enrichment ever runs) and FOC always falls shortly
+                // before the street date, so that's used to pick the
+                // right year rather than guessing "this year" blindly -
+                // which would be wrong for all of January's solicitations
+                // (an FOC date in the preceding December).
+                var focMatch = FocDateTextPattern.Match(value);
+                if (focMatch.Success && int.TryParse(focMatch.Groups[2].Value, out var day))
+                {
+                    var monthNames = CultureInfo.InvariantCulture.DateTimeFormat.AbbreviatedMonthNames;
+                    var monthIndex = Array.FindIndex(monthNames, 0, 12,
+                        m => string.Equals(m, focMatch.Groups[1].Value, StringComparison.OrdinalIgnoreCase));
+                    if (monthIndex < 0)
+                    {
+                        var fullMonthNames = CultureInfo.InvariantCulture.DateTimeFormat.MonthNames;
+                        monthIndex = Array.FindIndex(fullMonthNames, 0, 12,
+                            m => string.Equals(m, focMatch.Groups[1].Value, StringComparison.OrdinalIgnoreCase));
+                    }
+
+                    if (monthIndex >= 0)
+                    {
+                        var year = entry.ReleaseDate?.Year ?? DateTime.Today.Year;
+                        DateOnly? candidate = null;
+                        try { candidate = new DateOnly(year, monthIndex + 1, day); }
+                        catch { /* e.g. Feb 30 from a misread day - leave FocDate unset */ }
+
+                        if (candidate != null)
+                        {
+                            if (entry.ReleaseDate != null && candidate.Value > entry.ReleaseDate.Value)
+                                candidate = candidate.Value.AddYears(-1);
+                            entry.FocDate = candidate;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -170,8 +305,17 @@ public class LocgService : ILocgService, IDisposable
     private async Task NavigateToWeekPageAsync(DateOnly mondayOfWeek)
     {
         var pageUrl = $"https://leagueofcomicgeeks.com/comics/new-comics/{mondayOfWeek.Year}/{mondayOfWeek.Month:D2}/{mondayOfWeek.Day:D2}";
+        await NavigateAndWaitForCloudflareAsync(pageUrl);
+    }
 
-        await _page!.GotoAsync(pageUrl, new PageGotoOptions
+    // Shared by every real page navigation this class does (the weekly
+    // page, and now each issue's own detail page for
+    // EnrichIssueDetails) - Cloudflare's interstitial can in principle
+    // show up on any page load, not just the first one of a session, so
+    // this is checked every time rather than only once at startup.
+    private async Task NavigateAndWaitForCloudflareAsync(string url)
+    {
+        await _page!.GotoAsync(url, new PageGotoOptions
         {
             WaitUntil = WaitUntilState.DOMContentLoaded,
             Timeout = 60000
@@ -182,10 +326,8 @@ public class LocgService : ILocgService, IDisposable
         // browser..."). Polling for that to clear - rather than a fixed
         // sleep - is what gives a person time to actually click through
         // an interactive check if one ever appears, without making every
-        // ordinary week (no challenge shown at all) wait the same fixed
-        // delay regardless. Checked on every week's navigation, not just
-        // the first, since there's no guarantee Cloudflare only ever
-        // challenges the very first page load of a session.
+        // ordinary page load (no challenge shown at all) wait the same
+        // fixed delay regardless.
         var deadline = DateTime.UtcNow.AddSeconds(90);
         while (DateTime.UtcNow < deadline)
         {
@@ -272,7 +414,6 @@ public class LocgService : ILocgService, IDisposable
     }
 
     private static readonly Regex IssueNumberPattern = new(@"#(\d+(?:\.\d+)?)", RegexOptions.Compiled);
-    private static readonly Regex VariantCoverLetterPattern = new(@"^Cover\s+([A-Za-z])\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex PricePattern = new(@"\$(\d+(?:\.\d+)?)", RegexOptions.Compiled);
 
     private static ComicListEntry? ParseIssueNode(HtmlNode li)
@@ -319,15 +460,24 @@ public class LocgService : ILocgService, IDisposable
 
         if (!string.IsNullOrWhiteSpace(variantText))
         {
-            var letterMatch = VariantCoverLetterPattern.Match(variantText);
-            // A variant whose name doesn't start with "Cover <letter>"
-            // (an incentive ratio variant named only by its artist, say)
-            // still needs a letter distinct from the default "A" so it
-            // doesn't collide with the base cover under
-            // AddMissingCoverVariants' known-letters check - "B" is a
-            // reasonable single fallback since LOCG's own grouping here
-            // is already per-issue, not per-cover-letter.
-            entry.CoverLetter = letterMatch.Success ? letterMatch.Groups[1].Value.ToUpperInvariant() : "B";
+            entry.VariantLabel = variantText;
+            // A variant whose name doesn't have "Cover <letter>" anywhere
+            // in it (an incentive ratio variant named only by its artist,
+            // say - "Ryan Sook Variant") has no real letter to read at
+            // all. Used to fall back to a single hardcoded "B" here,
+            // which meant every such variant on the same issue collided
+            // on that one literal letter - confirmed live: Ultimates #19
+            // showed three/four different variants all labeled Cover B,
+            // each save silently overwriting the slot the last one took.
+            // "B" is still written here as a provisional placeholder
+            // (every ComicListEntry needs *a* non-null CoverLetter), but
+            // CoverLetterIsGuess=true tells AutoFetchService.
+            // ResolveCoverLetters this one's letter isn't real and needs
+            // its own free slot assigned, not treated as a confident claim
+            // on "B".
+            var guessed = CoverLetterParser.GuessFromName(variantText);
+            entry.CoverLetter = guessed ?? "B";
+            entry.CoverLetterIsGuess = guessed == null;
         }
 
         var dateAttr = li.SelectSingleNode(".//span[contains(@class,'date')]")?.GetAttributeValue("data-date", "");
@@ -350,6 +500,20 @@ public class LocgService : ILocgService, IDisposable
             imgSrc = imgNode?.GetAttributeValue("src", "");
         if (!string.IsNullOrWhiteSpace(imgSrc))
             entry.CoverImageUrl = imgSrc;
+
+        // The per-issue detail page (UPC, real FOC date - neither is on
+        // this weekly list at all, see EnrichIssueDetails) - whatever the
+        // FIRST link pointing at "/comic/" inside this <li> is, same
+        // defensive "look for the shape, not one exact class name"
+        // approach as everything else in this file, since the exact
+        // wrapper markup around that link was never directly inspected.
+        var linkHref = li.SelectSingleNode(".//a[contains(@href,'/comic/')]")?.GetAttributeValue("href", "");
+        if (!string.IsNullOrWhiteSpace(linkHref))
+        {
+            entry.DetailUrl = linkHref.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+                ? linkHref
+                : $"https://leagueofcomicgeeks.com{(linkHref.StartsWith('/') ? "" : "/")}{linkHref}";
+        }
 
         return entry;
     }
