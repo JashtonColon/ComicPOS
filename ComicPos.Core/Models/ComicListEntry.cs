@@ -49,6 +49,93 @@ public class ComicListEntry
     // detail popup as the issue's description. comicade.com is the only
     // source that has this text at all.
     public string? Description { get; set; }
+
+    // The issue's own LOCG detail page (e.g.
+    // https://leagueofcomicgeeks.com/comic/1096934/absolute-flash-21) -
+    // only ever set by LocgService, since that's the only source whose
+    // weekly list links out to a separate per-issue page at all. Not
+    // persisted anywhere - purely a hand-off so
+    // AutoFetchService.BuildCoverFromEntry knows where to send
+    // ILocgService.EnrichIssueDetails for a brand-new issue/cover, since
+    // the weekly list itself doesn't carry UPC or a real FOC date.
+    public string? DetailUrl { get; set; }
+
+    // Everything below is only ever set by MetronService - see
+    // IMetronService.GetIssuesInDateRange. Metron's own API returns the
+    // real volume identity and start year directly alongside every issue
+    // it lists (no name/year guessing needed at all), which is precise
+    // enough to use as the PRIMARY lookup/creation key for a Series row
+    // in AutoFetchService.AddEntriesAsIssues, ahead of the name-based
+    // normalized-key matching every other source still needs.
+
+    // Metron's own numeric id for this specific issue - handed to
+    // IMetronService.EnrichIssueDetails to fetch price/UPC/publisher for
+    // a brand-new issue, the same hand-off DetailUrl above does for LOCG.
+    public int? MetronIssueId { get; set; }
+
+    // Metron's own numeric id for the VOLUME this issue belongs to -
+    // stored onto Series.MetronSeriesId the first time a series resolves
+    // through this, so every later run can match by this exact id
+    // instead of by name at all.
+    public int? MetronSeriesId { get; set; }
+
+    // The real year this volume began, straight from Metron's own
+    // series.year_began - used as a brand-new Series row's StartYear
+    // instead of AddEntriesAsIssues' old "just use today's year" guess,
+    // which stamped a wrong placeholder onto every series discovered
+    // from a weekly scrape (a 1990s-launched series discovered via this
+    // week's new issue used to get StartYear = this week's year).
+    public int? SeriesStartYearHint { get; set; }
+
+    // True when CoverLetter above is a best-effort fallback (LOCG
+    // couldn't parse a real "Cover X" out of a variant's name, so it
+    // used a single placeholder letter) rather than something actually
+    // read off the source. AddEntriesAsIssues/AddMissingCoverVariants
+    // treat a guessed letter as "needs ITS OWN free slot" instead of
+    // "this is definitely Cover B" - three unlettered LOCG variants for
+    // the same issue used to all land on the literal same letter ("B")
+    // and silently overwrite each other's spot in the grid (confirmed
+    // live: Ultimates #19 showed three different variants all labeled
+    // Cover B). A confidently-parsed letter (this stays false) is still
+    // treated as a real identity, so a later re-scrape of the SAME
+    // cover is recognized and not duplicated.
+    public bool CoverLetterIsGuess { get; set; }
+
+    // Every OTHER cover Metron has on file for this exact issue - only
+    // ever populated by MetronService.EnrichIssueDetails, from that same
+    // per-issue detail call's own "variants" list (name/upc/price/image
+    // per variant). Metron's cheap list call (GetIssuesInDateRange) only
+    // ever returns the primary/Cover-A edition, so a brand-new issue
+    // starts with zero of these and gets them filled in right before
+    // AutoFetchService turns this entry into Cover rows - one extra Cover
+    // row per entry here, each with its own real image/UPC/price instead
+    // of just Cover A ever showing up.
+    public List<MetronVariantInfo> Variants { get; set; } = new();
+
+    // The raw free-text label a variant was announced under (LOCG's own
+    // variant text - "Cover B Ryan Sook", "Ryan Sook Variant", etc.) -
+    // only ever set by LocgService, since Metron's equivalent per-variant
+    // text already lives on MetronVariantInfo.Name above (one ComicListEntry
+    // per LOCG variant vs. one entry total with several Variants for
+    // Metron - see AutoFetchService.BuildCoversFromEntry, which reads
+    // whichever of the two applies). Used both to show something more
+    // useful than a bare guessed letter (Cover.CoverArtist) and, for a
+    // variant CoverLetterParser couldn't find a real letter in, as the
+    // only stable way to recognize "this is the same variant a later
+    // re-scrape already added" instead of a bare UPC (LOCG variants
+    // essentially never have one).
+    public string? VariantLabel { get; set; }
+}
+
+// One Metron-listed variant cover for an issue - see ComicListEntry.
+// Variants above. Deliberately a flat DTO, not an EF entity: it only
+// ever exists transiently, on the way to becoming a real Cover row.
+public class MetronVariantInfo
+{
+    public string? Name { get; set; }
+    public string? Upc { get; set; }
+    public decimal? Price { get; set; }
+    public string? ImageUrl { get; set; }
 }
 
 // One week's worth of entries, plus the street date they all ship on
