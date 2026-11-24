@@ -71,7 +71,17 @@ public class MetronService : IMetronService
     private static HttpClient BuildClient()
     {
         var client = new HttpClient();
-        client.Timeout = TimeSpan.FromSeconds(20);
+        // Was 20s - raised after a live run (2026-11-23) showed every
+        // single /api/issue/?series_name=...&number=... search (the
+        // query FindIssueId/FindAndDownloadCover use) hitting exactly
+        // this timeout via TaskCanceledException, while other Metron
+        // calls (the bulk date-range listing Check Now uses) complete
+        // fine - that specific search endpoint just appears to be
+        // genuinely slower than 20s on Metron's end, not rate-limited or
+        // blocked (no 429/403 - the request never got a response at
+        // all). 60s is a guess at enough headroom, not a measured value -
+        // may need to go higher if it's still not enough.
+        client.Timeout = TimeSpan.FromSeconds(60);
         client.DefaultRequestHeaders.UserAgent.ParseAdd(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ComicPos/1.0 (personal single-store inventory tool)");
         // Same reasoning as GcdService's client: a Django REST Framework
@@ -239,10 +249,22 @@ public class MetronService : IMetronService
     // anything - see IMetronService.FindIssueId for why this exists
     // (recovering a Metron issue id for an issue added before
     // Issue.MetronIssueId was persisted at all).
-    public int? FindIssueId(string seriesName, float issueNumber, DateOnly? expectedDate)
+    //
+    // Retries specifically on 429 with a real backoff (20s, then 40s)
+    // before giving up, and always returns a FailureReason alongside a
+    // null Id - added after a live run (2026-11-23) came back 0/806 with
+    // every single issue reporting the exact same generic "couldn't
+    // find it" failure. That's indistinguishable from Metron genuinely
+    // not having the issue UNLESS this records which it actually was,
+    // and a sustained 429 storm is exactly what this service's normal
+    // 3.5s-apart pacing (WaitForRateLimit) can't protect against if
+    // something else is sharing the same Metron account/token at the
+    // same time (e.g. another copy of this app left running elsewhere).
+    public (int? Id, string? FailureReason) FindIssueId(string seriesName, float issueNumber, DateOnly? expectedDate)
     {
         var settings = _storeSettings.Load();
-        if (string.IsNullOrWhiteSpace(settings.MetronApiToken)) return null;
+        if (string.IsNullOrWhiteSpace(settings.MetronApiToken))
+            return (null, "no Metron API token configured in Settings");
 
         var numberText = issueNumber == Math.Floor(issueNumber)
             ? ((int)issueNumber).ToString(CultureInfo.InvariantCulture)
@@ -250,44 +272,70 @@ public class MetronService : IMetronService
         var query = $"series_name={Uri.EscapeDataString(seriesName)}&number={Uri.EscapeDataString(numberText)}";
         var url = $"{BaseUrl}/issue/?{query}";
 
-        string json;
-        try
+        const int maxAttempts = 3;
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            WaitForRateLimit();
-            using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.MetronApiToken);
-            using var response = Http.Send(request);
-            if (!response.IsSuccessStatusCode) return null;
-            json = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-            if (json.TrimStart().StartsWith("<")) return null;
-        }
-        catch
-        {
-            return null;
+            string json;
+            try
+            {
+                WaitForRateLimit();
+                using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.MetronApiToken);
+                using var response = Http.Send(request);
+
+                if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                {
+                    if (attempt < maxAttempts)
+                    {
+                        Thread.Sleep(TimeSpan.FromSeconds(20 * attempt));
+                        continue;
+                    }
+                    return (null, $"429 (rate limited) from {url} after {maxAttempts} attempts");
+                }
+                if (response.StatusCode == HttpStatusCode.Forbidden)
+                    return (null, $"403 (blocked) from {url}");
+                if (!response.IsSuccessStatusCode)
+                    return (null, $"HTTP {(int)response.StatusCode} {response.ReasonPhrase} from {url}");
+
+                json = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                if (json.TrimStart().StartsWith("<"))
+                    return (null, $"got an HTML page instead of JSON (likely bot-protection) from {url}");
+            }
+            catch (Exception ex)
+            {
+                return (null, $"{ex.GetType().Name}: {ex.Message} ({url})");
+            }
+
+            MetronIssueListResponse? list;
+            try
+            {
+                list = JsonSerializer.Deserialize<MetronIssueListResponse>(json, JsonOptions);
+            }
+            catch (Exception ex)
+            {
+                return (null, $"unparseable response: {ex.Message}");
+            }
+
+            var matches = list?.results;
+            if (matches == null || matches.Count == 0)
+                return (null, $"no match in Metron for series_name={seriesName}&number={numberText}");
+
+            var chosen = expectedDate != null
+                ? matches
+                    .OrderBy(m => m.cover_date.HasValue
+                        ? Math.Abs(m.cover_date.Value.DayNumber - expectedDate.Value.DayNumber)
+                        : int.MaxValue)
+                    .First()
+                : matches[0];
+
+            return (chosen.id, null);
         }
 
-        MetronIssueListResponse? list;
-        try
-        {
-            list = JsonSerializer.Deserialize<MetronIssueListResponse>(json, JsonOptions);
-        }
-        catch
-        {
-            return null;
-        }
-
-        var matches = list?.results;
-        if (matches == null || matches.Count == 0) return null;
-
-        var chosen = expectedDate != null
-            ? matches
-                .OrderBy(m => m.cover_date.HasValue
-                    ? Math.Abs(m.cover_date.Value.DayNumber - expectedDate.Value.DayNumber)
-                    : int.MaxValue)
-                .First()
-            : matches[0];
-
-        return chosen.id;
+        // Unreachable - every path above either returns or continues the
+        // retry loop, and the loop's last allowed iteration always
+        // returns instead of continuing. Here only so the compiler can
+        // see every path returns a value.
+        return (null, "retry loop exhausted unexpectedly");
     }
 
     // Shared by FindAndDownloadCover's per-candidate loop and
