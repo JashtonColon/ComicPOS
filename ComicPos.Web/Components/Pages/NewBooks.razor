@@ -40,6 +40,8 @@
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunMetronBackfillYear" title="Pulls all of @DateTime.Today.Year from Metron in one go - for rebuilding history after a catalog reset, not routine use.">Backfill @DateTime.Today.Year (Metron)</button>
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunLocgBackfill" title="Fallback only - pulls every week of @DateTime.Today.Year from League of Comic Geeks. Opens a real Chrome window and needs an occasional manual Cloudflare click; LOCG only lets a request through every few minutes, so a full year can take several hours.">Check Now (LOCG, fallback)</button>
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRetryMetronEnrichment" title="One-time catch-up for issues Metron already added whose price/UPC/description never came through (a detail-call failure when they were first added) - fills those in and pulls in any cover variants that were missed too. Only needs running once per affected batch, not routine.">Retry Metron Enrichment</button>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRetryMetronEnrichmentTest" title="Same as Retry Metron Enrichment, but stops after 5 issues - use this first to sanity-check a change (like the Metron API retry/diagnostics fix) in under a minute instead of committing to the full multi-hour run blind.">Retry Metron Enrichment (Test 5)</button>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRetryLocgEnrichmentTest" title="Same job as Retry Metron Enrichment, but sourced from LOCG instead - use this while Metron is blocked. Stops after 5 issues so you can check the result against LOCG's own site before running the full batch. Each issue needing a new LOCG week can take several minutes (LOCG's own rate limit), so this is slower per-issue than the Metron version.">Retry LOCG Enrichment (Test 5)</button>
     </div>
 </div>
 
@@ -438,6 +440,107 @@ else
         else if (result != null)
         {
             var summary = $"Re-enriched {result.Added.Count} issue(s) from Metron.";
+            if (result.Errors.Count > 0)
+                summary += " Some issues had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Same as RunRetryMetronEnrichment above, just capped at 5 issues via
+    // the limit parameter - a quick way to check a change to the Metron
+    // retry path (like the 429-retry/FailureReason fix) actually works
+    // before committing to the full, multi-hour run again.
+    private async Task RunRetryMetronEnrichmentTest()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Test run (5 issues) - re-checking Metron for issues whose price/UPC/description never came through...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.RetryMetronEnrichment(progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }, limit: 5));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Metron retry-enrichment test run failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Test run: re-enriched {result.Added.Count} issue(s) from Metron.";
+            if (result.Errors.Count > 0)
+                summary += " Some issues had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // LOCG counterpart to RunRetryMetronEnrichmentTest above - same
+    // Test-5 "sanity-check before committing to the real thing" purpose,
+    // added 2026-11-23 while Metron itself is blocked (see
+    // metron-integration-notes.md) so there's still a way to make
+    // progress on the backfill. No un-capped "Retry LOCG Enrichment"
+    // button yet on purpose - this is brand-new code hitting a slow,
+    // rate-limited site, so it's worth confirming a Test-5 run actually
+    // matches LOCG's real data before ever running it uncapped against
+    // the full backlog.
+    private async Task RunRetryLocgEnrichmentTest()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Test run (5 issues) - re-checking LOCG for issues whose publisher/UPC/price never came through...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.RetryLocgEnrichment(progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }, limit: 5));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"LOCG retry-enrichment test run failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Test run: re-enriched {result.Added.Count} issue(s) from LOCG.";
             if (result.Errors.Count > 0)
                 summary += " Some issues had errors: " + string.Join("; ", result.Errors.Take(10));
             _resultMessage = summary;
