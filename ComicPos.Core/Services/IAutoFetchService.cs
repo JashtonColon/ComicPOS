@@ -109,5 +109,23 @@ public interface IAutoFetchService
     // for) - fills in real Price/UPC/Publisher/Description and adds any
     // cover variants Metron has on file that never got pulled in. Never
     // run automatically, same spirit as RescanExistingBooks above.
-    AutoFetchResult RetryMetronEnrichment(Action<string>? onProgress = null);
+    // limit caps how many candidate issues are processed (first N found) -
+    // for the "Retry Metron Enrichment (Test 5)" button, so a change to
+    // this method can be sanity-checked on a handful of issues in well
+    // under a minute instead of committing to the full multi-hour run
+    // blind (added 2026-11-23 after a full run came back 0/806 with no
+    // way to tell why until FindIssueId's FailureReason existed either).
+    // Null means no cap - the real, full run.
+    AutoFetchResult RetryMetronEnrichment(Action<string>? onProgress = null, int? limit = null);
+
+    // Same catch-up job as RetryMetronEnrichment above, sourced from LOCG
+    // instead - added 2026-11-23 specifically because Metron itself is
+    // IP/network-blocked right now (see metron-integration-notes.md), so
+    // this is the one path that can still make progress on the backlog of
+    // issues showing a placeholder Publisher/UPC/price while that's
+    // sorted out. Matches both "MTR-" and "LOCG-" placeholder covers (see
+    // AutoFetchService.RetryLocgEnrichment's own doc comment for why it's
+    // not narrowly Metron-only). Same limit/Test-5-button contract as
+    // RetryMetronEnrichment - null means the real, full run.
+    AutoFetchResult RetryLocgEnrichment(Action<string>? onProgress = null, int? limit = null);
 }
