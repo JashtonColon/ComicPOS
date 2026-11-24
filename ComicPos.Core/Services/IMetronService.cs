@@ -123,10 +123,15 @@ public interface IMetronService
     // 2026-11-23), so RetryMetronEnrichment has no id to call
     // EnrichIssueDetails with yet and has to re-find it by name/number
     // first, one time, the same way the issue was originally matched
-    // during discovery. Null when nothing matches - same "no match"
-    // outcome as FindAndDownloadCover's own Fail(), just without a
-    // Reason/Detail string since this is only ever used internally.
-    int? FindIssueId(string seriesName, float issueNumber, DateOnly? expectedDate);
+    // during discovery. Id is null on any failure (no match, rate
+    // limited, blocked, network/parse error) - FailureReason says which,
+    // so a caller logs something more useful than one generic "couldn't
+    // find it" string. Added after a live run (2026-11-23) came back
+    // 0/806 with every single issue reporting the exact same generic
+    // failure, which gave no way to tell a real "not on Metron" miss
+    // apart from a rate-limit storm (this method now retries 429s a
+    // couple of times internally before giving up - see MetronService).
+    (int? Id, string? FailureReason) FindIssueId(string seriesName, float issueNumber, DateOnly? expectedDate);
 }
 
 // One downloaded cover image, as part of a multi-cover result (see
