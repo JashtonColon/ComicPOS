@@ -70,6 +70,8 @@ public class AutoFetchService : IAutoFetchService
                 trace.AppendLine("Errors:");
                 foreach (var line in result.Errors) trace.AppendLine("  " + line);
             }
+            trace.AppendLine();
+            trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}.");
             var traceText = trace.ToString();
             result.Trace = traceText;
             DebugLog.WriteCheckNowLog(traceText);
@@ -834,6 +836,8 @@ public class AutoFetchService : IAutoFetchService
             trace.AppendLine("Errors:");
             foreach (var line in result.Errors) trace.AppendLine("  " + line);
         }
+        trace.AppendLine();
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}.");
         var rescanTraceText = trace.ToString();
         result.Trace = rescanTraceText;
         DebugLog.WriteCheckNowLog(rescanTraceText);
@@ -876,6 +880,8 @@ public class AutoFetchService : IAutoFetchService
                 trace.AppendLine("Errors:");
                 foreach (var line in result.Errors) trace.AppendLine("  " + line);
             }
+            trace.AppendLine();
+            trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}.");
             var locgTraceText = trace.ToString();
             result.Trace = locgTraceText;
             DebugLog.WriteCheckNowLog(locgTraceText);
@@ -993,6 +999,8 @@ public class AutoFetchService : IAutoFetchService
                 trace.AppendLine("Errors:");
                 foreach (var line in result.Errors) trace.AppendLine("  " + line);
             }
+            trace.AppendLine();
+            trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}.");
             var metronTraceText = trace.ToString();
             result.Trace = metronTraceText;
             DebugLog.WriteCheckNowLog(metronTraceText);
@@ -1073,17 +1081,32 @@ public class AutoFetchService : IAutoFetchService
     // search AddEntriesAsIssues/Check Now itself never ran for this issue
     // because it was matched on MetronSeriesId/name instead) before the
     // usual per-id detail call can happen at all.
-    public AutoFetchResult RetryMetronEnrichment(Action<string>? onProgress = null)
+    public AutoFetchResult RetryMetronEnrichment(Action<string>? onProgress = null, int? limit = null)
     {
         var result = new AutoFetchResult();
         var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Retry Metron enrichment run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}" + (limit.HasValue ? $" (TEST RUN - capped at {limit} issue(s))" : ""));
+        trace.AppendLine(new string('=', 60));
 
         var candidates = _db.Issues
             .Include(i => i.Series)
             .Include(i => i.Covers)
             .ToList()
             .Where(i => i.Covers.Any(c => c.Price == 0 && c.Barcode.StartsWith("MTR-")))
+            // Most recent release first, not whatever order SQLite's table
+            // scan happens to return (effectively insertion order) - added
+            // 2026-11-23 after a Test 5 run on the LOCG counterpart below
+            // picked 5 of the OLDEST unenriched rows, which turned out to
+            // all be old solicitation-catalog/digital-only junk (Marvel
+            // Previews, an IDW title catalog, several "Infinity Comic"
+            // digital exclusives) sitting outside GetNewBooks' 3-month
+            // window - not representative of what this button is actually
+            // for, and a wasted ~10 minutes confirming nothing useful.
+            // Newest-first means a `limit` test run samples real, recent
+            // single issues instead.
+            .OrderByDescending(i => i.ReleaseDate)
             .ToList();
+        if (limit.HasValue) candidates = candidates.Take(limit.Value).ToList();
 
         onProgress?.Invoke($"Found {candidates.Count} Metron-sourced issue(s) still showing placeholder price/barcode.");
 
@@ -1092,6 +1115,14 @@ public class AutoFetchService : IAutoFetchService
         {
             done++;
             var seriesName = issue.Series.Name;
+            // Set on every path below (success or failure) before this
+            // iteration's trace line gets written - added 2026-11-23
+            // after a run where every one of 5 test issues failed on the
+            // early "couldn't re-find" continue, which skipped the old
+            // once-every-5 checkpoint entirely, leaving the debug file
+            // showing nothing but a start/finish timestamp with zero
+            // detail on what actually happened in between.
+            string outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: (no outcome recorded - this is a bug if you see it)";
             try
             {
                 if (!issue.MetronIssueId.HasValue)
@@ -1101,10 +1132,14 @@ public class AutoFetchService : IAutoFetchService
                     // for) - re-find it by the same series_name+number
                     // search Check Now originally used to match this
                     // issue against Metron in the first place.
-                    var foundId = _metron.FindIssueId(seriesName, issue.IssueNumber, issue.ReleaseDate);
+                    var (foundId, failureReason) = _metron.FindIssueId(seriesName, issue.IssueNumber, issue.ReleaseDate);
                     if (!foundId.HasValue)
                     {
-                        result.Errors.Add($"{seriesName} #{issue.IssueNumber:0.##}: couldn't re-find this issue on Metron by series name/number - skipped.");
+                        outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: couldn't re-find this issue on Metron - {failureReason}";
+                        result.Errors.Add(outcomeLine);
+                        trace.AppendLine(outcomeLine);
+                        onProgress?.Invoke(outcomeLine);
+                        DebugLog.WriteCheckNowLog(trace.ToString());
                         continue;
                     }
                     issue.MetronIssueId = foundId;
@@ -1133,26 +1168,239 @@ public class AutoFetchService : IAutoFetchService
                 tempEntry.MetronIssueId = null;
                 AddMissingCoverVariants(issue, new List<ComicListEntry> { tempEntry }, seriesName, "MTR", result);
 
-                result.Added.Add($"{seriesName} #{issue.IssueNumber:0.##}: re-enriched from Metron ({variantsFound} variant(s) on file there).");
+                outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: re-enriched from Metron ({variantsFound} variant(s) on file there).";
+                result.Added.Add(outcomeLine);
             }
             catch (Exception ex)
             {
-                result.Errors.Add($"{seriesName} #{issue.IssueNumber:0.##}: retry enrichment failed: {ex.Message}");
+                outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: retry enrichment failed: {ex.Message}";
+                result.Errors.Add(outcomeLine);
             }
 
-            if (done % 5 == 0 || done == candidates.Count)
-            {
-                _db.SaveChanges();
-                var line = $"Re-enriched {done}/{candidates.Count} issue(s) from Metron.";
-                trace.AppendLine(line);
-                onProgress?.Invoke(line);
-                DebugLog.WriteCheckNowLog(trace.ToString());
-            }
+            // Every issue's outcome goes to the trace/disk immediately,
+            // not batched every 5 like the old code - the network call
+            // above already takes 3.5s+ (more on a retry), so one extra
+            // file write per issue is free by comparison, and it's what
+            // actually makes the debug file useful instead of silent
+            // until a batch boundary that a run of all-failures never
+            // reaches. SaveChanges stays batched - no reason to hit the
+            // DB that often.
+            trace.AppendLine(outcomeLine);
+            onProgress?.Invoke(outcomeLine);
+            if (done % 5 == 0 || done == candidates.Count) _db.SaveChanges();
+            DebugLog.WriteCheckNowLog(trace.ToString());
         }
 
         _db.SaveChanges();
-        if (trace.Length == 0) trace.AppendLine("No issues needed retrying.");
+        if (done == 0) trace.AppendLine("No issues needed retrying.");
+        trace.AppendLine();
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}.");
         result.Trace = trace.ToString();
+        // Always write once more here, even if the loop above never ran
+        // (zero candidates) or never hit a done%5==0/last-item checkpoint -
+        // otherwise a trivial run (nothing to retry) would leave the debug
+        // file showing a stale trace from whatever ran before it.
+        DebugLog.WriteCheckNowLog(result.Trace);
+        return result;
+    }
+
+    // LOCG counterpart to RetryMetronEnrichment above - same job (go back
+    // and fill in Publisher/UPC/price/description/covers for an issue
+    // that's already on file but still showing a generated placeholder),
+    // sourced from LOCG's weekly list/detail pages instead of Metron's
+    // API. Added 2026-11-23 specifically because Metron itself is
+    // IP/network-blocked right now (see metron-integration-notes.md) -
+    // this is the one enrichment path that doesn't depend on Metron being
+    // reachable at all, so the same backfill can still make progress
+    // while that's sorted out. Matches BOTH "MTR-" and "LOCG-" placeholder
+    // covers (not just Metron's), since a LOCG-added issue can end up
+    // with the same stuck placeholder if its own detail-page enrichment
+    // failed at creation time (BuildCoversFromEntry's try/catch around
+    // ILocgService.EnrichIssueDetails just logs and moves on) - this is a
+    // general "go check LOCG again" pass, not a narrowly Metron-only one.
+    //
+    // There's no stored LOCG-specific id on Issue the way Issue.
+    // MetronIssueId exists for Metron (this path didn't exist until now),
+    // so matching against LOCG's weekly list has to go by series name
+    // (SeriesNameKey.Normalize - the same key every other matcher in this
+    // file already uses) plus issue number instead of a direct id lookup.
+    //
+    // A release week is fetched from LOCG (_locg.GetWeekEntries) at most
+    // ONCE per distinct Monday across the whole run - cached in weekCache
+    // below, success or failure. LOCG's own AJAX endpoint only lets a
+    // request through roughly once every 4-5 minutes (see ILocgService),
+    // so re-fetching the same week once per issue instead of once per
+    // week would turn a batch of same-week candidates into a run taking
+    // hours longer than it needs to, and risks exhausting LocgService's
+    // own retry budget for nothing. A week that throws is cached as a
+    // failure too, so it isn't silently retried for every other candidate
+    // that happens to ship that same week.
+    public AutoFetchResult RetryLocgEnrichment(Action<string>? onProgress = null, int? limit = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Retry LOCG enrichment run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}" + (limit.HasValue ? $" (TEST RUN - capped at {limit} issue(s))" : ""));
+        trace.AppendLine(new string('=', 60));
+
+        var candidates = _db.Issues
+            .Include(i => i.Series)
+            .Include(i => i.Covers)
+            .ToList()
+            .Where(i => i.Covers.Any(c => c.Price == 0 && (c.Barcode.StartsWith("MTR-") || c.Barcode.StartsWith("LOCG-"))))
+            // Most recent release first - see the identical comment on
+            // RetryMetronEnrichment's candidate query above. Confirmed
+            // live 2026-11-23: an unordered Test 5 run picked 5 old
+            // solicitation-catalog/digital-only entries (Marvel Previews,
+            // an IDW title catalog, several "Infinity Comic" exclusives) -
+            // real LOCG data, correctly matched, but none of them
+            // representative single issues and none inside GetNewBooks'
+            // 3-month window, so there was nothing useful to check the
+            // result against.
+            .OrderByDescending(i => i.ReleaseDate)
+            .ToList();
+        if (limit.HasValue) candidates = candidates.Take(limit.Value).ToList();
+
+        onProgress?.Invoke($"Found {candidates.Count} issue(s) still showing placeholder price/barcode to try against LOCG.");
+
+        var weekCache = new Dictionary<DateOnly, (List<ComicListEntry>? Entries, string? Error)>();
+
+        var done = 0;
+        foreach (var issue in candidates)
+        {
+            done++;
+            var seriesName = issue.Series.Name;
+            // Same real-time-write pattern as RetryMetronEnrichment above -
+            // set on every path (success or failure) before this
+            // iteration's trace line gets written, so an all-failures run
+            // still leaves a readable debug file instead of a blank one.
+            string outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: (no outcome recorded - this is a bug if you see it)";
+            try
+            {
+                if (!issue.ReleaseDate.HasValue)
+                {
+                    outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: skipped - no release date on file, can't tell which LOCG week to check.";
+                    result.Errors.Add(outcomeLine);
+                    trace.AppendLine(outcomeLine);
+                    onProgress?.Invoke(outcomeLine);
+                    DebugLog.WriteCheckNowLog(trace.ToString());
+                    continue;
+                }
+
+                var releaseDate = issue.ReleaseDate.Value;
+                // Same Monday-of-week formula RunBackfillYearFromLocg uses
+                // (DayOfWeek: Sunday=0...Saturday=6, Monday=1) - LOCG's
+                // weekly pages are always Monday-to-Monday.
+                var monday = releaseDate.AddDays(-(((int)releaseDate.DayOfWeek + 6) % 7));
+
+                if (!weekCache.TryGetValue(monday, out var week))
+                {
+                    try
+                    {
+                        var entries = _locg.GetWeekEntries(monday);
+                        week = (entries, null);
+                    }
+                    catch (Exception ex)
+                    {
+                        week = (null, ex.Message);
+                    }
+                    weekCache[monday] = week;
+                }
+
+                if (week.Entries == null)
+                {
+                    outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: couldn't fetch LOCG's {monday:MM/dd/yyyy} week - {week.Error}";
+                    result.Errors.Add(outcomeLine);
+                    trace.AppendLine(outcomeLine);
+                    onProgress?.Invoke(outcomeLine);
+                    DebugLog.WriteCheckNowLog(trace.ToString());
+                    continue;
+                }
+
+                var seriesKey = SeriesNameKey.Normalize(seriesName);
+                var matches = week.Entries
+                    .Where(e => !string.IsNullOrWhiteSpace(e.SeriesName)
+                        && SeriesNameKey.Normalize(e.SeriesName!) == seriesKey
+                        && e.IssueNumber.HasValue
+                        && Math.Abs(e.IssueNumber.Value - issue.IssueNumber) < 0.01f)
+                    .ToList();
+
+                if (matches.Count == 0)
+                {
+                    outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: not found in LOCG's {monday:MM/dd/yyyy} week ({week.Entries.Count} entries that week).";
+                    result.Errors.Add(outcomeLine);
+                    trace.AppendLine(outcomeLine);
+                    onProgress?.Invoke(outcomeLine);
+                    DebugLog.WriteCheckNowLog(trace.ToString());
+                    continue;
+                }
+
+                // The Cover A entry when LOCG has one, otherwise just
+                // whichever matched first - this is the one whose detail
+                // page gets fetched for a real UPC (the weekly LIST page
+                // never carries one - see ILocgService.EnrichIssueDetails)
+                // and whose Publisher/Price/Description backfill the
+                // issue/stale-cover's own fields below.
+                var primary = matches.FirstOrDefault(e => string.Equals(e.CoverLetter, "A", StringComparison.OrdinalIgnoreCase)) ?? matches[0];
+
+                if (!string.IsNullOrWhiteSpace(primary.DetailUrl))
+                {
+                    try { _locg.EnrichIssueDetails(primary); }
+                    catch (Exception ex)
+                    {
+                        result.Errors.Add($"{seriesName} #{issue.IssueNumber:0.##}: LOCG detail page enrichment failed: {ex.Message}");
+                    }
+                }
+
+                var staleCover = issue.Covers.FirstOrDefault(c => c.Price == 0 && (c.Barcode.StartsWith("MTR-") || c.Barcode.StartsWith("LOCG-")));
+                if (staleCover != null)
+                {
+                    if (!string.IsNullOrWhiteSpace(primary.Upc)) staleCover.Barcode = primary.Upc!;
+                    if (primary.Price.HasValue) staleCover.Price = primary.Price.Value;
+                    if (!string.IsNullOrWhiteSpace(primary.Description)) staleCover.Description = primary.Description;
+                }
+                if (!string.IsNullOrWhiteSpace(primary.Publisher) && string.IsNullOrWhiteSpace(issue.Publisher))
+                    issue.Publisher = primary.Publisher;
+
+                // Clear DetailUrl now that primary's own detail page has
+                // already been fetched above - same reason
+                // RetryMetronEnrichment clears tempEntry.MetronIssueId
+                // before its own AddMissingCoverVariants call: without
+                // this, BuildCoversFromEntry (called inside
+                // AddMissingCoverVariants) would pay for a second,
+                // redundant ~30s detail-page fetch for data already in
+                // hand. Any OTHER entry in matches (a variant LOCG listed
+                // that isn't on file yet) keeps its own DetailUrl, so its
+                // own detail page still gets fetched the first time it's
+                // actually turned into a new Cover row - exactly like a
+                // brand-new issue already works.
+                primary.DetailUrl = null;
+                AddMissingCoverVariants(issue, matches, seriesName, "LOCG", result);
+
+                outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: re-enriched from LOCG ({matches.Count} matching entr{(matches.Count == 1 ? "y" : "ies")} that week).";
+                result.Added.Add(outcomeLine);
+            }
+            catch (Exception ex)
+            {
+                outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: retry enrichment failed: {ex.Message}";
+                result.Errors.Add(outcomeLine);
+            }
+
+            trace.AppendLine(outcomeLine);
+            onProgress?.Invoke(outcomeLine);
+            if (done % 5 == 0 || done == candidates.Count) _db.SaveChanges();
+            DebugLog.WriteCheckNowLog(trace.ToString());
+        }
+
+        _db.SaveChanges();
+        if (done == 0) trace.AppendLine("No issues needed retrying.");
+        trace.AppendLine();
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}.");
+        result.Trace = trace.ToString();
+        // Always write once more here, even if the loop above never ran
+        // (zero candidates) or never hit a done%5==0/last-item checkpoint -
+        // otherwise a trivial run (nothing to retry) would leave the debug
+        // file showing a stale trace from whatever ran before it.
+        DebugLog.WriteCheckNowLog(result.Trace);
         return result;
     }
 
