@@ -8,12 +8,32 @@
    runs through the exact same filter-reset logic a page already has for
    clearing the box by hand (resetting any page/selection state tied to
    the search) - no second "clear" method needed on any page that uses
-   this. *@
+   this.
+
+   Debounced by default (2026-11-26, bug report: "if you type fast it
+   will sometimes delete characters you are typing"). Root cause: a
+   page's OnInput handler re-queries the database and rebuilds a whole
+   results table on every single keystroke; that round trip is slow
+   enough that an EARLIER keystroke's render can land back at the
+   browser AFTER a LATER keystroke already changed the box, snapping the
+   box back to the older, shorter text it had at that earlier point -
+   which looks exactly like the box eating characters as you type. The
+   box still echoes every keystroke instantly and exactly (_liveValue,
+   below) - only the expensive part (the page's own OnInput callback) now
+   waits for a short pause in typing, so the heavy rebuild runs once per
+   pause instead of once per keystroke, and no stale render is ever still
+   in flight to race a live one. Checkout's barcode-scan box opts out via
+   DebounceMs="0": its OnInput is a trivial field assignment (no DB
+   query, no big re-render - never actually had this bug), and a real
+   scanner's Enter can follow its last digit within milliseconds, faster
+   than any debounce window - delaying it would read stale/empty text on
+   Enter and break the scan-to-checkout flow. *@
 @namespace ComicPos.Web.Components.Shared
+@implements IDisposable
 
 <div class="search-box-wrap">
-    <input type="text" class="search-box" placeholder="@Placeholder" value="@Value" @oninput="OnInput" @onkeydown="OnKeyDown" />
-    @if (!string.IsNullOrEmpty(Value))
+    <input type="text" class="search-box" placeholder="@Placeholder" value="@_liveValue" @oninput="HandleInput" @onkeydown="OnKeyDown" />
+    @if (!string.IsNullOrEmpty(_liveValue))
     {
         <button type="button" class="search-box-clear" title="Clear" @onclick="Clear">&times;</button>
     }
@@ -29,5 +49,59 @@
     // with nothing subscribed, which is a harmless no-op.
     [Parameter] public EventCallback<KeyboardEventArgs> OnKeyDown { get; set; }
 
-    private Task Clear() => OnInput.InvokeAsync(new ChangeEventArgs { Value = "" });
+    // How long to wait, after the user stops typing, before actually
+    // calling OnInput. 0 disables debouncing entirely (the component's
+    // original, immediate behavior) - see the doc comment above for why
+    // Checkout's barcode box needs that.
+    [Parameter] public int DebounceMs { get; set; } = 300;
+
+    private string _liveValue = "";
+    private CancellationTokenSource? _debounceCts;
+
+    protected override void OnParametersSet()
+    {
+        // Mirrors the parent's own state in on every render that isn't
+        // mid-debounce (first render, page navigation, the parent
+        // clearing the field itself) without fighting the user's live
+        // typing - HandleInput below is what keeps _liveValue current
+        // while a debounce is pending, and this never runs again until
+        // the parent actually hands back a new Value.
+        _liveValue = Value;
+    }
+
+    private async Task HandleInput(ChangeEventArgs e)
+    {
+        _liveValue = e.Value?.ToString() ?? "";
+
+        if (DebounceMs <= 0)
+        {
+            await OnInput.InvokeAsync(new ChangeEventArgs { Value = _liveValue });
+            return;
+        }
+
+        _debounceCts?.Cancel();
+        _debounceCts?.Dispose();
+        var cts = new CancellationTokenSource();
+        _debounceCts = cts;
+
+        try
+        {
+            await Task.Delay(DebounceMs, cts.Token);
+        }
+        catch (TaskCanceledException)
+        {
+            return; // superseded by a later keystroke - that one will run this instead
+        }
+
+        await OnInput.InvokeAsync(new ChangeEventArgs { Value = _liveValue });
+    }
+
+    private Task Clear()
+    {
+        _debounceCts?.Cancel();
+        _liveValue = "";
+        return OnInput.InvokeAsync(new ChangeEventArgs { Value = "" });
+    }
+
+    public void Dispose() => _debounceCts?.Cancel();
 }
