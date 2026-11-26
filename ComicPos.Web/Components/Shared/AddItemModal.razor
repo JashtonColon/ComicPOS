@@ -24,6 +24,51 @@
         }
     </div>
 
+    @* Price/cover/stock moved up here - 2026-11-24, user feedback: this is
+       the part that actually matters for a POS (what does this book cost,
+       what does it look like, how many do we already have), so it belongs
+       at a glance right after the barcode scan, not buried below Series
+       Name/Issue Number/Publisher/creator credits. The cover thumbnail only
+       shows for an item LookUp() found already on file (it has a real
+       Cover.Id to serve via /api/cover-image/{id} - a brand-new item found
+       via the Metron UPC auto-add path has no Cover row yet until it's
+       actually saved, so there's nothing to preview for that case yet). *@
+    <div class="form-row" style="display:flex;gap:16px;align-items:flex-start;background:var(--accent-soft);padding:10px 12px;border-radius:8px">
+        @if (_foundCoverId != null)
+        {
+            <img src="/api/cover-image/@_foundCoverId" class="cover-thumb-detail" style="flex-shrink:0"
+                 onerror="this.onerror=null;this.src='/img/no-cover.svg';" />
+        }
+        <div style="flex:1;display:flex;gap:16px;flex-wrap:wrap">
+            <div class="form-row" style="margin:0">
+                <label>Price:*</label>
+                <input type="text" style="width:90px" value="@_price" @oninput="e => _price = e.Value?.ToString() ?? string.Empty" />
+            </div>
+            <div class="form-row" style="margin:0">
+                <label>@(_foundCoverId != null ? "Stock in system:*" : "Starting Stock:*")</label>
+                <input type="text" style="width:90px" value="@_stock" @oninput="e => _stock = e.Value?.ToString() ?? string.Empty" />
+            </div>
+            <div class="form-row" style="margin:0">
+                <label>Cover Letter:</label>
+                <input type="text" maxlength="1" style="width:60px" value="@_coverLetter" @oninput='e => _coverLetter = e.Value?.ToString() ?? "A"' />
+            </div>
+        </div>
+    </div>
+
+    @* Added 2026-11-24, user feedback: didn't want to scroll past Series
+       Name/Issue #/credits/dates just to hit Save for the common case
+       (scan a barcode, confirm price/stock, done). Fires the exact same
+       Save() the bottom button does - this is a second way to reach it,
+       not a replacement; the bottom one still makes sense once someone's
+       scrolled down to actually fill in writer/artist credits etc. *@
+    <div class="form-row" style="display:flex;justify-content:flex-end;align-items:center;gap:10px">
+        @if (!string.IsNullOrEmpty(_error))
+        {
+            <span class="error-text" style="margin:0">@_error</span>
+        }
+        <button class="btn-primary" @onclick="Save">Save Item</button>
+    </div>
+
     <div class="form-row-split">
         <div class="form-row">
             <label>Series Name:*</label>
@@ -86,21 +131,6 @@
         <div class="form-row">
             <label>Letterer:</label>
             <input type="text" value="@_letterer" @oninput="e => _letterer = e.Value?.ToString() ?? string.Empty" />
-        </div>
-    </div>
-
-    <div class="form-row-split">
-        <div class="form-row">
-            <label>Cover Letter:</label>
-            <input type="text" maxlength="1" value="@_coverLetter" @oninput='e => _coverLetter = e.Value?.ToString() ?? "A"' />
-        </div>
-        <div class="form-row">
-            <label>Price:*</label>
-            <input type="text" value="@_price" @oninput="e => _price = e.Value?.ToString() ?? string.Empty" />
-        </div>
-        <div class="form-row">
-            <label>Starting Stock:*</label>
-            <input type="text" value="@_stock" @oninput="e => _stock = e.Value?.ToString() ?? string.Empty" />
         </div>
     </div>
 
@@ -171,6 +201,12 @@
     private string? _lookedUpCoverImagePath;
     private string? _error;
 
+    // Id of the Cover row LookUp() just found, so the new price/cover/stock
+    // summary panel can show its real cover art via /api/cover-image/{id}.
+    // Null for a brand-new item (nothing saved yet to have an id) - the
+    // Metron UPC auto-add path never sets this before TrySaveItem runs.
+    private int? _foundCoverId;
+
     protected override void OnParametersSet()
     {
         if (Show && !_wasShown)
@@ -180,6 +216,7 @@
             _price = "0.00"; _stock = "0"; _description = ""; _hasFoc = false; _focDate = ""; _hasRelease = false; _releaseDate = "";
             _author = ""; _penciler = ""; _inker = ""; _colorist = ""; _letterer = "";
             _missingFields = new(); _onlineLookupStatus = null; _lookedUpCoverImagePath = null;
+            _foundCoverId = null;
             _error = null;
         }
         _wasShown = Show;
@@ -196,6 +233,7 @@
         _missingFields = new();
         _onlineLookupStatus = null;
         _lookedUpCoverImagePath = null;
+        _foundCoverId = null;
 
         var trimmedBarcode = _barcode.Trim();
         var cover = Inventory.FindByBarcode(trimmedBarcode);
@@ -205,6 +243,7 @@
             return;
         }
 
+        _foundCoverId = cover.Id;
         var issue = cover.Issue;
         var series = issue.Series;
         _seriesName = series.Name;
@@ -229,14 +268,15 @@
 
         // "verify that everything is there" - flag what's missing on an
         // item that's already in the system, rather than silently letting
-        // a restock go through with gaps nobody noticed.
+        // a restock go through with gaps nobody noticed. Used to also flag
+        // Writer/Penciler/Inker/Colorist/Letterer here - dropped 2026-11-24
+        // per user feedback: creator credits don't affect anything this POS
+        // actually does (no screen filters, prices, or reports by them), so
+        // nagging about them on every single restock scan was just noise.
+        // Cover image and Publisher stay - both are genuinely used (visual
+        // ID at checkout, FOC/buy-report grouping).
         if (string.IsNullOrWhiteSpace(cover.CoverImagePath)) _missingFields.Add("Cover image");
         if (string.IsNullOrWhiteSpace(issue.Publisher)) _missingFields.Add("Publisher");
-        if (string.IsNullOrWhiteSpace(issue.Author)) _missingFields.Add("Writer");
-        if (string.IsNullOrWhiteSpace(issue.Penciler)) _missingFields.Add("Penciler");
-        if (string.IsNullOrWhiteSpace(issue.Inker)) _missingFields.Add("Inker");
-        if (string.IsNullOrWhiteSpace(issue.Colorist)) _missingFields.Add("Colorist");
-        if (string.IsNullOrWhiteSpace(issue.Letterer)) _missingFields.Add("Letterer");
     }
 
     // "if the book is not already in the system we look up and try to find
