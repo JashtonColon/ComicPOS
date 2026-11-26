@@ -169,6 +169,33 @@ input, select, textarea {
 
 .btn-ghost:hover { background: #fff; border-color: var(--accent); color: var(--accent); }
 
+/* Fix (2026-11-24): the sidebar's "Switch" button (inside the worker chip)
+   is the one place a .btn-ghost sits on the DARK sidebar instead of the
+   light main content area. .btn-ghost's colors (var(--text) - near-black -
+   on a near-transparent border) are made for a light background and are
+   effectively invisible against the sidebar's near-black background until
+   :hover flips the whole button to a white fill, which is exactly what
+   looked like "blacked out unless hovering." Scoped override here instead
+   of changing .btn-ghost itself, which is correct everywhere else it's
+   used (every other .btn-ghost in the app sits on the light main panel). */
+.pos-worker-chip .btn-ghost {
+    color: var(--sidebar-text);
+    border-color: rgba(255, 255, 255, 0.18);
+}
+
+.pos-worker-chip .btn-ghost:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: #fff;
+    border-color: var(--accent);
+}
+
+/* Opt-in per button (Checkout's cart Remove button, History's Void Sale
+   buttons - see each razor file), not every .btn-ghost in the app - a
+   plain black border makes a destructive action stand out from the rest
+   of its row/modal without restyling every other ghost button site-wide. */
+.btn-remove { border-color: #000; }
+.btn-remove:hover { border-color: #000; }
+
 .btn-primary {
     background: var(--accent);
     border: none;
@@ -265,7 +292,11 @@ input, select, textarea {
 }
 
 .pos-table td {
-    padding: 13px 10px;
+    /* Was 13px top/bottom - tightened 2026-11-24 (user feedback: rows
+       felt too spread out app-wide). Still comfortably clickable/
+       readable at this app's 17px base font size, just less empty space
+       between rows on a long list. */
+    padding: 8px 10px;
     border-bottom: 1px solid var(--border);
 }
 
@@ -481,7 +512,9 @@ input, select, textarea {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 12px 14px;
+    /* Was 12px top/bottom - tightened 2026-11-24 alongside .pos-table td,
+       same "rows feel too spread out" feedback. */
+    padding: 8px 14px;
     background: var(--panel-bg);
     border: 1px solid var(--border);
     border-radius: 10px;
@@ -641,8 +674,25 @@ input, select, textarea {
 }
 
 .zoom-overlay img {
-    max-width: min(90vw, 700px);
-    max-height: 90vh;
+    /* Bug #87 fix (2026-11-24): raising the cap above (flat 700px, then
+       min(92vw, 1200px)) never actually made the zoomed cover look
+       bigger, because max-width/max-height on a plain <img> only ever
+       SHRINK it down to fit - they never scale it UP past its own
+       natural pixel size. Most cover scans on file here are a few
+       hundred pixels wide at most (a distributor thumbnail, not a
+       print-resolution scan), so the image kept rendering at its small
+       natural size no matter how high the cap went - confirmed live, a
+       zoomed cover still looked barely bigger than the detail modal's
+       own 160x240 thumbnail even after the 1200px cap went in.
+       Real fix: explicit width/height (not max-width/max-height) DO
+       force a browser to scale an <img> up past its natural size, and
+       object-fit: contain keeps the whole cover visible without
+       cropping/stretching inside that box regardless of its real aspect
+       ratio - still capped at the same viewport percentages as before
+       so it never overflows a small screen. */
+    width: min(92vw, 1200px);
+    height: min(92vh, 1200px);
+    object-fit: contain;
     border-radius: 10px;
     box-shadow: 0 20px 60px rgba(0,0,0,0.5);
 }
@@ -731,3 +781,168 @@ input, select, textarea {
 
 .totals-row { display: flex; justify-content: space-between; padding: 8px 0; font-size: 16px; }
 .totals-row.grand { font-weight: 700; font-size: 19px; border-top: 1px solid var(--border); margin-top: 4px; padding-top: 10px; }
+
+/* ---- Scrollbars (2026-11-24, user asked for something "cooler" than
+   the OS default everywhere something scrolls: the page itself, a
+   modal, the log-trace box, any overflowing list). Firefox gets the
+   standards-based scrollbar-width/scrollbar-color pair; everything
+   Chromium/WebKit-based (the desktop app this mostly runs in included)
+   only understands the ::-webkit-scrollbar family instead - neither one
+   alone covers every browser, so both are set. ---- */
+* {
+    scrollbar-width: thin;
+    scrollbar-color: var(--accent) transparent;
+}
+
+*::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+    background-color: var(--accent);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+    background-color: #3b5bd9;
+}
+
+/* Follow-up (2026-11-24): the thumb/track rules above weren't the whole
+   scrollbar - Chrome/Edge on Windows still drew its own default up/down
+   arrow buttons at each end (an opaque light-gray box with a triangle
+   icon) UNLESS ::-webkit-scrollbar-button is explicitly hidden, and a
+   default ::-webkit-scrollbar-corner (the little square where a vertical
+   and horizontal scrollbar meet) left its own default light box behind
+   too - reported live as "the white box outline the bar usually has" and
+   "get rid of the arrows." Neither has a transparent/none default; both
+   have to be zeroed out explicitly. */
+*::-webkit-scrollbar-button {
+    display: none;
+    width: 0;
+    height: 0;
+}
+
+*::-webkit-scrollbar-corner {
+    background: transparent;
+}
+
+/* ---- Register lock overlay (worker PIN + 1-minute inactivity lockout,
+   2026-11-24) - MainLayout swaps @Body for this on a gated page rather
+   than layering a modal backdrop on top of it, so it just needs to fill
+   the main content area, not the whole viewport. ---- */
+.pos-gate {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 60vh;
+    padding: 20px;
+}
+
+.pos-gate-card {
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.12);
+    width: 380px;
+    max-width: 100%;
+    padding: 28px 26px;
+}
+
+.pos-gate-heading {
+    font-size: 19px;
+    font-weight: 700;
+    margin-bottom: 6px;
+}
+
+/* ---- Clearable search box (the "X" to clear - 2026-11-24) ---- */
+.search-box-wrap {
+    position: relative;
+    width: 100%;
+    max-width: 420px;
+    margin-bottom: 16px;
+}
+
+.search-box-wrap .search-box {
+    max-width: 100%;
+    margin-bottom: 0;
+    /* Room for the X button below so typed text never runs under it. */
+    padding-right: 30px;
+}
+
+.search-box-clear {
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 16px;
+    line-height: 1;
+    padding: 4px 6px;
+    border-radius: 999px;
+}
+
+.search-box-clear:hover { color: var(--text); background: var(--accent-soft); }
+
+/* Task #95 (2026-11-24): "cool" alternate Dashboard view - a pure
+   cover-art wall, toggled in from Dashboard.razor. Deliberately distinct
+   from the stat-card/panel look (no numbers here at all): a responsive
+   grid of comic-proportioned cover tiles with a subtle lift + accent
+   glow on hover, instead of a bordered data table. */
+.cover-wall-section { margin-bottom: 28px; }
+
+.cover-wall-section h2 {
+    margin: 0 0 14px;
+    font-size: 16px;
+}
+
+.cover-wall {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 16px;
+}
+
+.cover-wall-card {
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+.cover-wall-card:hover {
+    transform: translateY(-4px);
+    border-color: var(--accent);
+    box-shadow: 0 10px 24px rgba(76, 110, 245, 0.25);
+}
+
+.cover-wall-img {
+    width: 100%;
+    aspect-ratio: 2 / 3;
+    object-fit: cover;
+    display: block;
+    background: var(--bg);
+}
+
+.cover-wall-caption {
+    padding: 8px 10px 2px;
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.cover-wall-date {
+    padding: 0 10px 10px;
+    font-size: 12px;
+    color: var(--text-muted);
+}
