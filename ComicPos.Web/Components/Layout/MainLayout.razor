@@ -3,6 +3,7 @@
 @using ComicPos.Web.Services
 @inject NavigationManager Nav
 @inject CurrentWorkerContext CurrentWorker
+@inject IJSRuntime JS
 @implements IDisposable
 
 <div class="pos-shell">
@@ -21,13 +22,22 @@
             <div class="pos-nav-heading">Stock</div>
             <a href="import" class="pos-nav-item @ActiveClass("import")" @onclick="@(() => GoTo("import"))" @onclick:preventDefault>Import</a>
             <a href="new-books" class="pos-nav-item @ActiveClass("new-books")" @onclick="@(() => GoTo("new-books"))" @onclick:preventDefault>New Books</a>
+            <a href="series-browse" class="pos-nav-item @ActiveClass("series-browse")" @onclick="@(() => GoTo("series-browse"))" @onclick:preventDefault>Series Browse</a>
             <a href="foc-report" class="pos-nav-item @ActiveClass("foc-report")" @onclick="@(() => GoTo("foc-report"))" @onclick:preventDefault>FOC Report</a>
         </div>
 
         <div class="pos-nav-group pos-nav-group-bottom">
             <div class="pos-worker-chip" @onclick="OpenWorkerLogin">
                 <div class="pos-worker-chip-label">Working as</div>
-                <div class="pos-worker-chip-name">@(CurrentWorker.Current?.Name ?? "Not set")</div>
+                @* Bug fix (2026-11-24): this used to show CurrentWorker.Current?.Name
+                   even after the 1-minute inactivity lockout kicked in - Current is
+                   deliberately left set (not nulled) on lockout, so WorkerGateOverlay's
+                   re-login flow can still know who was last working, but that meant
+                   this chip kept showing the last worker's name here in the sidebar
+                   (visible even while the gate overlay covers the gated page body)
+                   as if they were still actively logged in. Now shows "Not set" the
+                   same as a real logout whenever IsLocked is true. *@
+                <div class="pos-worker-chip-name">@((CurrentWorker.Current != null && !CurrentWorker.IsLocked) ? CurrentWorker.Current.Name : "Not set")</div>
                 <button class="btn-ghost btn-sm" style="width:100%;margin-top:6px" @onclick="OpenWorkerLogin" @onclick:stopPropagation>Switch</button>
             </div>
             <a href="settings" class="pos-nav-item @ActiveClass("settings")" @onclick="@(() => GoTo("settings"))" @onclick:preventDefault>Settings</a>
@@ -35,7 +45,14 @@
     </nav>
 
     <main class="pos-main">
-        @Body
+        @if (ShowGate)
+        {
+            <WorkerGateOverlay />
+        }
+        else
+        {
+            @Body
+        }
     </main>
 </div>
 
@@ -43,6 +60,51 @@
 
 @code {
     private bool _showWorkerLogin;
+    private DotNetObjectReference<MainLayout>? _activitySelfRef;
+
+    // Gated routes need SOME worker logged in and not auto-locked from
+    // inactivity (see CurrentWorkerContext's own doc comment for the
+    // full story). New Books and Import are deliberately left OUT - New
+    // Books per the store's own framing ("nothing can really happen
+    // here"), Import because it's a setup/maintenance screen. Series
+    // Browse (added 2026-11-24, Task #82) is the same framing as New
+    // Books - a read-only browse of the same catalog data, no edits or
+    // destructive actions possible from it - so it stays out too.
+    //
+    // Settings was ALSO left out originally (reasoning at the time: it's
+    // where workers/PINs themselves get added, so a worker would need to
+    // reach it before ever logging in) - but that left Settings reachable
+    // by anyone at any time with no login at all, which defeats the
+    // whole point of the gate (2026-11-24 report: "settings are still
+    // accesable by anyen even when not logged in"). Settings is gated
+    // now too. The chicken-and-egg concern doesn't actually apply once a
+    // store has ANY worker already set up (which this store does) - the
+    // only edge case left is a brand-new install with zero workers ever
+    // added, which would need its very first worker added before Settings
+    // gates it; not a concern for an already-running store.
+    //
+    // Dashboard ("" - the home route) was UN-gated 2026-11-24 per explicit
+    // request - it's a read-only landing page (stats view or the cover-art
+    // Cool View, see Dashboard.razor) with no transactional actions
+    // possible from it, so there's no reason it needs a worker logged in
+    // before it can even be looked at.
+    private static readonly HashSet<string> GatedRoutes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "checkout", "history", "customers", "inventory", "foc-report", "settings"
+    };
+
+    private bool ShowGate => GatedRoutes.Contains(CurrentRelativePath())
+        && (CurrentWorker.Current == null || CurrentWorker.IsLocked);
+
+    private string CurrentRelativePath()
+    {
+        var relative = Nav.Uri.StartsWith(Nav.BaseUri, StringComparison.OrdinalIgnoreCase)
+            ? Nav.Uri[Nav.BaseUri.Length..]
+            : Nav.Uri;
+        var qIndex = relative.IndexOf('?');
+        if (qIndex >= 0) relative = relative[..qIndex];
+        return relative.TrimEnd('/');
+    }
 
     protected override void OnInitialized()
     {
@@ -53,9 +115,28 @@
         // instead (see GoTo's comment for why NavLink itself can't be used
         // with @onclick:preventDefault), that re-render has to be done by
         // hand: re-render this layout whenever the URL changes so
-        // ActiveClass() gets re-evaluated with the new current page.
+        // ActiveClass() (and now ShowGate, which also depends on the
+        // current route) gets re-evaluated against the new current page.
         Nav.LocationChanged += OnLocationChanged;
     }
+
+    // Wires up wwwroot/js/site.js's tiny activity watcher (worker PIN +
+    // 1-minute inactivity lockout, 2026-11-24) - it calls NotifyActivity
+    // below (throttled client-side to at most once per 4s) on any
+    // mousemove/click/keydown/scroll/touch, which CurrentWorkerContext's
+    // own background timer uses to decide when a gated page should lock.
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            _activitySelfRef = DotNetObjectReference.Create(this);
+            try { await JS.InvokeVoidAsync("comicPosActivityWatch.start", _activitySelfRef); }
+            catch { /* best effort - worst case the register just never auto-locks */ }
+        }
+    }
+
+    [JSInvokable]
+    public void NotifyActivity() => CurrentWorker.NotifyActivity();
 
     private void OnWorkerChanged() => InvokeAsync(StateHasChanged);
 
@@ -69,6 +150,7 @@
     {
         CurrentWorker.Changed -= OnWorkerChanged;
         Nav.LocationChanged -= OnLocationChanged;
+        _activitySelfRef?.Dispose();
     }
 
     private string ActiveClass(string relativeHref) => IsSamePage(relativeHref) ? "active" : "";
