@@ -45,6 +45,14 @@ public class ComicListEntry
     // instead of needing AutoFetchService's later Comic Vine backfill pass.
     public string? CoverImageUrl { get; set; }
 
+    // An already-on-disk cover image file - only ever set by
+    // AutoFetchService.ImportLunarDistributionRelease, since that source
+    // extracts a real cover photo straight out of the workbook itself
+    // (no URL at all, nothing to download). Checked BEFORE CoverImageUrl
+    // in BuildCoversFromEntry - see that method - so this never pays for
+    // a pointless network round-trip for an image that's already saved.
+    public string? CoverImageLocalPath { get; set; }
+
     // The publisher's own solicit blurb - what shows up in the New Books
     // detail popup as the issue's description. comicade.com is the only
     // source that has this text at all.
@@ -125,6 +133,20 @@ public class ComicListEntry
     // re-scrape already added" instead of a bare UPC (LOCG variants
     // essentially never have one).
     public string? VariantLabel { get; set; }
+
+    // When set, overrides AddEntriesAsIssues' own name-pattern guess
+    // (StripCollectedEditionSuffix) for whether this becomes
+    // IssueType.SingleIssue or IssueType.CollectedEdition - only ever
+    // set by AutoFetchService.ImportPrhCatalogRelease, since PRH's own
+    // feed gives the real format (CB/TR/HC/NT/DG) directly on every row
+    // rather than needing it guessed from the title text, which PRH's
+    // own naming is inconsistent about carrying a recognizable
+    // "Omnibus"/"Vol. N"/"TP"/"HC" marker for at all (confirmed live:
+    // "Amazing Spider-Man: Power And Responsibility [Marvel Brick 1]" is
+    // a trade paperback with none of those words anywhere in it). Null
+    // for every other source, which keeps using the existing name-based
+    // guess exactly as before.
+    public IssueType? TypeHint { get; set; }
 }
 
 // One Metron-listed variant cover for an issue - see ComicListEntry.
