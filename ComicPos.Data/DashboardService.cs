@@ -85,4 +85,42 @@ public class DashboardService : IDashboardService
             })
             .ToList();
     }
+
+    public List<CoverArtEntry> GetRecentCoverArt(int count)
+    {
+        return _db.Covers
+            .Include(c => c.Issue).ThenInclude(i => i.Series)
+            .Where(c => c.CoverImagePath != null && c.CoverImagePath != "")
+            .OrderByDescending(c => c.Id)
+            .Take(count)
+            .ToList()
+            .Select(c => new CoverArtEntry
+            {
+                CoverId = c.Id,
+                SeriesName = c.Issue.Series.Name,
+                IssueNumber = c.Issue.IssueNumber,
+                CoverLetter = c.CoverLetter
+            })
+            .ToList();
+    }
+
+    public List<UpcomingReleaseEntry> GetUpcomingReleases(int count)
+    {
+        var today = DateOnly.FromDateTime(DateTime.Today);
+
+        return _db.Covers
+            .Include(c => c.Issue).ThenInclude(i => i.Series)
+            .Where(c => c.CoverLetter == "A" && c.Issue.ReleaseDate != null && c.Issue.ReleaseDate >= today)
+            .OrderBy(c => c.Issue.ReleaseDate)
+            .Take(count)
+            .ToList()
+            .Select(c => new UpcomingReleaseEntry
+            {
+                CoverId = c.Id,
+                SeriesName = c.Issue.Series.Name,
+                IssueNumber = c.Issue.IssueNumber,
+                ReleaseDate = c.Issue.ReleaseDate
+            })
+            .ToList();
+    }
 }
