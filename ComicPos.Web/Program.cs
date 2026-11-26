@@ -52,6 +52,8 @@ builder.Services.AddSingleton<IGcdService, GcdService>();
 builder.Services.AddSingleton<IMetronService, MetronService>();
 builder.Services.AddSingleton<ILocgService, LocgService>();
 builder.Services.AddScoped<ComicPos.Web.Services.CurrentWorkerContext>();
+builder.Services.AddScoped<ComicPos.Web.Services.CurrentSaleContext>();
+builder.Services.AddScoped<ComicPos.Web.Services.NewBooksStatusContext>();
 
 // Web equivalent of MainForm's hourly maintenance timer - see
 // BackgroundJobsService's own header comment for why this runs in its own
@@ -125,8 +127,24 @@ app.UseAntiforgery();
 // Cover art lives on disk as plain files (Cover.CoverImagePath), same as
 // the desktop app reads them - this just streams that same file back as
 // an http response so a plain <img src="..."> tag in a Razor page can
-// show it. No caching headers yet; covers don't change often, but this
-// is the simple version first.
+// show it.
+//
+// Fix (2026-11-24): this had NO caching headers at all - every single
+// <img> tag re-downloaded the full image bytes from scratch on every
+// page load, with no way for the browser to know it already had an
+// up-to-date copy. Harmless when Dashboard only ever showed a handful of
+// thumbnails, but Dashboard is now the ungated default landing page and
+// its new Cool View alone renders up to ~24 cover images on every visit
+// (see GetRecentCoverArt/GetUpcomingReleases) - this is what made
+// navigating to Dashboard feel laggy. Passing `lastModified` here lets
+// ASP.NET Core's built-in conditional-GET handling do the rest: the
+// browser sends `If-Modified-Since` on a repeat request and gets a tiny
+// 304 (no body) back instead of the full image again, with ZERO risk of
+// ever serving a stale image after a real change - a cover's real file
+// write time changes any time its CoverImagePath is replaced (a fresh
+// Re-scan, a manual upload in Inventory, etc.), which invalidates this
+// automatically. No query-string cache-busting needed here the way
+// Inventory.razor's own <img> tags use one.
 app.MapGet("/api/cover-image/{coverId:int}", async (int coverId, ComicDbContext db) =>
 {
     var cover = await db.Covers.FindAsync(coverId);
@@ -135,7 +153,8 @@ app.MapGet("/api/cover-image/{coverId:int}", async (int coverId, ComicDbContext 
 
     var bytes = await File.ReadAllBytesAsync(cover.CoverImagePath);
     var contentType = cover.CoverImagePath.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ? "image/png" : "image/jpeg";
-    return Results.File(bytes, contentType);
+    var lastModified = File.GetLastWriteTimeUtc(cover.CoverImagePath);
+    return Results.File(bytes, contentType, lastModified: lastModified, enableRangeProcessing: true);
 });
 
 // Same idea as the cover-image endpoint above, but for
