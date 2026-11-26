@@ -25,7 +25,7 @@
 @if (_screen == Screen.List)
 {
     <div class="toolbar">
-        <input type="text" class="search-box" placeholder="Search customers..." value="@_search" @oninput="OnSearchInput" />
+        <ClearableSearchBox Value="@_search" Placeholder="Search customers..." OnInput="OnSearchInput" />
         <button class="btn-primary" @onclick="@(() => _showAddCustomer = true)">+ Add Customer</button>
     </div>
 
@@ -137,7 +137,7 @@ else if (_screen == Screen.Edit && _selectedCustomer != null)
 else if (_screen == Screen.HistorySeries)
 {
     <div class="toolbar">
-        <input type="text" class="search-box" placeholder="Search series..." value="@_historySearch" @oninput="OnHistorySearchInput" />
+        <ClearableSearchBox Value="@_historySearch" Placeholder="Search series..." OnInput="OnHistorySearchInput" />
     </div>
     @if (_historySeriesNames.Count == 0)
     {
@@ -240,7 +240,7 @@ else if (_screen == Screen.PullList && _selectedCustomer != null)
 
     <div class="panel" style="margin-top:16px">
         <p class="list-row-title">Add a series</p>
-        <input type="text" class="search-box" placeholder="Search a series to add..." value="@_pullSearch" @oninput="OnPullSearchInput" />
+        <ClearableSearchBox Value="@_pullSearch" Placeholder="Search a series to add..." OnInput="OnPullSearchInput" />
         @if (_pullSeriesResults.Count > 0)
         {
             <div class="list-rows" style="margin-top:8px">
