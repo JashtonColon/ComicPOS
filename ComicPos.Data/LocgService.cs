@@ -315,11 +315,40 @@ public class LocgService : ILocgService, IDisposable
     // this is checked every time rather than only once at startup.
     private async Task NavigateAndWaitForCloudflareAsync(string url)
     {
-        await _page!.GotoAsync(url, new PageGotoOptions
+        // Confirmed live 2026-11-23: GotoAsync can throw "Navigation to X
+        // is interrupted by another navigation to Y" - Y being either the
+        // same URL (Cloudflare's challenge reloading the page once it
+        // passes) or the PREVIOUS call's URL (a reload from the last page
+        // still in flight when this one started). Neither is a real
+        // failure: let whatever navigation won settle, then go again if
+        // the page didn't end up where it was meant to.
+        const int maxNavAttempts = 4;
+        for (var navAttempt = 1; ; navAttempt++)
         {
-            WaitUntil = WaitUntilState.DOMContentLoaded,
-            Timeout = 60000
-        });
+            try
+            {
+                await _page!.GotoAsync(url, new PageGotoOptions
+                {
+                    WaitUntil = WaitUntilState.DOMContentLoaded,
+                    Timeout = 60000
+                });
+                break;
+            }
+            catch (PlaywrightException ex) when (
+                ex.Message.Contains("interrupted by another navigation", StringComparison.OrdinalIgnoreCase) &&
+                navAttempt < maxNavAttempts)
+            {
+                try
+                {
+                    await _page!.WaitForLoadStateAsync(LoadState.DOMContentLoaded,
+                        new PageWaitForLoadStateOptions { Timeout = 30000 });
+                }
+                catch (PlaywrightException) { /* still settling - the next GotoAsync handles it */ }
+
+                if (UrlsMatch(_page!.Url, url)) break;
+                await Task.Delay(TimeSpan.FromSeconds(3));
+            }
+        }
 
         // Cloudflare's own interstitial replaces the page's <title> while
         // its challenge is running ("Just a moment...", "Checking your
@@ -339,7 +368,20 @@ public class LocgService : ILocgService, IDisposable
             }
             await Task.Delay(1000);
         }
+
+        // A challenge that just cleared reloads the page itself - wait
+        // that reload out here, so it can't land in the middle of the
+        // NEXT call's navigation or in-page fetch().
+        try
+        {
+            await _page.WaitForLoadStateAsync(LoadState.DOMContentLoaded,
+                new PageWaitForLoadStateOptions { Timeout = 30000 });
+        }
+        catch (PlaywrightException) { /* best-effort settle only */ }
     }
+
+    private static bool UrlsMatch(string actual, string expected) =>
+        string.Equals(actual.TrimEnd('/'), expected.TrimEnd('/'), StringComparison.OrdinalIgnoreCase);
 
     // facets[]=variant_types:0 through :8 and per_page=50000 were both
     // copied verbatim from a real request the site's own UI made (the
