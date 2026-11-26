@@ -14,6 +14,15 @@ public class AutoFetchResult
     // result popup.
     public int CoversBackfilled;
 
+    // New Cover rows created by BackfillCoverVariantsFromPrhBookPages for a
+    // sibling cover-letter variant that had nothing on file at all before
+    // (as opposed to CoversBackfilled above, which also covers upgrading
+    // an EXISTING cover's placeholder/derived barcode to a real one that
+    // method discovers - see its own doc comment). Kept separate so the
+    // result popup can say "found N new cover(s), upgraded M barcode(s)"
+    // instead of one undifferentiated number.
+    public int CoverVariantsAdded;
+
     public List<string> Added { get; } = new();
     public List<string> Errors { get; } = new();
 
@@ -371,4 +380,37 @@ public interface IAutoFetchService
     // RetryMetronEnrichment/UpgradeLowResolutionCovers above. Never run
     // automatically.
     AutoFetchResult BackfillCoversFromPrhImageCdn(Action<string>? onProgress = null, int? limit = null);
+
+    // Added 2026-11-26, same day - a DIFFERENT PRH mechanism from
+    // BackfillCoversFromPrhImageCdn above, found after the store pointed
+    // out a real-world miss (Amazing Spider-Man #35 showing only "Cover A"
+    // in the app despite genuinely having several variant covers) and then
+    // showed exactly where PRH keeps that data: not the combined "Comics
+    // Retail" feed/PDF this app already imports (confirmed live, by
+    // direct inspection of a real monthly file, that feed only ever lists
+    // ONE row per issue - always "Cover A" - so Bug #16's shared-barcode
+    // logic has nothing to act on from it), but prhcomics.com's own
+    // per-product page. Confirmed live: https://prhcomics.com/book/?isbn=
+    // {anyCoverOfAnIssue'sOwnBarcode} is a plain, public, server-rendered,
+    // cookie-less page (fetch()'d with credentials:'omit' and it still
+    // works) whose "Additional covers" carousel already lists every OTHER
+    // cover of that same issue - each with its own genuinely distinct,
+    // real barcode (not a shared UPC, and not this app's own derived
+    // "{barcode}#{letter}" fallback), a title string in PRH's familiar
+    // "SERIES #N COVER X ARTIST VARIANT" grammar (same one
+    // PrhTitleParser already parses for the catalog importer - reused
+    // as-is here), and a price - confirmed even for a cover with no
+    // final artwork yet (an incentive "Cover D TBD Artist Virgin 1:100
+    // Variant" row already had its real barcode assigned). The store's
+    // own caveat still applies: not every variant PRH eventually
+    // solicits is necessarily listed here yet, and this says nothing
+    // about non-PRH-distributed exclusives (a con-exclusive foil, say) -
+    // it only ever ADDS/upgrades what PRH itself has on file, never
+    // removes anything. See AutoFetchService.
+    // BackfillCoverVariantsFromPrhBookPages's own doc comment for exactly
+    // which issues qualify as candidates and how a real barcode replaces
+    // an existing placeholder/derived one. Same Test-N-button contract as
+    // RetryMetronEnrichment/BackfillCoversFromPrhImageCdn above. Never run
+    // automatically.
+    AutoFetchResult BackfillCoverVariantsFromPrhBookPages(Action<string>? onProgress = null, int? limit = null);
 }
