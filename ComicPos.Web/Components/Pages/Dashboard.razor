@@ -7,89 +7,145 @@
 
 <div class="page-header">
     <h1>Dashboard</h1>
-    <button class="btn-ghost" @onclick="Load">Refresh</button>
-</div>
-
-<div class="stat-row">
-    <div class="stat-card">
-        <div class="stat-label">Today</div>
-        <div class="stat-value">@_today.ToString("C")</div>
-    </div>
-    <div class="stat-card">
-        <div class="stat-label">This Week</div>
-        <div class="stat-value">@_week.ToString("C")</div>
-    </div>
-    <div class="stat-card">
-        <div class="stat-label">This Month</div>
-        <div class="stat-value">@_month.ToString("C")</div>
+    <div class="btn-row">
+        <button class="btn-ghost" @onclick="ToggleView">@(_showCoolView ? "Switch to Stats View" : "Switch to Cool View")</button>
+        <button class="btn-ghost" @onclick="Load">Refresh</button>
     </div>
 </div>
 
-<div class="panel-row">
-    <section class="panel">
-        <h2>Top Sellers <span class="panel-sub">last 30 days</span></h2>
-        <table class="pos-table">
-            <thead><tr><th>Series</th><th>Units Sold</th></tr></thead>
-            <tbody>
-                @foreach (var entry in _topSellers)
+@* Task #95 (2026-11-24): "an alternate cool-looking Dashboard view that
+   doesn't show sales figures/stats" - a pure cover-art wall instead of
+   the stat-row/panel-row view below. Same page/route, toggled with the
+   button above rather than a separate nav item, since this is a second
+   VIEW of the Dashboard, not a second page. *@
+@if (_showCoolView)
+{
+    <div class="cover-wall-section">
+        <h2>Recently Added</h2>
+        @if (_recentCoverArt.Count == 0)
+        {
+            <p class="empty-state">No cover art on file yet.</p>
+        }
+        else
+        {
+            <div class="cover-wall">
+                @foreach (var c in _recentCoverArt)
                 {
-                    <tr>
-                        <td>@entry.SeriesName</td>
-                        <td>@entry.QuantitySold</td>
-                    </tr>
+                    <div class="cover-wall-card">
+                        <img class="cover-wall-img" src="/api/cover-image/@c.CoverId" alt="cover"
+                             onerror="this.onerror=null;this.src='/img/no-cover.svg';" />
+                        <div class="cover-wall-caption">@c.SeriesName #@c.IssueNumber.ToString("0.##")</div>
+                    </div>
                 }
-                @if (_topSellers.Count == 0)
-                {
-                    <tr><td colspan="2" class="pos-table-empty">No sales in this window yet.</td></tr>
-                }
-            </tbody>
-        </table>
-    </section>
+            </div>
+        }
+    </div>
 
-    <section class="panel">
-        <h2>Low Stock <span class="panel-sub">2 or fewer</span></h2>
-        <table class="pos-table">
-            <thead><tr><th>Series</th><th>Issue #</th><th>Cover</th><th>Stock</th></tr></thead>
-            <tbody>
-                @foreach (var entry in _lowStock)
+    <div class="cover-wall-section">
+        <h2>Coming Soon</h2>
+        @if (_upcomingReleases.Count == 0)
+        {
+            <p class="empty-state">Nothing solicited yet.</p>
+        }
+        else
+        {
+            <div class="cover-wall">
+                @foreach (var u in _upcomingReleases)
                 {
-                    <tr>
-                        <td>@entry.SeriesName (@entry.StartYear)</td>
-                        <td>@entry.IssueNumber.ToString("0.##")</td>
-                        <td>@entry.CoverLetter</td>
-                        <td>@entry.StockQuantity</td>
-                    </tr>
+                    <div class="cover-wall-card">
+                        <img class="cover-wall-img" src="/api/cover-image/@u.CoverId" alt="cover"
+                             onerror="this.onerror=null;this.src='/img/no-cover.svg';" />
+                        <div class="cover-wall-caption">@u.SeriesName #@u.IssueNumber.ToString("0.##")</div>
+                        <div class="cover-wall-date">@(u.ReleaseDate?.ToString("MMM d") ?? "")</div>
+                    </div>
                 }
-                @if (_lowStock.Count == 0)
-                {
-                    <tr><td colspan="4" class="pos-table-empty">Nothing is running low.</td></tr>
-                }
-            </tbody>
-        </table>
-    </section>
+            </div>
+        }
+    </div>
+}
+else
+{
+    <div class="stat-row">
+        <div class="stat-card">
+            <div class="stat-label">Today</div>
+            <div class="stat-value">@_today.ToString("C")</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">This Week</div>
+            <div class="stat-value">@_week.ToString("C")</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">This Month</div>
+            <div class="stat-value">@_month.ToString("C")</div>
+        </div>
+    </div>
 
-    <section class="panel">
-        <h2>Recent Purchases <span class="panel-sub">last @_recentSales.Count</span></h2>
-        <table class="pos-table">
-            <thead><tr><th>When</th><th>Customer</th><th>Items</th><th>Total</th></tr></thead>
-            <tbody>
-                @foreach (var sale in _recentSales)
-                {
-                    <tr>
-                        <td>@sale.SoldAt.ToString("MMM d, h:mm tt")</td>
-                        <td>@(string.IsNullOrWhiteSpace(sale.CustomerName) ? "Walk-in" : sale.CustomerName)</td>
-                        <td>@sale.ItemCount</td>
-                        <td>@sale.Total.ToString("C")</td>
-                    </tr>
-                }
-                @if (_recentSales.Count == 0)
-                {
-                    <tr><td colspan="4" class="pos-table-empty">No purchases yet.</td></tr>
-                }
-            </tbody>
-        </table>
-    </section>
-</div>
+    <div class="panel-row">
+        <section class="panel">
+            <h2>Top Sellers <span class="panel-sub">last 30 days</span></h2>
+            <table class="pos-table">
+                <thead><tr><th>Series</th><th>Units Sold</th></tr></thead>
+                <tbody>
+                    @foreach (var entry in _topSellers)
+                    {
+                        <tr>
+                            <td>@entry.SeriesName</td>
+                            <td>@entry.QuantitySold</td>
+                        </tr>
+                    }
+                    @if (_topSellers.Count == 0)
+                    {
+                        <tr><td colspan="2" class="pos-table-empty">No sales in this window yet.</td></tr>
+                    }
+                </tbody>
+            </table>
+        </section>
+
+        <section class="panel">
+            <h2>Low Stock <span class="panel-sub">2 or fewer</span></h2>
+            <table class="pos-table">
+                <thead><tr><th>Series</th><th>Issue #</th><th>Cover</th><th>Stock</th></tr></thead>
+                <tbody>
+                    @foreach (var entry in _lowStock)
+                    {
+                        <tr>
+                            <td>@entry.SeriesName (@entry.StartYear)</td>
+                            <td>@entry.IssueNumber.ToString("0.##")</td>
+                            <td>@entry.CoverLetter</td>
+                            <td>@entry.StockQuantity</td>
+                        </tr>
+                    }
+                    @if (_lowStock.Count == 0)
+                    {
+                        <tr><td colspan="4" class="pos-table-empty">Nothing is running low.</td></tr>
+                    }
+                </tbody>
+            </table>
+        </section>
+
+        <section class="panel">
+            <h2>Recent Purchases <span class="panel-sub">last @_recentSales.Count</span></h2>
+            <table class="pos-table">
+                <thead><tr><th>When</th><th>Customer</th><th>Items</th><th>Total</th></tr></thead>
+                <tbody>
+                    @foreach (var sale in _recentSales)
+                    {
+                        <tr>
+                            <td>@sale.SoldAt.ToString("MMM d, h:mm tt")</td>
+                            <td>@(string.IsNullOrWhiteSpace(sale.CustomerName) ? "Walk-in" : sale.CustomerName)</td>
+                            <td>@sale.ItemCount</td>
+                            <td>@sale.Total.ToString("C")</td>
+                        </tr>
+                    }
+                    @if (_recentSales.Count == 0)
+                    {
+                        <tr><td colspan="4" class="pos-table-empty">No purchases yet.</td></tr>
+                    }
+                </tbody>
+            </table>
+        </section>
+    </div>
+}
 
 @code {
     private decimal _today;
@@ -98,8 +154,17 @@
     private List<TopSellerEntry> _topSellers = new();
     private List<LowStockEntry> _lowStock = new();
     private List<RecentSaleEntry> _recentSales = new();
+    private List<CoverArtEntry> _recentCoverArt = new();
+    private List<UpcomingReleaseEntry> _upcomingReleases = new();
+    // Defaults to true (2026-11-24, explicit request) - Cool View is now
+    // what a worker (or anyone, since Dashboard is ungated too) sees first
+    // on landing here; the stats view is still one click away via the
+    // same toggle button.
+    private bool _showCoolView = true;
 
     protected override void OnInitialized() => Load();
+
+    private void ToggleView() => _showCoolView = !_showCoolView;
 
     private void Load()
     {
@@ -114,5 +179,12 @@
         _topSellers = DashboardService.GetTopSellingSeries(30, 10);
         _lowStock = DashboardService.GetLowStock(2);
         _recentSales = DashboardService.GetRecentSales(10);
+        // Trimmed from 18 each (2026-11-24) - Cool View is now the default
+        // landing view and Dashboard is ungated, so this loads on every
+        // single visit to the app; fewer tiles means fewer cover-image
+        // requests on first load, on top of the new caching fix in
+        // Program.cs's /api/cover-image endpoint.
+        _recentCoverArt = DashboardService.GetRecentCoverArt(12);
+        _upcomingReleases = DashboardService.GetUpcomingReleases(12);
     }
 }
