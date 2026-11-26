@@ -1,0 +1,616 @@
+@page "/checkout"
+@using System.Text
+@using ComicPos.Core.Models
+@using ComicPos.Core.Services
+@inject ICheckoutService CheckoutService
+@inject ICustomerService Customers
+@inject ISalesHistoryService SalesHistory
+@inject IStoreSettingsService StoreSettingsService
+@inject ComicPos.Web.Services.CurrentWorkerContext CurrentWorker
+@inject ComicPos.Web.Services.CurrentSaleContext SaleContext
+@rendermode InteractiveServer
+
+<PageTitle>Checkout - Comic POS</PageTitle>
+
+<div class="page-header">
+    <h1>Checkout</h1>
+</div>
+
+<div class="checkout-layout">
+    <div class="checkout-main">
+        <div class="toolbar">
+            <ClearableSearchBox Value="@_barcode" Placeholder="Scan barcode..."
+                   OnInput="e => _barcode = e.Value?.ToString() ?? string.Empty"
+                   OnKeyDown="HandleBarcodeKeyDown" />
+        </div>
+        @if (_scanError != null)
+        {
+            <p class="error-text">@_scanError</p>
+        }
+
+        @if (_cartRows.Count == 0)
+        {
+            <p class="empty-state">Cart is empty - scan an item to begin.</p>
+        }
+        else
+        {
+            <table class="pos-table">
+                <thead>
+                    <tr><th>Series</th><th>Issue</th><th>Cover</th><th>Qty</th><th>Price Each</th><th>Discount %</th><th>Total</th><th></th></tr>
+                </thead>
+                <tbody>
+                    @foreach (var row in _cartRows)
+                    {
+                        <tr>
+                            <td>@row.SeriesLabel</td>
+                            <td>@row.Line.Cover.Issue.IssueNumber.ToString("0.##")</td>
+                            <td>@row.Line.Cover.CoverLetter</td>
+                            <td><input type="text" style="width:50px" value="@row.Quantity" @onchange="e => SaveQuantity(row, e.Value?.ToString() ?? string.Empty)" /></td>
+                            <td><input type="text" style="width:70px" value="@row.PriceEach" @onchange="e => SavePriceEach(row, e.Value?.ToString() ?? string.Empty)" /></td>
+                            <td><input type="text" style="width:60px" value="@row.Discount" @onchange="e => SaveDiscount(row, e.Value?.ToString() ?? string.Empty)" /></td>
+                            <td>@row.LineTotal.ToString("C")</td>
+                            <td><button class="btn-ghost btn-sm btn-remove" @onclick="@(() => RemoveLine(row.Line))">Remove</button></td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    </div>
+
+    <div class="checkout-side">
+        <div class="panel">
+            <p class="list-row-title">@_customerLabel</p>
+            <ClearableSearchBox Value="@_customerSearch" Placeholder="Search customer (optional)..." OnInput="OnCustomerSearchInput" />
+            @if (_customerResults.Count > 0)
+            {
+                <div class="list-rows" style="margin-top:8px">
+                    @foreach (var c in _customerResults)
+                    {
+                        <div class="list-row" style="cursor:pointer;padding:8px 10px" @onclick="@(() => SelectCustomer(c))">
+                            <div class="list-row-main"><span class="list-row-title">@c.Name</span></div>
+                        </div>
+                    }
+                </div>
+            }
+            @if (_sale.CustomerId.HasValue)
+            {
+                <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+                    <div class="totals-row"><span>Store Credit Available</span><span>@_storeCreditBalance.ToString("C")</span></div>
+                    @if (_storeCreditBalance > 0)
+                    {
+                        <div class="form-row" style="margin-top:6px">
+                            <label>Apply Credit:</label>
+                            <input type="text" style="width:90px" value="@_storeCreditToApplyInput" @onchange="OnStoreCreditInputChanged" />
+                            <button class="btn-ghost btn-sm" @onclick="ApplyMaxStoreCredit">Max</button>
+                        </div>
+                        @if (_storeCreditError != null)
+                        {
+                            <p class="error-text" style="margin:4px 0 0">@_storeCreditError</p>
+                        }
+                    }
+                </div>
+            }
+        </div>
+
+        <div class="panel" style="margin-top:14px">
+            <div class="totals-row"><span>Subtotal</span><span>@_subtotal.ToString("C")</span></div>
+            <div class="totals-row"><span>Tax</span><span>@_tax.ToString("C")</span></div>
+            <div class="totals-row grand"><span>Total</span><span>@_total.ToString("C")</span></div>
+            @if (_sale.StoreCreditUsed > 0)
+            {
+                <div class="totals-row"><span>Store Credit Applied</span><span>-@_sale.StoreCreditUsed.ToString("C")</span></div>
+                <div class="totals-row grand"><span>Amount Due</span><span>@_amountDue.ToString("C")</span></div>
+            }
+
+            <div class="form-row" style="margin-top:10px">
+                <label>Cash Tendered:</label>
+                <input type="text" value="@_cashTendered" @oninput="OnCashTenderedInput" />
+            </div>
+            <div class="totals-row">
+                <span>Change Due</span>
+                <span style="@(_change < 0 ? "color:var(--danger)" : "")">@_changeDisplay</span>
+            </div>
+
+            @if (_completeError != null)
+            {
+                <p class="error-text">@_completeError</p>
+            }
+
+            <button class="btn-primary" style="width:100%;margin-top:10px" @onclick="CompleteSaleClicked">Complete Sale</button>
+        </div>
+    </div>
+</div>
+
+@if (_lowStockWarnings != null)
+{
+    <Modal Show="true" Title="Low Stock Warning" OnBackdropClick="CancelLowStockConfirm">
+        <p>Some items are low on stock:</p>
+        <ul>
+            @foreach (var w in _lowStockWarnings)
+            {
+                <li>@w</li>
+            }
+        </ul>
+        <p>Complete the sale anyway?</p>
+        <div class="form-actions">
+            <button class="btn-ghost" @onclick="CancelLowStockConfirm">No</button>
+            <button class="btn-primary" @onclick="ConfirmLowStockAndComplete">Yes, Complete Sale</button>
+        </div>
+    </Modal>
+}
+
+@if (_priorPurchaseWarning != null)
+{
+    <Modal Show="true" Title="Already Purchased" OnBackdropClick="DismissPriorPurchaseWarning">
+        <p>@_priorPurchaseWarning</p>
+        <div class="form-actions">
+            <button class="btn-primary" @onclick="DismissPriorPurchaseWarning">OK</button>
+        </div>
+    </Modal>
+}
+
+<ReceiptModal Show="_showReceipt" Body="@_receiptBody" StoreName="@_receiptStoreName"
+              Address="@_receiptAddress" Phone="@_receiptPhone" HasLogo="_receiptHasLogo" OnClose="CloseReceipt" />
+
+@code {
+    private Sale _sale = null!;
+    private List<CartRow> _cartRows = new();
+    private string _barcode = "";
+    private string? _scanError;
+
+    private string _customerSearch = "";
+    private List<Customer> _customerResults = new();
+    private string _customerLabel = "Customer: Walk-in";
+    private string? _selectedCustomerName;
+
+    private string _cashTendered = "";
+    private decimal _subtotal;
+    private decimal _tax;
+    private decimal _total;
+    private decimal _amountDue;
+    private decimal _change;
+    private string _changeDisplay = "";
+    private string? _completeError;
+    private List<string>? _lowStockWarnings;
+
+    // Set right after a successful scan when the selected customer's own
+    // sales history already has this exact cover on it (see
+    // CheckPriorPurchase) - purely informational, same spirit as the
+    // customer asking "didn't I already get this one?" at the counter.
+    // Deliberately doesn't block or remove anything from the cart; the
+    // clerk can still hit Remove on that line themselves if it really was
+    // a mis-scan.
+    private string? _priorPurchaseWarning;
+
+    private decimal _storeCreditBalance;
+    private string _storeCreditToApplyInput = "";
+    private string? _storeCreditError;
+
+    private bool _showReceipt;
+    private string _receiptBody = "";
+    private string _receiptStoreName = "";
+    private string _receiptAddress = "";
+    private string _receiptPhone = "";
+    private bool _receiptHasLogo;
+
+    private class CartRow
+    {
+        public SaleLine Line { get; set; } = null!;
+        public string SeriesLabel { get; set; } = "";
+        public string Quantity { get; set; } = "";
+        public string PriceEach { get; set; } = "";
+        public string Discount { get; set; } = "";
+        public decimal LineTotal { get; set; }
+    }
+
+    // Resumes the in-progress sale from CurrentSaleContext when one's
+    // already there (navigated away and back within the same circuit),
+    // instead of unconditionally starting a brand-new one every time this
+    // page component is created - see CurrentSaleContext's own doc
+    // comment for why that was happening. A genuinely new sale (first
+    // visit this circuit, or right after FinishSale cleared the context)
+    // still goes through CheckoutService.StartSale() exactly as before.
+    protected override void OnInitialized()
+    {
+        if (SaleContext.Sale != null)
+        {
+            _sale = SaleContext.Sale;
+            _selectedCustomerName = SaleContext.SelectedCustomerName;
+            _customerLabel = _selectedCustomerName != null ? $"Customer: {_selectedCustomerName}" : "Customer: Walk-in";
+            _cashTendered = SaleContext.CashTendered;
+            _storeCreditToApplyInput = SaleContext.StoreCreditToApplyInput;
+            if (_sale.CustomerId.HasValue)
+                _storeCreditBalance = Customers.GetStoreCreditBalance(_sale.CustomerId.Value);
+        }
+        else
+        {
+            _sale = CheckoutService.StartSale();
+            SaleContext.SetSale(_sale, null);
+        }
+        RefreshCart();
+    }
+
+    private void RefreshCart()
+    {
+        _cartRows = _sale.Lines.Select(l => new CartRow
+        {
+            Line = l,
+            SeriesLabel = $"{l.Cover.Issue.Series.Name} ({l.Cover.Issue.Series.StartYear})",
+            Quantity = l.Quantity.ToString(),
+            PriceEach = l.PriceEach.ToString("0.00"),
+            Discount = l.DiscountPercent.ToString("0.00"),
+            LineTotal = l.PriceEach * l.Quantity * (1 - l.DiscountPercent / 100)
+        }).ToList();
+
+        RecalculateTotals();
+    }
+
+    private decimal GetSubtotal() => _sale.Lines.Sum(l => l.PriceEach * l.Quantity * (1 - l.DiscountPercent / 100));
+    private decimal GetTaxRate() => StoreSettingsService.Load().TaxRatePercent;
+
+    private void RecalculateTotals()
+    {
+        _subtotal = GetSubtotal();
+        _tax = _subtotal * (GetTaxRate() / 100);
+        _total = _subtotal + _tax;
+        // Store credit can never cover more than the total, even if more
+        // was somehow applied earlier against a cart that's since shrunk
+        // (an item removed after credit was applied) - clamped here so
+        // _amountDue/_change can never go negative just from that.
+        if (_sale.StoreCreditUsed > _total)
+            _sale.StoreCreditUsed = _total;
+        _amountDue = _total - _sale.StoreCreditUsed;
+        UpdateChangeDue();
+    }
+
+    private void UpdateChangeDue()
+    {
+        if (decimal.TryParse(_cashTendered, out var tendered))
+        {
+            _change = tendered - _amountDue;
+            _changeDisplay = _change.ToString("C");
+        }
+        else
+        {
+            _change = 0;
+            _changeDisplay = "";
+        }
+    }
+
+    private void OnCashTenderedInput(ChangeEventArgs e)
+    {
+        _cashTendered = e.Value?.ToString() ?? "";
+        SaleContext.CashTendered = _cashTendered;
+        UpdateChangeDue();
+    }
+
+    private void HandleBarcodeKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key != "Enter") return;
+
+        _scanError = null;
+        var barcode = _barcode;
+        var success = CheckoutService.ScanItem(_sale, barcode);
+        if (!success)
+        {
+            _scanError = $"Item with barcode {barcode} not found.";
+        }
+        else
+        {
+            RefreshCart();
+            CheckPriorPurchase(barcode);
+        }
+        _barcode = "";
+    }
+
+    // Added 2026-11-24 - the store asked for a heads-up when a customer's
+    // already bought the exact book that just got scanned, so a clerk
+    // doesn't sell someone a second copy of the same single issue by
+    // mistake. Deliberately keyed on the scanned Cover's own Id (this
+    // exact variant/cover-letter), not just the Issue - a customer buying
+    // Cover A today and Cover B next week is two different collectibles,
+    // not a duplicate, so that pair should never trigger this. Only fires
+    // when a customer is actually attached to the sale (walk-in sales have
+    // no history to check), and ignores any sale that's since been voided
+    // (CheckoutService.VoidSale already treats a void as undoing the
+    // purchase - stock and store credit both get put back - so the
+    // warning shouldn't act like it still happened).
+    private void CheckPriorPurchase(string barcode)
+    {
+        if (!_sale.CustomerId.HasValue) return;
+
+        var scannedLine = _sale.Lines.FirstOrDefault(l => l.Cover.Barcode == barcode);
+        if (scannedLine == null) return;
+
+        var priorPurchase = SalesHistory.GetHistoryForCustomer(_sale.CustomerId.Value)
+            .Where(h => !h.Sale.IsVoided && h.CoverId == scannedLine.CoverId)
+            .OrderByDescending(h => h.Sale.SoldAt)
+            .FirstOrDefault();
+
+        if (priorPurchase != null)
+        {
+            var issue = priorPurchase.Cover.Issue;
+            _priorPurchaseWarning = $"{_selectedCustomerName} already bought {issue.Series.Name} #{issue.IssueNumber:0.##} [{priorPurchase.Cover.CoverLetter}] on {priorPurchase.Sale.SoldAt:MMM d, yyyy}.";
+        }
+    }
+
+    private void DismissPriorPurchaseWarning() => _priorPurchaseWarning = null;
+
+    private void SaveQuantity(CartRow row, string newValue)
+    {
+        if (int.TryParse(newValue, out var qty))
+        {
+            if (qty <= 0)
+                _sale.Lines.Remove(row.Line);
+            else
+                row.Line.Quantity = qty;
+        }
+        RefreshCart();
+    }
+
+    private void SavePriceEach(CartRow row, string newValue)
+    {
+        if (decimal.TryParse(newValue, out var price) && price >= 0)
+            row.Line.PriceEach = price;
+        RefreshCart();
+    }
+
+    private void SaveDiscount(CartRow row, string newValue)
+    {
+        // Clamped to 0-100 - an unclamped value over 100 would make the
+        // line's total (and the sale subtotal/tax/change due) negative.
+        if (decimal.TryParse(newValue, out var disc))
+            row.Line.DiscountPercent = Math.Clamp(disc, 0, 100);
+        RefreshCart();
+    }
+
+    private void RemoveLine(SaleLine line)
+    {
+        _sale.Lines.Remove(line);
+        RefreshCart();
+    }
+
+    private void OnCustomerSearchInput(ChangeEventArgs e)
+    {
+        _customerSearch = e.Value?.ToString() ?? "";
+        _customerResults = string.IsNullOrWhiteSpace(_customerSearch)
+            ? new List<Customer>()
+            : Customers.SearchCustomers(_customerSearch);
+    }
+
+    private void SelectCustomer(Customer customer)
+    {
+        _sale.CustomerId = customer.Id;
+        _customerLabel = $"Customer: {customer.Name}";
+        _selectedCustomerName = customer.Name;
+        SaleContext.SetCustomer(customer.Name);
+        _customerSearch = "";
+        _customerResults = new List<Customer>();
+        _storeCreditBalance = Customers.GetStoreCreditBalance(customer.Id);
+        _storeCreditToApplyInput = "";
+        _storeCreditError = null;
+        // Switching customers mid-sale drops any credit already applied
+        // against the PREVIOUS customer's balance - it was never this
+        // new customer's to spend.
+        _sale.StoreCreditUsed = 0;
+        RecalculateTotals();
+    }
+
+    private void OnStoreCreditInputChanged(ChangeEventArgs e)
+    {
+        _storeCreditToApplyInput = e.Value?.ToString() ?? "";
+        SaleContext.StoreCreditToApplyInput = _storeCreditToApplyInput;
+        _storeCreditError = null;
+
+        if (string.IsNullOrWhiteSpace(_storeCreditToApplyInput))
+        {
+            CheckoutService.ApplyStoreCredit(_sale, 0);
+            RecalculateTotals();
+            return;
+        }
+
+        if (!decimal.TryParse(_storeCreditToApplyInput, out var amount) || amount < 0)
+        {
+            _storeCreditError = "Enter a valid amount.";
+            return;
+        }
+
+        // Never offer to apply more than what's actually owed - clamped
+        // against _total here (before store credit), not _amountDue,
+        // since _amountDue already has any previously-applied credit
+        // subtracted out.
+        var cap = Math.Min(amount, _total);
+        try
+        {
+            CheckoutService.ApplyStoreCredit(_sale, cap);
+            if (cap < amount)
+                _storeCreditToApplyInput = cap.ToString("0.00");
+        }
+        catch (InvalidOperationException ex)
+        {
+            _storeCreditError = ex.Message;
+        }
+        SaleContext.StoreCreditToApplyInput = _storeCreditToApplyInput;
+        RecalculateTotals();
+    }
+
+    private void ApplyMaxStoreCredit()
+    {
+        var cap = Math.Min(_storeCreditBalance, _total);
+        try
+        {
+            CheckoutService.ApplyStoreCredit(_sale, cap);
+            _storeCreditToApplyInput = cap.ToString("0.00");
+            SaleContext.StoreCreditToApplyInput = _storeCreditToApplyInput;
+            _storeCreditError = null;
+        }
+        catch (InvalidOperationException ex)
+        {
+            _storeCreditError = ex.Message;
+        }
+        RecalculateTotals();
+    }
+
+    private void CompleteSaleClicked()
+    {
+        _completeError = null;
+        if (_sale.Lines.Count == 0)
+        {
+            _completeError = "Scan at least one item first.";
+            return;
+        }
+
+        var warnings = CheckoutService.GetLowStockWarnings(_sale);
+        if (warnings.Count > 0)
+        {
+            _lowStockWarnings = warnings;
+            return;
+        }
+
+        FinishSale();
+    }
+
+    private void CancelLowStockConfirm() => _lowStockWarnings = null;
+
+    private void ConfirmLowStockAndComplete()
+    {
+        _lowStockWarnings = null;
+        FinishSale();
+    }
+
+    private void FinishSale()
+    {
+        var completingSale = _sale;
+
+        var subtotal = completingSale.Lines.Sum(l => l.PriceEach * l.Quantity * (1 - l.DiscountPercent / 100));
+        var tax = subtotal * (GetTaxRate() / 100);
+        var total = subtotal + tax;
+        var storeCreditUsed = completingSale.StoreCreditUsed;
+        var amountDue = total - storeCreditUsed;
+        decimal.TryParse(_cashTendered, out var tendered);
+        var change = tendered - amountDue;
+        var customerNameForReceipt = _selectedCustomerName;
+        var servedByForReceipt = CurrentWorker.Current?.Name;
+
+        var store = StoreSettingsService.Load();
+
+        // Complete the sale first so completingSale.Id is assigned by the
+        // database (and its store-credit ledger debit, if any, is
+        // written - see CheckoutService.CompleteSale) - the receipt
+        // wants a real receipt number, not 0.
+        //
+        // Wrapped in try/catch added 2026-11-24 - this call used to be
+        // unguarded, unlike every other risky call in this file
+        // (OnStoreCreditInputChanged/ApplyMaxStoreCredit both already
+        // caught their own InvalidOperationException). An uncaught
+        // exception here doesn't just fail this one sale - it crashes the
+        // whole Blazor Server circuit for this browser tab, which looks
+        // exactly like "every button on the page stopped responding"
+        // (confirmed live: this is what made the Low Stock Warning
+        // modal's Yes/No/X all look broken together - clicking Yes threw
+        // here, and once the circuit was down, No and X couldn't respond
+        // either, even though neither of them does anything risky on its
+        // own). The cart/sale are untouched at this point (nothing below
+        // has run yet), so returning here leaves everything exactly as it
+        // was and lets the person retry or adjust quantities instead of
+        // losing the whole page.
+        try
+        {
+            CheckoutService.CompleteSale(completingSale);
+        }
+        catch (Exception ex)
+        {
+            _lowStockWarnings = null;
+            _completeError = $"Couldn't complete the sale: {ex.Message}";
+            return;
+        }
+        var receiptBody = BuildReceipt(completingSale, customerNameForReceipt, servedByForReceipt, subtotal, tax, total, storeCreditUsed, amountDue, tendered, change);
+
+        _sale = CheckoutService.StartSale();
+        SaleContext.Clear();
+        SaleContext.SetSale(_sale, null);
+        _customerLabel = "Customer: Walk-in";
+        _selectedCustomerName = null;
+        _customerSearch = "";
+        _customerResults = new List<Customer>();
+        _cashTendered = "";
+        _storeCreditBalance = 0;
+        _storeCreditToApplyInput = "";
+        _storeCreditError = null;
+        RefreshCart();
+
+        _receiptBody = receiptBody;
+        _receiptStoreName = store.StoreName;
+        _receiptAddress = store.Address;
+        _receiptPhone = store.Phone;
+        _receiptHasLogo = !string.IsNullOrWhiteSpace(store.LogoPath) && File.Exists(store.LogoPath);
+        _showReceipt = true;
+    }
+
+    private void CloseReceipt() => _showReceipt = false;
+
+    // Builds the receipt as real HTML (a meta row, an itemized table, then
+    // totals) instead of monospace-padded text, so it prints like an actual
+    // store receipt rather than a plain-text dump. Rendered via
+    // ReceiptModal's Body parameter, which casts this to a MarkupString.
+    // "Served By" comes from CurrentWorker.Current (set at worker login) -
+    // left off the receipt entirely when nobody's logged in rather than
+    // showing a blank/faked row.
+    private static string BuildReceipt(Sale sale, string? customerName, string? servedBy, decimal subtotal, decimal tax, decimal total, decimal storeCreditUsed, decimal amountDue, decimal tendered, decimal change)
+    {
+        var sb = new StringBuilder();
+
+        sb.Append("<div class=\"receipt-meta\">");
+        sb.Append("<div class=\"receipt-meta-row\">");
+        sb.Append($"<span>To: {Esc(string.IsNullOrWhiteSpace(customerName) ? "Walk-in Customer" : customerName)}</span>");
+        sb.Append($"<span>Receipt No: #{sale.Id}</span>");
+        sb.Append("</div>");
+        sb.Append("<div class=\"receipt-meta-row\">");
+        sb.Append($"<span>{sale.SoldAt:MMM d, yyyy h:mm tt}</span>");
+        sb.Append(string.IsNullOrWhiteSpace(servedBy) ? "<span></span>" : $"<span>Served By: {Esc(servedBy)}</span>");
+        sb.Append("</div>");
+        sb.Append("</div>");
+
+        sb.Append("<table class=\"receipt-table\"><thead><tr>");
+        sb.Append("<th class=\"col-qty\">Qty</th><th class=\"col-item\">Item</th><th class=\"col-num\">Price</th><th class=\"col-num\">Disc%</th><th class=\"col-num\">Total</th>");
+        sb.Append("</tr></thead><tbody>");
+
+        foreach (var line in sale.Lines)
+        {
+            var name = Esc($"{line.Cover.Issue.Series.Name} #{line.Cover.Issue.IssueNumber:0.##} [{line.Cover.CoverLetter}]");
+            var lineTotal = line.PriceEach * line.Quantity * (1 - line.DiscountPercent / 100);
+            sb.Append("<tr>");
+            sb.Append($"<td class=\"col-qty\">{line.Quantity}</td>");
+            sb.Append($"<td class=\"col-item\">{name}</td>");
+            sb.Append($"<td class=\"col-num\">{line.PriceEach:C}</td>");
+            sb.Append($"<td class=\"col-num\">{(line.DiscountPercent > 0 ? line.DiscountPercent.ToString("0.##") + "%" : "-")}</td>");
+            sb.Append($"<td class=\"col-num\">{lineTotal:C}</td>");
+            sb.Append("</tr>");
+        }
+
+        sb.Append("</tbody></table>");
+
+        sb.Append("<div class=\"receipt-totals\">");
+        sb.Append($"<div class=\"receipt-totals-row\"><span>Subtotal</span><span>{subtotal:C}</span></div>");
+        sb.Append($"<div class=\"receipt-totals-row\"><span>Tax</span><span>{tax:C}</span></div>");
+        sb.Append($"<div class=\"receipt-totals-row receipt-grand\"><span>Total</span><span>{total:C}</span></div>");
+
+        if (storeCreditUsed > 0)
+        {
+            sb.Append($"<div class=\"receipt-totals-row\"><span>Store Credit Applied</span><span>-{storeCreditUsed:C}</span></div>");
+            sb.Append($"<div class=\"receipt-totals-row receipt-grand\"><span>Amount Due</span><span>{amountDue:C}</span></div>");
+        }
+
+        if (tendered > 0)
+        {
+            sb.Append($"<div class=\"receipt-totals-row\"><span>Cash Tendered</span><span>{tendered:C}</span></div>");
+            sb.Append($"<div class=\"receipt-totals-row\"><span>Change</span><span>{change:C}</span></div>");
+        }
+
+        sb.Append("</div>");
+
+        return sb.ToString();
+    }
+
+    private static string Esc(string text) => System.Net.WebUtility.HtmlEncode(text);
+}
