@@ -1912,6 +1912,23 @@ public class AutoFetchService : IAutoFetchService
             result.Errors.Add(line);
             trace.AppendLine(line);
         }
+        else
+        {
+            // Added 2026-11-26: used to be a wholly separate, manual
+            // catch-up pass (BackfillCoverVariantsFromPrhBookPages,
+            // still below, now kept as the whole-catalog version of
+            // this same lookup) - the user pointed out the catalog
+            // xlsx's own UPC cell is ITSELF a hyperlink straight to
+            // this exact book's prhcomics.com page, and wanted that
+            // followed as part of one linear import pipeline (xlsx ->
+            // metadata -> covers/variants from the UPC lookup -> done),
+            // not a separate click some time later. See
+            // FetchAdditionalCoversForImportedEntries's own doc comment
+            // for the full story, including why this needs no LOCG
+            // involvement at all.
+            onProgress?.Invoke($"{result.NewIssuesAdded} new issue(s) added - checking prhcomics.com for additional covers/variants...");
+            FetchAdditionalCoversForImportedEntries(entries, allSeries, result, trace, onProgress);
+        }
 
         trace.AppendLine();
         if (result.Added.Count > 0)
@@ -1924,7 +1941,7 @@ public class AutoFetchService : IAutoFetchService
         result.Trace = trace.ToString();
         DebugLog.WriteCheckNowLog(result.Trace);
         onProgress?.Invoke(saved
-            ? $"Done - {result.NewIssuesAdded} new issue(s) added. Covers (if any) will come from Comic Vine auto-linking, same as any other source with no photo of its own."
+            ? $"Done - {result.NewIssuesAdded} new issue(s) added, {result.CoverVariantsAdded} additional cover variant(s) found and {result.CoversBackfilled} cover image(s) pulled straight from PRH's own site. Anything PRH doesn't have yet still falls back to Comic Vine auto-linking."
             : $"Done - save failed, nothing from this file was added: {saveError}");
         return result;
     }
@@ -2547,8 +2564,6 @@ public class AutoFetchService : IAutoFetchService
     //    Edition)" are - merging them would have filed, say, a facsimile
     //    of a decades-old key issue as "another cover" of today's current
     //    issue #1 of the same-named ongoing series.
-    //  - DuplicateSeriesFormatWord strips a bare HC/TP/SC/GN/OHC/OGN/TPB
-    //    format token.
     //  - DuplicateSeriesVolumeMarker normalizes "Vol 03"/"Vol. 3"/"VOLUME
     //    03" down to just the bare number (leading zeros dropped) -
     //    deliberately keeping the NUMBER itself, not stripping it: PRH's
@@ -2562,25 +2577,132 @@ public class AutoFetchService : IAutoFetchService
     //    "Absolute Superman Vol. 3: ..." and a hypothetical "...Vol. 4:
     //    ..." still produce different keys ("3" vs "4").
     //
-    // A merged result like this isn't data loss, either - see
-    // MergeDuplicateSeries' own doc comment: when the keeper's existing
-    // issue #1 already has a real (non-placeholder) Cover A, an incoming
-    // duplicate's cover doesn't overwrite it, it gets its own new letter
-    // via ResolveCoverLetters - so an HC/TP/reprint trio merges into ONE
-    // series/issue with up to three real Cover rows (one per real
-    // barcode/price), the exact same shape a single floppy issue's own
-    // Cover A/B/C variants already take.
+    // REVERSED 2026-11-26 (Bug #22): a third pass, DuplicateSeriesFormatWord,
+    // used to also strip a bare HC/TP/SC/GN/OHC/OGN/TPB format token, on
+    // the theory that an HC/TP/reprint trio of the same book was "the
+    // same shape" as a single floppy issue's own Cover A/B/C variants
+    // (see MergeDuplicateSeries' three-tier cover merge) and could merge
+    // the same way. Live data proved that theory wrong: the user found a
+    // real post-widening scan flagging 267 "duplicate" groups, the vast
+    // majority of them genuine HC-vs-TP(-vs-plain) pairs of the exact
+    // same book - e.g. "ABSOLUTE SUPERMAN HC VOL 03..." vs "...TP VOL
+    // 03..." - correctly NAME-matched, but wrongly treated as mergeable:
+    // an HC and a TP are two different real SKUs a comic shop stocks and
+    // sells separately (different barcode, different price, independent
+    // on-hand counts), not two printed covers of one interchangeable
+    // product. Confirmed live and much worse than just "untidy": for any
+    // group where an ongoing/limited floppy run happened to share this
+    // key with its own later HC and TP (e.g. "DC K.O." - 5 real single
+    // issues - grouped with "DC K.O. HC" and "DC K.O. TP", each 1 issue),
+    // MergeDuplicateSeries' own Type-aware matching (Bug #19) does NOT
+    // treat the HC and the TP as a conflict with the floppy run's issue
+    // #1 (different Type), so each gets "moved" onto the floppy series
+    // as its own new Issue row - except the HC and the TP share the same
+    // (IssueNumber, Type) key AS EACH OTHER, so the one processed second
+    // lands in the "conflict" branch and has ITS real barcode/price
+    // merged in as just another lettered Cover on the first one's Issue
+    // row. Net result if a merge had run: the hardcover and the
+    // paperback - two genuinely different, separately-priced products -
+    // would have collapsed into one anonymous "issue" nested under the
+    // floppy run's series, both their own distinct catalog names gone.
+    // Removed entirely rather than narrowed, at the time - see
+    // DuplicateSeriesKey just below.
+    //
+    // RE-REVERSED 2026-11-26 (Bug #23, same day): removing this pass
+    // entirely went too far the other way. The user confirmed live that
+    // genuinely-safe HC/TP/plain trios of the SAME book (no complicating
+    // floppy run at all, e.g. "Absolute Superman Vol. 3" solicited three
+    // times by PRH, worded three different ways) stopped being found OR
+    // even just listed once this strip was gone - not merged, not even
+    // shown as "possible duplicates" to look at. The real fix was never
+    // "never strip this" - it's keeping the strip (so these really do
+    // still match as the same key), while separately gating the MERGE
+    // action itself on format: DuplicateSeriesFormatBucket (below) and
+    // GetDuplicateSeriesCandidateGroups now do that - see their own doc
+    // comments. FindDuplicateSeries' scan uses no bucket gate at all (so
+    // it shows everything, HC-vs-TP included); MergeDuplicateSeries only
+    // auto-merges a group whose members are ALL the same bucket, and
+    // explicitly logs - without touching - any group that isn't.
     private static readonly Regex DuplicateSeriesEditionParenthetical = new(@"\((?!\s*[^()]*\bfacsimile\b)[^()]*\bedition\b[^()]*\)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex DuplicateSeriesFormatWord = new(@"\b(?:HC|TP|SC|GN|OHC|OGN|TPB)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex DuplicateSeriesVolumeMarker = new(@"\bVol(?:ume)?\.?\s*0*(\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    // Bug #23 fix (2026-11-26): brought back - Bug #22 had removed this
+    // entirely (see that fix's own history in the comment block above).
+    // See DuplicateSeriesKey just below for why outright removal went
+    // too far, and DuplicateSeriesFormatBucket further down for the new,
+    // separate, merge-only safeguard that replaces what removing this
+    // strip used to be the only way to get.
+    private static readonly Regex DuplicateSeriesFormatWord = new(@"\b(?:HC|TP|SC|GN|OHC|OGN|TPB)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static string DuplicateSeriesKey(string name)
     {
         var t = DuplicateSeriesYearSuffix.Replace(name.Trim(), "").Trim();
         t = DuplicateSeriesEditionParenthetical.Replace(t, "").Trim();
+        // Bug #23 fix (2026-11-26): restored - Bug #22 removed this pass
+        // entirely after an HC/TP pair sharing this key got wrongly
+        // MERGED into one SKU by MergeDuplicateSeries. Confirmed live
+        // afterward (user report, 2026-11-26): removing the strip also
+        // hid every genuinely-safe HC/TP/plain trio of the SAME book
+        // from ever being found or even just LISTED - a frequent shape
+        // in PRH's own catalog data (the same book solicited three
+        // times, worded three different ways - see this field's own
+        // doc comment above for real examples). This key's only job is
+        // "do these names refer to the same work?" - whether that's
+        // then safe to physically MERGE is a separate question, now
+        // decided by DuplicateSeriesFormatBucket below, which
+        // GetDuplicateSeriesCandidateGroups applies only on
+        // MergeDuplicateSeries' side, not FindDuplicateSeries'.
         t = DuplicateSeriesFormatWord.Replace(t, "").Trim();
         t = DuplicateSeriesVolumeMarker.Replace(t, "$1").Trim();
         return SeriesNameKey.Normalize(t);
+    }
+
+    // Bug #23 fix (2026-11-26): added alongside DuplicateSeriesFormatWord's
+    // return above. Categorizes a series' raw (un-stripped) name by which
+    // physical format it names, off the same words DuplicateSeriesKey just
+    // stripped out of the matching key - used ONLY by MergeDuplicateSeries
+    // (via GetDuplicateSeriesCandidateGroups' caller-side filter below) to
+    // decide whether a same-key, same-issue-count group is actually safe
+    // to physically merge. Two names in the SAME bucket (both HC, or both
+    // some trade-paperback spelling) really are the identical SKU worded
+    // two ways - safe to merge. Two names in DIFFERENT buckets (HC vs TP,
+    // or either vs a plain/no-format name) are the dangerous Bug #22
+    // shape - two or three real, separately-priced/barcoded products that
+    // must never collapse into one Issue/Cover row - but still worth
+    // surfacing in FindDuplicateSeries' own scan (which calls
+    // GetDuplicateSeriesCandidateGroups directly, with no bucket filter at
+    // all) so the user can see them and merge by hand if they choose to.
+    private static string DuplicateSeriesFormatBucket(string name)
+    {
+        if (Regex.IsMatch(name, @"\b(?:HC|OHC)\b", RegexOptions.IgnoreCase)) return "HC";
+        if (Regex.IsMatch(name, @"\b(?:TP|SC|GN|OGN|TPB)\b", RegexOptions.IgnoreCase)) return "TRADE";
+        return "PLAIN";
+    }
+
+    // Bug #23 fix (2026-11-26): the actual "possible duplicate" grouping
+    // logic, pulled out into one shared helper so FindDuplicateSeries and
+    // MergeDuplicateSeries can never again drift apart the way Bug #22's
+    // fix had to be hand-applied to both separately. Groups by
+    // DuplicateSeriesKey, then - WITHIN each key group - by issue count
+    // (not across the whole key group the way Bug #22's guard worked):
+    // two real printings of the identical content always collect the
+    // same number of issues, so a same-key sub-group that shares one
+    // issue count is a reliable "possible duplicate", independently of
+    // whatever ELSE happens to share that key. Strictly more precise than
+    // Bug #22's group-wide check, which excluded an entire key group -
+    // including any genuinely-safe same-count members inside it - the
+    // instant ANY one member had a different count (confirmed live: that
+    // silently hid "DC K.O. HC" from ever pairing with "DC K.O. TP" too,
+    // just because the unrelated 5-issue "DC K.O." floppy run happened to
+    // share their key).
+    private static List<(string Key, List<Series> Members)> GetDuplicateSeriesCandidateGroups(List<Series> allSeries)
+    {
+        return allSeries
+            .GroupBy(s => DuplicateSeriesKey(s.Name), StringComparer.OrdinalIgnoreCase)
+            .SelectMany(g => g
+                .GroupBy(s => s.Issues.Count)
+                .Where(sub => sub.Count() > 1)
+                .Select(sub => (Key: g.Key, Members: sub.ToList())))
+            .ToList();
     }
 
     // Read-only - added 2026-11-24 alongside the LunarTitleParser fix
@@ -2597,10 +2719,14 @@ public class AutoFetchService : IAutoFetchService
         trace.AppendLine(new string('=', 60));
 
         var allSeries = _db.AllSeries.Include(s => s.Issues).ToList();
-        var groups = allSeries
-            .GroupBy(s => DuplicateSeriesKey(s.Name), StringComparer.OrdinalIgnoreCase)
-            .Where(g => g.Count() > 1)
-            .ToList();
+        // Bug #23 fix (2026-11-26): now the shared helper (see its own
+        // doc comment above). This scan applies no format-bucket
+        // restriction at all, unlike MergeDuplicateSeries below -
+        // specifically so a genuine HC-vs-TP(-vs-plain) trio of the same
+        // book still shows up HERE for the user to see and act on by
+        // hand, even though the merge action itself won't touch it
+        // automatically.
+        var groups = GetDuplicateSeriesCandidateGroups(allSeries);
 
         if (groups.Count == 0)
         {
@@ -2612,7 +2738,7 @@ public class AutoFetchService : IAutoFetchService
             {
                 trace.AppendLine();
                 trace.AppendLine($"Possible duplicate: \"{group.Key}\"");
-                foreach (var s in group.OrderByDescending(s => s.Issues.Count))
+                foreach (var s in group.Members.OrderByDescending(s => s.Issues.Count))
                 {
                     var line = $"  Series #{s.Id}: \"{s.Name}\" - {s.Issues.Count} issue(s), StartYear {s.StartYear}"
                         + (s.ComicVineVolumeId != null ? $", Comic Vine volume {s.ComicVineVolumeId}" : "")
@@ -2674,17 +2800,45 @@ public class AutoFetchService : IAutoFetchService
         trace.AppendLine(new string('=', 60));
 
         var allSeries = _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers).ToList();
-        var groups = allSeries
-            .GroupBy(s => DuplicateSeriesKey(s.Name), StringComparer.OrdinalIgnoreCase)
-            .Where(g => g.Count() > 1)
+        // Bug #23 fix (2026-11-26): now the shared helper (see its own
+        // doc comment above, by DuplicateSeriesKey/DuplicateSeriesFormatBucket).
+        var candidateGroups = GetDuplicateSeriesCandidateGroups(allSeries);
+
+        // Bug #23 fix (2026-11-26): a candidate group is only safe to
+        // actually MERGE when every member names the same physical format
+        // (DuplicateSeriesFormatBucket) - see that method's own doc
+        // comment for the full reasoning. A mixed-bucket group (an HC
+        // paired with a TP, or either paired with a plain/no-format name)
+        // is still shown below as FOUND, but deliberately left alone:
+        // these are two or three genuinely different, separately-priced/
+        // barcoded products (Bug #22's whole point), not one product
+        // worded two ways.
+        var groups = candidateGroups
+            .Where(g => g.Members.Select(s => DuplicateSeriesFormatBucket(s.Name)).Distinct().Count() == 1)
             .ToList();
+        var skipped = candidateGroups
+            .Where(g => g.Members.Select(s => DuplicateSeriesFormatBucket(s.Name)).Distinct().Count() != 1)
+            .ToList();
+
+        foreach (var g in skipped)
+        {
+            trace.AppendLine();
+            trace.AppendLine($"Found \"{g.Key}\" ({g.Members.Count} series, same issue count) but NOT merging - different formats (HC/TP/plain), needs a manual look:");
+            foreach (var s in g.Members.OrderByDescending(s => s.Issues.Count))
+                trace.AppendLine($"  Series #{s.Id}: \"{s.Name}\" - {s.Issues.Count} issue(s)");
+        }
 
         if (groups.Count == 0)
         {
-            trace.AppendLine("No duplicate series found - nothing to merge.");
+            trace.AppendLine();
+            trace.AppendLine(skipped.Count == 0
+                ? "No duplicate series found - nothing to merge."
+                : $"No same-format duplicate series found to merge ({skipped.Count} different-format group(s) above need a manual look).");
             result.Trace = trace.ToString();
             DebugLog.WriteCheckNowLog(result.Trace);
-            onProgress?.Invoke("No duplicates found - nothing to merge.");
+            onProgress?.Invoke(skipped.Count == 0
+                ? "No duplicates found - nothing to merge."
+                : $"No same-format duplicates to merge - {skipped.Count} different-format group(s) need a manual look (see log).");
             return result;
         }
 
@@ -2692,7 +2846,7 @@ public class AutoFetchService : IAutoFetchService
 
         foreach (var group in groups)
         {
-            var members = group
+            var members = group.Members
                 .OrderByDescending(s => s.Issues.Count)
                 .ThenByDescending(s => s.ComicVineVolumeId.HasValue)
                 .ThenByDescending(s => s.MetronSeriesId.HasValue)
@@ -2840,11 +2994,11 @@ public class AutoFetchService : IAutoFetchService
         _db.SaveChanges();
 
         trace.AppendLine();
-        trace.AppendLine($"Done. {groups.Count} duplicate group(s) merged, {seriesRemoved} empty series removed, {issuesMoved} issue(s) moved outright, {issuesMerged} issue(s) merged (covers combined), {coversDropped} exact-duplicate cover(s) dropped.");
-        result.Added.Add($"Merged {groups.Count} duplicate series group(s) - {seriesRemoved} empty series removed.");
+        trace.AppendLine($"Done. {groups.Count} duplicate group(s) merged, {seriesRemoved} empty series removed, {issuesMoved} issue(s) moved outright, {issuesMerged} issue(s) merged (covers combined), {coversDropped} exact-duplicate cover(s) dropped{(skipped.Count > 0 ? $"; {skipped.Count} different-format group(s) left alone (see above)" : "")}.");
+        result.Added.Add($"Merged {groups.Count} duplicate series group(s) - {seriesRemoved} empty series removed.{(skipped.Count > 0 ? $" {skipped.Count} different-format group(s) found but not merged (see trace)." : "")}");
         result.Trace = trace.ToString();
         DebugLog.WriteCheckNowLog(result.Trace);
-        onProgress?.Invoke($"Done - merged {groups.Count} duplicate group(s).");
+        onProgress?.Invoke($"Done - merged {groups.Count} duplicate group(s).{(skipped.Count > 0 ? $" {skipped.Count} different-format group(s) left for a manual look." : "")}");
         return result;
     }
 
@@ -5093,32 +5247,209 @@ public class AutoFetchService : IAutoFetchService
         }
     }
 
+    // Shared by BackfillCoverVariantsFromPrhBookPages (the manual,
+    // whole-catalog backfill pass below) and ImportPrhCatalogRelease
+    // (which now calls this itself, right after every monthly import -
+    // see that method's own doc comment for why). The same shape test
+    // either way: a PRH-shaped barcode (real ISBN-13, or a 17-digit
+    // UPC+price-addon) is what tells a genuinely PRH-sourced barcode
+    // apart from every other source's generated placeholder/fallback,
+    // and is also exactly what's needed to find this issue's own
+    // prhcomics.com product page in the first place (see
+    // PrhWebsiteFetcher.DownloadBookPageHtmlAsync).
+    private static bool IsPrhShapedBarcode(string barcode)
+    {
+        var lookup = barcode.Split('#')[0];
+        return (lookup.Length == 13 || lookup.Length == 17) && lookup.All(char.IsDigit);
+    }
+
+    // Shared by BackfillCoverVariantsFromPrhBookPages and
+    // ImportPrhCatalogRelease - given ONE issue's own prhcomics.com
+    // book-page HTML (the caller does the actual HTTP fetch and its own
+    // exception/404 handling, since what happens on THOSE outcomes
+    // differs a little between a one-off import batch and a whole-
+    // catalog backfill run), parses its "Additional covers" section and
+    // adds/upgrades whatever it finds. Returns (added, upgraded) - both
+    // 0 for a real page with nothing extra listed, which is the
+    // ordinary, common case for a genuinely single-cover issue, not a
+    // problem worth a trace line of its own.
+    private (int Added, int Upgraded) ApplyAdditionalCoversFromPrhBookPageHtml(
+        Issue issue, string html, HashSet<string> claimedBarcodes,
+        AutoFetchResult result, System.Text.StringBuilder trace, string label)
+    {
+        var scraped = PrhWebsiteFetcher.ParseAdditionalCovers(html);
+        if (scraped.Count == 0) return (0, 0);
+
+        var addedHere = 0;
+        var upgradedHere = 0;
+        var alreadyKnownHere = 0;
+        string? unrelatedRawTitle = null;
+        float? unrelatedIssueNumber = null;
+
+        foreach (var item in scraped)
+        {
+            // Reuses PrhTitleParser as-is - the scraped title is in
+            // the exact same "SERIES #N COVER X ARTIST VARIANT"
+            // grammar as the catalog importer's own Title column
+            // (confirmed live, identical wording), so there's no new
+            // parsing grammar to get wrong here. row.IssueNumber is
+            // read back only as a sanity check (this scrape should
+            // always describe THIS SAME issue, since it came from one
+            // of this issue's own covers' page) - a mismatch means
+            // prhcomics.com linked to a different issue/printing than
+            // expected, so it's skipped rather than risk filing a
+            // cover under the wrong issue.
+            //
+            // Confirmed live 2026-11-26 (real Test 5 run, The Amazing
+            // Spider-Man #1004 and Star Wars: The Book of Boba Fett
+            // #6): when an issue has NO real additional covers, the
+            // page's "Additional covers" container renders empty and
+            // ParseAdditionalCovers' 60000-char forward window keeps
+            // going past it and scrapes the NEXT carousel on the page
+            // instead (a "more issues in this series" widget, which
+            // reuses the exact same carousel-meta-isbn/title markup) -
+            // every single item it finds there is a different issue
+            // number, never a genuine cover of THIS issue. Since a
+            // real "Additional covers" carousel only ever lists
+            // siblings of the SAME issue, the first title that comes
+            // back for a DIFFERENT issue number is the signal we've
+            // crossed into that next, unrelated carousel - everything
+            // from here on is assumed to be more of the same, so this
+            // breaks out of the loop entirely rather than logging one
+            // "doesn't match" line per remaining item (confirmed live:
+            // Boba Fett #6 alone would otherwise have logged 7 of
+            // them). This is the ordinary, expected shape for the
+            // (common) single-cover issue, not a problem - so it's
+            // just a trace line, never result.Errors.
+            var row = new PrhCatalogRow();
+            PrhTitleParser.ApplyTitle(row, item.RawTitle);
+
+            if (row.IssueNumber.HasValue && Math.Abs(row.IssueNumber.Value - issue.IssueNumber) > 0.01f)
+            {
+                // Don't log yet - whether this is a genuine "nothing
+                // here" or just "already fully covered, nothing new"
+                // depends on alreadyKnownHere, decided once after the
+                // loop (see the bottom of this method) so the two
+                // cases get distinct, non-misleading trace lines
+                // instead of this single message covering both.
+                unrelatedRawTitle = item.RawTitle;
+                unrelatedIssueNumber = row.IssueNumber;
+                break;
+            }
+
+            var coverLetter = row.CoverLetter; // defaults to "A" if no marker found - see PrhTitleParser; shouldn't happen for a genuine "additional cover"
+            decimal price = 0;
+            if (!string.IsNullOrWhiteSpace(item.PriceText))
+            {
+                var priceDigits = item.PriceText.Replace("$", "").Replace("US", "", StringComparison.OrdinalIgnoreCase).Trim();
+                decimal.TryParse(priceDigits, NumberStyles.Number, CultureInfo.InvariantCulture, out price);
+            }
+
+            var existingCover = issue.Covers.FirstOrDefault(c => string.Equals(c.CoverLetter, coverLetter, StringComparison.OrdinalIgnoreCase));
+            if (existingCover != null)
+            {
+                // Already have this letter - only worth touching if
+                // what's on file isn't a real, distinct barcode yet:
+                // Bug #16's own derived "{barcode}#{letter}" fallback
+                // ('#' never appears in a real numeric barcode - see
+                // BackfillCoversFromPrhImageCdn's own doc comment), or
+                // one of the other sources' generated placeholder (see
+                // LooksLikePlaceholderCover). A cover that already has
+                // its own clean, real, different barcode is left
+                // alone even though it differs from this scrape -
+                // never overwrite good data blind.
+                var looksDerived = existingCover.Barcode.Contains('#');
+                if ((looksDerived || LooksLikePlaceholderCover(existingCover)) && !claimedBarcodes.Contains(item.Isbn))
+                {
+                    existingCover.Barcode = item.Isbn;
+                    if (price > 0) existingCover.Price = price;
+                    if (string.IsNullOrWhiteSpace(existingCover.CoverArtist) && !string.IsNullOrWhiteSpace(row.VariantText))
+                        existingCover.CoverArtist = row.VariantText;
+                    claimedBarcodes.Add(item.Isbn);
+                    upgradedHere++;
+                    result.CoversBackfilled++;
+                }
+                else
+                {
+                    // Already have this exact real cover - not new,
+                    // but not "nothing here" either. See alreadyKnownHere.
+                    alreadyKnownHere++;
+                }
+                continue;
+            }
+
+            if (claimedBarcodes.Contains(item.Isbn))
+            {
+                var conflictLine = $"{label}: skipped additional cover {coverLetter} (barcode {item.Isbn}) - already in use by a different issue; needs a manual look.";
+                result.Errors.Add(conflictLine);
+                trace.AppendLine(conflictLine);
+                continue;
+            }
+
+            var newCover = new Cover
+            {
+                CoverLetter = coverLetter,
+                Barcode = item.Isbn,
+                Price = price,
+                StockQuantity = 0,
+                CoverArtist = row.VariantText
+            };
+            issue.Covers.Add(newCover);
+            claimedBarcodes.Add(item.Isbn);
+            addedHere++;
+            result.CoverVariantsAdded++;
+        }
+
+        // Decided once, here, instead of inline above: a mismatch
+        // only means "this book genuinely has no more covers" when
+        // nothing real was found at all. If real siblings WERE found
+        // this call (added, upgraded, or already fully on file from
+        // an earlier run), the mismatch just marks where the real
+        // carousel ended - it's not itself news, except when every
+        // single sibling was already known, which is worth saying
+        // explicitly rather than leaving silent.
+        if (addedHere == 0 && upgradedHere == 0)
+        {
+            if (alreadyKnownHere > 0)
+                trace.AppendLine($"{label}: already has {alreadyKnownHere} real cover(s) matching PRH's own page - nothing new to add.");
+            else if (unrelatedRawTitle != null)
+                trace.AppendLine($"{label}: additional-cover scrape rolled into an unrelated carousel at \"{unrelatedRawTitle}\" (issue #{unrelatedIssueNumber}) - stopping here, no real additional covers found.");
+        }
+
+        return (addedHere, upgradedHere);
+    }
+
     // See IAutoFetchService.BackfillCoverVariantsFromPrhBookPages's own
-    // doc comment for the full story. Candidate issues are chosen by the
-    // SAME "does this issue have a cover whose barcode is PRH's own real
-    // ISBN-13/17-digit-UPC shape" test as BackfillCoversFromPrhImageCdn's
-    // own candidate query just above (reused for the identical reason:
-    // that shape is what tells a genuinely PRH-sourced barcode apart from
-    // every other source's generated placeholder/fallback) - that same
-    // barcode is also exactly what's needed to find this issue's own
-    // prhcomics.com product page in the first place. When an issue
-    // already has more than one such cover, "A" is preferred as the one
-    // actually fetched - arbitrary but deterministic, and it doesn't
-    // matter which cover's page gets fetched, since every cover's own
-    // "Additional covers" carousel lists every OTHER cover of the same
-    // issue, never itself.
+    // doc comment for the full story. Candidate issues are chosen by
+    // IsPrhShapedBarcode - the SAME "does this issue have a cover whose
+    // barcode is PRH's own real ISBN-13/17-digit-UPC shape" test as
+    // BackfillCoversFromPrhImageCdn's own candidate query just above
+    // (reused for the identical reason: that shape is what tells a
+    // genuinely PRH-sourced barcode apart from every other source's
+    // generated placeholder/fallback) - that same barcode is also
+    // exactly what's needed to find this issue's own prhcomics.com
+    // product page in the first place. When an issue already has more
+    // than one such cover, "A" is preferred as the one actually fetched -
+    // arbitrary but deterministic, and it doesn't matter which cover's
+    // page gets fetched, since every cover's own "Additional covers"
+    // carousel lists every OTHER cover of the same issue, never itself.
+    //
+    // IMPORTANT: this is no longer the only way new books get their
+    // variant covers. ImportPrhCatalogRelease now calls
+    // FetchAdditionalCoversForImportedEntries itself, right after every
+    // monthly import, which does the exact same lookup for just that
+    // batch's own newly-touched issues - see that method's own doc
+    // comment for the "why no reason to go to LOCG at all for this"
+    // story (2026-11-26). This method stays as the WHOLE-CATALOG catch-
+    // up pass, for anything imported before that existed, or any issue
+    // whose prhcomics.com page didn't have its variants listed yet at
+    // import time but does now.
     public AutoFetchResult BackfillCoverVariantsFromPrhBookPages(Action<string>? onProgress = null, int? limit = null)
     {
         var result = new AutoFetchResult();
         var trace = new System.Text.StringBuilder();
         trace.AppendLine($"Backfill cover variants from PRH's own book pages run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}" + (limit.HasValue ? $" (TEST RUN - capped at {limit} issue(s))" : ""));
         trace.AppendLine(new string('=', 60));
-
-        static bool IsPrhShaped(string barcode)
-        {
-            var lookup = barcode.Split('#')[0];
-            return (lookup.Length == 13 || lookup.Length == 17) && lookup.All(char.IsDigit);
-        }
 
         var rawIssues = _db.Issues
             .Include(i => i.Series)
@@ -5130,14 +5461,14 @@ public class AutoFetchService : IAutoFetchService
             .Select(i => (
                 Issue: i,
                 QueryCover: i.Covers
-                    .Where(c => IsPrhShaped(c.Barcode))
+                    .Where(c => IsPrhShapedBarcode(c.Barcode))
                     .OrderBy(c => string.Equals(c.CoverLetter, "A", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
                     .ThenBy(c => c.CoverLetter, StringComparer.OrdinalIgnoreCase)
                     .FirstOrDefault()))
             .Where(x => x.QueryCover != null)
             // Same closest-to-today ordering fix as every other retry/
             // backfill method in this file (see BackfillCoversFromPrhImageCdn's
-            // own doc comment) - surfaces recently-shipped/about-to-ship
+            // own doc comment), surfaces recently-shipped/about-to-ship
             // issues first on a capped Test-N run, instead of whatever DB
             // insertion order happens to be.
             .OrderBy(x => x.Issue.ReleaseDate.HasValue
@@ -5210,131 +5541,7 @@ public class AutoFetchService : IAutoFetchService
                 continue;
             }
 
-            var scraped = PrhWebsiteFetcher.ParseAdditionalCovers(html);
-
-            if (scraped.Count == 0)
-            {
-                // A real PRH page, genuinely single-cover - not worth a
-                // trace line (or even counting) per miss, same spirit as
-                // BackfillCoversFromPrhImageCdn's own noCoverAvailable.
-                if (done % 25 == 0 || done == candidates.Count)
-                {
-                    var (saved0, saveError0) = TrySaveChanges();
-                    if (!saved0) result.Errors.Add($"Batch ending at issue {done}: failed to save - {saveError0}");
-                }
-                continue;
-            }
-
-            var addedHere = 0;
-            var upgradedHere = 0;
-
-            foreach (var item in scraped)
-            {
-                // Reuses PrhTitleParser as-is - the scraped title is in
-                // the exact same "SERIES #N COVER X ARTIST VARIANT"
-                // grammar as the catalog importer's own Title column
-                // (confirmed live, identical wording), so there's no new
-                // parsing grammar to get wrong here. row.IssueNumber is
-                // read back only as a sanity check (this scrape should
-                // always describe THIS SAME issue, since it came from one
-                // of this issue's own covers' page) - a mismatch means
-                // prhcomics.com linked to a different issue/printing than
-                // expected, so it's skipped rather than risk filing a
-                // cover under the wrong issue.
-                //
-                // Confirmed live 2026-11-26 (real Test 5 run, The Amazing
-                // Spider-Man #1004 and Star Wars: The Book of Boba Fett
-                // #6): when an issue has NO real additional covers, the
-                // page's "Additional covers" container renders empty and
-                // ParseAdditionalCovers' 60000-char forward window keeps
-                // going past it and scrapes the NEXT carousel on the page
-                // instead (a "more issues in this series" widget, which
-                // reuses the exact same carousel-meta-isbn/title markup) -
-                // every single item it finds there is a different issue
-                // number, never a genuine cover of THIS issue. Since a
-                // real "Additional covers" carousel only ever lists
-                // siblings of the SAME issue, the first title that comes
-                // back for a DIFFERENT issue number is the signal we've
-                // crossed into that next, unrelated carousel - everything
-                // from here on is assumed to be more of the same, so this
-                // breaks out of the loop entirely rather than logging one
-                // "doesn't match" line per remaining item (confirmed live:
-                // Boba Fett #6 alone would otherwise have logged 7 of
-                // them). This is the ordinary, expected shape for the
-                // (common) single-cover issue, not a problem - so it's
-                // just a trace line, never result.Errors.
-                var row = new PrhCatalogRow();
-                PrhTitleParser.ApplyTitle(row, item.RawTitle);
-
-                if (row.IssueNumber.HasValue && Math.Abs(row.IssueNumber.Value - issue.IssueNumber) > 0.01f)
-                {
-                    trace.AppendLine($"{label}: additional-cover scrape rolled into an unrelated carousel at \"{item.RawTitle}\" (issue #{row.IssueNumber}) - stopping here, no real additional covers found.");
-                    break;
-                }
-
-                var coverLetter = row.CoverLetter; // defaults to "A" if no marker found - see PrhTitleParser; shouldn't happen for a genuine "additional cover"
-                decimal price = 0;
-                if (!string.IsNullOrWhiteSpace(item.PriceText))
-                {
-                    var priceDigits = item.PriceText.Replace("$", "").Replace("US", "", StringComparison.OrdinalIgnoreCase).Trim();
-                    decimal.TryParse(priceDigits, NumberStyles.Number, CultureInfo.InvariantCulture, out price);
-                }
-
-                var existingCover = issue.Covers.FirstOrDefault(c => string.Equals(c.CoverLetter, coverLetter, StringComparison.OrdinalIgnoreCase));
-                if (existingCover != null)
-                {
-                    // Already have this letter - only worth touching if
-                    // what's on file isn't a real, distinct barcode yet:
-                    // Bug #16's own derived "{barcode}#{letter}" fallback
-                    // ('#' never appears in a real numeric barcode - see
-                    // BackfillCoversFromPrhImageCdn's own doc comment), or
-                    // one of the other sources' generated placeholder (see
-                    // LooksLikePlaceholderCover). A cover that already has
-                    // its own clean, real, different barcode is left
-                    // alone even though it differs from this scrape -
-                    // never overwrite good data blind.
-                    var looksDerived = existingCover.Barcode.Contains('#');
-                    if ((looksDerived || LooksLikePlaceholderCover(existingCover)) && !claimedBarcodes.Contains(item.Isbn))
-                    {
-                        existingCover.Barcode = item.Isbn;
-                        if (price > 0) existingCover.Price = price;
-                        if (string.IsNullOrWhiteSpace(existingCover.CoverArtist) && !string.IsNullOrWhiteSpace(row.VariantText))
-                            existingCover.CoverArtist = row.VariantText;
-                        claimedBarcodes.Add(item.Isbn);
-                        upgradedHere++;
-                        result.CoversBackfilled++;
-                    }
-                    continue;
-                }
-
-                if (claimedBarcodes.Contains(item.Isbn))
-                {
-                    // Bug #21 fix (2026-11-26): this branch used to add to result.Errors
-                    // with no matching trace.AppendLine, unlike every other error branch in
-                    // this method (the catch block above, and the TrySaveChanges failure
-                    // checks below) - so a real cross-issue barcode collision was counted in
-                    // the run's final "N error(s)" summary but never showed up anywhere in
-                    // the pasted trace text itself. Added the missing trace line so this is
-                    // visible like every other error this method can report.
-                    var conflictLine = $"{label}: skipped additional cover {coverLetter} (barcode {item.Isbn}) - already in use by a different issue; needs a manual look.";
-                    result.Errors.Add(conflictLine);
-                    trace.AppendLine(conflictLine);
-                    continue;
-                }
-
-                var newCover = new Cover
-                {
-                    CoverLetter = coverLetter,
-                    Barcode = item.Isbn,
-                    Price = price,
-                    StockQuantity = 0,
-                    CoverArtist = row.VariantText
-                };
-                issue.Covers.Add(newCover);
-                claimedBarcodes.Add(item.Isbn);
-                addedHere++;
-                result.CoverVariantsAdded++;
-            }
+            var (addedHere, upgradedHere) = ApplyAdditionalCoversFromPrhBookPageHtml(issue, html, claimedBarcodes, result, trace, label);
 
             if (addedHere > 0 || upgradedHere > 0)
             {
@@ -5357,6 +5564,197 @@ public class AutoFetchService : IAutoFetchService
         DebugLog.WriteCheckNowLog(result.Trace);
 
         return result;
+    }
+
+    // Added 2026-11-26: the user pointed out that the catalog xlsx's own
+    // UPC cell is ITSELF a hyperlink straight to this exact issue's
+    // prhcomics.com book page (confirmed live - a Sabrina the Teenage
+    // Witch #5 variant row's UPC hyperlinked to
+    // prhcomics.com/book/?isbn=<that same barcode>#additional_covers,
+    // whose "Additional covers" grid listed all 7 siblings: Main Cover,
+    // 2 more open-order variants, 1 blank-sketch variant, and 3
+    // incentive variants - for an ONI PRESS book, not DC, confirming
+    // this lookup is publisher-agnostic, not DC/PRH-imprint-specific as
+    // first assumed) - and that the real pipeline should be "get the
+    // month's xlsx, get each book's metadata, then get its covers/
+    // variants from that same UPC lookup, done" as ONE pass, not a
+    // separate manual catch-up click run some time later. So: no LOCG
+    // involvement needed at all for this (LOCG's own 30-second crawl-
+    // delay would have made a whole-catalog pass take DAYS; prhcomics.com
+    // has no such limit - see BackfillCoverVariantsFromPrhBookPages'
+    // own 300ms courtesy-pacing comment above - so doing this inline,
+    // synchronously, as part of every import is entirely practical).
+    //
+    // Called by ImportPrhCatalogRelease right after its own save
+    // succeeds. Re-derives which Issues this batch actually touched by
+    // matching entries' own (SeriesName, IssueNumber) back against
+    // allSeries - the same list ImportPrhCatalogRelease already built
+    // and fed into AddEntriesAsIssues, which adds new Series/Issues onto
+    // it in place - rather than changing AddEntriesAsIssues' own
+    // signature to additionally return touched Issues, which is shared
+    // by every other import source in this file (Lunar, Comicade, LOCG,
+    // Metron, GCD) and not worth the risk of touching for this. Scoped
+    // to just this one batch rather than the whole catalog, so a
+    // monthly import (typically a few hundred rows) stays fast - no
+    // separate manual "Backfill PRH Cover Variants" click needed for
+    // anything imported from here on.
+    private void FetchAdditionalCoversForImportedEntries(
+        List<ComicListEntry> entries, List<Series> allSeries,
+        AutoFetchResult result, System.Text.StringBuilder trace, Action<string>? onProgress)
+    {
+        // Keys compare the normalized name UPPERCASED, not with a
+        // StringComparer on the HashSet itself - ValueTuple<string,
+        // float>'s own default equality is plain ordinal (case-
+        // SENSITIVE) per field, with no way to hand it a per-field
+        // comparer, and this absolutely needs to be case-insensitive:
+        // Lunar/PRH's own all-caps catalog style ("AMAZING SPIDER-MAN")
+        // vs. an existing Series.Name in whatever casing it was first
+        // created with ("Amazing Spider-Man") describe the same series
+        // (see SeriesNameKey's own doc comment - Normalize only strips
+        // "The "/subtitle punctuation, it never touches casing at all).
+        var wantedKeys = entries
+            .Where(e => e.SeriesName != null && e.IssueNumber.HasValue)
+            .Select(e => (Key: SeriesNameKey.Normalize(e.SeriesName!).ToUpperInvariant(), e.IssueNumber!.Value))
+            .ToHashSet();
+
+        var touchedIssues = allSeries
+            .SelectMany(s => s.Issues)
+            .Where(i => wantedKeys.Contains((SeriesNameKey.Normalize(i.Series.Name).ToUpperInvariant(), i.IssueNumber)))
+            .Distinct()
+            .ToList();
+
+        var candidates = touchedIssues
+            .Select(i => (
+                Issue: i,
+                QueryCover: i.Covers
+                    .Where(c => IsPrhShapedBarcode(c.Barcode))
+                    .OrderBy(c => string.Equals(c.CoverLetter, "A", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                    .ThenBy(c => c.CoverLetter, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault()))
+            .Where(x => x.QueryCover != null)
+            .ToList();
+
+        if (candidates.Count == 0) return;
+
+        onProgress?.Invoke($"Checking {candidates.Count} just-imported issue(s) against prhcomics.com's own book pages for additional covers...");
+
+        var claimedBarcodes = _db.Covers.Select(c => c.Barcode).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var done = 0;
+        var noPrhPageFound = 0;
+
+        foreach (var (issue, queryCover) in candidates)
+        {
+            done++;
+            var label = $"{issue.Series.Name} #{issue.IssueNumber:0.##}";
+            var lookupBarcode = queryCover!.Barcode.Split('#')[0];
+
+            // Same deliberately modest, precautionary pace as
+            // BackfillCoverVariantsFromPrhBookPages - see that method's
+            // own comment on why.
+            if (done > 1) Thread.Sleep(300);
+
+            string? html;
+            try
+            {
+                html = PrhWebsiteFetcher.DownloadBookPageHtmlAsync(lookupBarcode).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                var errLine = $"{label}: additional-covers lookup failed: {ex.Message}";
+                result.Errors.Add(errLine);
+                trace.AppendLine(errLine);
+                continue;
+            }
+
+            if (html == null)
+            {
+                // A genuine 404 - this barcode isn't actually a
+                // prhcomics.com product (happens for a non-comic-book
+                // item some catalogs include, or a title PRH hasn't
+                // published a page for yet) - not an error, same spirit
+                // as BackfillCoverVariantsFromPrhBookPages' own.
+                noPrhPageFound++;
+                continue;
+            }
+
+            var (addedHere, upgradedHere) = ApplyAdditionalCoversFromPrhBookPageHtml(issue, html, claimedBarcodes, result, trace, label);
+
+            if (addedHere > 0 || upgradedHere > 0)
+            {
+                var outcomeLine = $"{label}: found {addedHere} new cover(s), upgraded {upgradedHere} barcode(s) via PRH's own book page ({lookupBarcode}).";
+                result.Added.Add(outcomeLine);
+                trace.AppendLine(outcomeLine);
+                onProgress?.Invoke(outcomeLine);
+            }
+        }
+
+        trace.AppendLine($"Checked {candidates.Count} just-imported issue(s) for additional covers; {noPrhPageFound} weren't real prhcomics.com products.");
+
+        // Covers every PRH-shaped-barcode cover among THIS batch's own
+        // touched issues that doesn't have an image yet - not just the
+        // variants the loop above just added, but also each new issue's
+        // own original "Cover A" row straight from the catalog row
+        // itself, which previously had no image at all until a separate,
+        // manual Comic Vine auto-link/backfill pass eventually found one
+        // (often a lower-resolution or wrong-printing image - see
+        // claude/metron-integration-notes.md's own pixelation writeup)
+        // or never did for a series Comic Vine couldn't confidently
+        // match at all. Same CDN BackfillCoversFromPrhImageCdn already
+        // uses (images.penguinrandomhouse.com/cover/{barcode} - see that
+        // method's own doc comment for the full story on how this was
+        // found and why it's safe/publisher-agnostic), just scoped to
+        // this one import batch instead of a whole-catalog scan, and run
+        // automatically here instead of only from its own manual button.
+        var imageCandidates = touchedIssues
+            .SelectMany(i => i.Covers.Select(c => (Issue: i, Cover: c)))
+            .Select(x => (x.Issue, x.Cover, LookupBarcode: x.Cover.Barcode.Split('#')[0]))
+            .Where(x => string.IsNullOrWhiteSpace(x.Cover.CoverImagePath)
+                && (x.LookupBarcode.Length == 13 || x.LookupBarcode.Length == 17)
+                && x.LookupBarcode.All(char.IsDigit))
+            .ToList();
+
+        if (imageCandidates.Count > 0)
+        {
+            onProgress?.Invoke($"Checking {imageCandidates.Count} cover(s) from this import against PRH's own cover image CDN...");
+            FetchPrhPlaceholderHashIfUnknown();
+
+            var noCoverAvailable = 0;
+            foreach (var (issue, cover, lookupBarcode) in imageCandidates)
+            {
+                var label = $"{issue.Series.Name} #{issue.IssueNumber:0.##} ({cover.CoverLetter})";
+
+                try
+                {
+                    var bytes = PrhWebsiteFetcher.DownloadCoverBytesAsync(lookupBarcode).GetAwaiter().GetResult();
+                    if (bytes == null) continue; // download failed - left uncovered, same as BackfillCoversFromPrhImageCdn's own
+
+                    var hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes));
+                    if (PlaceholderImageRegistry.IsKnownPlaceholder(hash))
+                    {
+                        noCoverAvailable++;
+                        continue; // PRH has nothing on file for this barcode yet
+                    }
+
+                    var hint = $"{issue.Series.Name}_{issue.IssueNumber}_{cover.CoverLetter}_prh-isbn";
+                    cover.CoverImagePath = _comicVine.SaveCoverImageBytes(bytes, hint);
+                    result.CoversBackfilled++;
+                    var outcomeLine = $"{label}: found a cover via PRH's image CDN ({lookupBarcode}).";
+                    trace.AppendLine(outcomeLine);
+                    onProgress?.Invoke(outcomeLine);
+                }
+                catch (Exception ex)
+                {
+                    var errLine = $"{label}: cover image CDN lookup failed: {ex.Message}";
+                    result.Errors.Add(errLine);
+                    trace.AppendLine(errLine);
+                }
+            }
+
+            trace.AppendLine($"Checked {imageCandidates.Count} cover(s) from this import against PRH's image CDN; {noCoverAvailable} had nothing on file there yet.");
+        }
+
+        var (saved, saveError) = TrySaveChanges();
+        if (!saved) result.Errors.Add($"Failed to save this import batch's additional-covers/cover-image lookup: {saveError}");
     }
 }
 
