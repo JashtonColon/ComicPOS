@@ -32,8 +32,15 @@
     }
     else
     {
+        <div class="toolbar">
+            <ClearableSearchBox Value="@_search" Placeholder="Search series..." OnInput="OnSearchInput" />
+        </div>
+        @if (_filteredSeriesNames.Count == 0)
+        {
+            <p class="empty-state">No series match "@_search".</p>
+        }
         <div class="list-rows">
-            @foreach (var name in _seriesNames)
+            @foreach (var name in _filteredSeriesNames)
             {
                 <div class="list-row" style="cursor:pointer" @onclick="@(() => GoToIssueList(name))">
                     <div class="list-row-main"><span class="list-row-title">@name</span></div>
@@ -87,7 +94,7 @@ else if (_level == 2)
                         <td>
                             @if (!line.Sale.IsVoided)
                             {
-                                <button class="btn-ghost btn-sm" @onclick="@(() => RequestVoid(line))">Void Sale</button>
+                                <button class="btn-ghost btn-sm btn-remove" @onclick="@(() => RequestVoid(line))">Void Sale</button>
                             }
                         </td>
                     </tr>
@@ -103,7 +110,11 @@ else if (_level == 2)
         <p>Void this entire sale from @_confirmVoidLine.Sale.SoldAt.ToString("g")? This restores stock for every item on that sale.</p>
         <div class="form-actions">
             <button class="btn-ghost" @onclick="CancelVoid">Cancel</button>
-            <button class="btn-primary" @onclick="ConfirmVoid">Void Sale</button>
+            @* btn-remove only actually shows (border-color with nothing to
+               render it against on a border:none btn-primary) on a ghost-
+               style button - same btn-ghost+btn-remove combo Checkout's
+               own Remove button uses, see app.css's .btn-remove comment. *@
+            <button class="btn-ghost btn-remove" @onclick="ConfirmVoid">Void Sale</button>
         </div>
     </Modal>
 }
@@ -120,6 +131,17 @@ else if (_level == 2)
     private List<SaleLine> _saleLines = new();
     private string? _voidError;
     private SaleLine? _confirmVoidLine;
+
+    // Added 2026-11-24 (user asked for a search box on History - the
+    // "All Series" list has no other way to narrow a long sales history
+    // down to one series). Plain substring match, same as Inventory's own
+    // series search.
+    private string _search = "";
+    private List<string> _filteredSeriesNames => string.IsNullOrWhiteSpace(_search)
+        ? _seriesNames
+        : _seriesNames.Where(n => n.Contains(_search, StringComparison.OrdinalIgnoreCase)).ToList();
+
+    private void OnSearchInput(ChangeEventArgs e) => _search = e.Value?.ToString() ?? "";
 
     protected override void OnInitialized() => LoadSeriesList();
 
