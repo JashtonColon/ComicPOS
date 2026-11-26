@@ -4,6 +4,8 @@
 @using ComicPos.Core.Services
 @inject IAutoFetchService AutoFetch
 @inject IJSRuntime JS
+@inject IServiceScopeFactory ScopeFactory
+@inject ComicPos.Web.Services.NewBooksStatusContext StatusContext
 @rendermode InteractiveServer
 
 <PageTitle>New Books - Comic POS</PageTitle>
@@ -13,13 +15,23 @@
 </div>
 
 <div class="toolbar">
-    <input type="text" class="search-box" placeholder="Search New Books by series or publisher..." value="@_search" @oninput="OnSearchInput" />
+    <ClearableSearchBox Value="@_search" Placeholder="Search New Books by series or publisher..." OnInput="OnSearchInput" />
     <div style="display:flex;gap:10px;align-items:center">
         <select value="@_sortBy" @onchange="OnSortChanged">
             <option value="@SortRelease">Release Date</option>
             <option value="@SortFoc">FOC Date</option>
             <option value="@SortPublisher">Publisher</option>
             <option value="@SortTitle">Title</option>
+        </select>
+        @* Added 2026-11-24, user feedback: no way to separate single issues
+           from trades/HCs/omnibuses on this screen at all - everything the
+           Lunar importer's TP/HC/collected-edition support (also added
+           2026-11-24) brings in shows mixed in with ongoing single issues,
+           with nothing to tell them apart except reading each title. *@
+        <select value="@_typeFilter" @onchange="OnTypeFilterChanged" title="Filter by Single Issue vs Collected Edition (TP/HC/Omnibus/etc.)">
+            <option value="@TypeFilterAll">All Types</option>
+            <option value="@TypeFilterSingle">Single Issues</option>
+            <option value="@TypeFilterCollected">Collected Editions</option>
         </select>
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRescan">Re-scan Existing</button>
         <!-- Metron is now the primary discovery source (2026-11-22),
@@ -39,9 +51,145 @@
         <button class="btn-primary btn-sm" disabled="@_checking" @onclick="RunMetronCheckNow" title="Pulls every issue Metron has on file with a street date from 2 weeks ago through 4 months out - recent misses plus enough lead time to see FOC deadlines coming. A plain REST API call, no browser window needed.">Check Now (Metron)</button>
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunMetronBackfillYear" title="Pulls all of @DateTime.Today.Year from Metron in one go - for rebuilding history after a catalog reset, not routine use.">Backfill @DateTime.Today.Year (Metron)</button>
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunLocgBackfill" title="Fallback only - pulls every week of @DateTime.Today.Year from League of Comic Geeks. Opens a real Chrome window and needs an occasional manual Cloudflare click; LOCG only lets a request through every few minutes, so a full year can take several hours.">Check Now (LOCG, fallback)</button>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunCheckForNewIssues" title="A second fallback, independent of BOTH Metron and LOCG - checks comiclist.info's weekly list, its Extended Forecast, comicade.com's FOC catalogue, and Comic Vine's new-#1 discovery. All four are plain HTTP/REST calls - no Cloudflare, no browser window, nothing to click through. This was the original Check Now before Metron existed; still fully wired up, just not the default anymore.">Check Now (no Cloudflare)</button>
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRetryMetronEnrichment" title="One-time catch-up for issues Metron already added whose price/UPC/description never came through (a detail-call failure when they were first added) - fills those in and pulls in any cover variants that were missed too. Only needs running once per affected batch, not routine.">Retry Metron Enrichment</button>
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRetryMetronEnrichmentTest" title="Same as Retry Metron Enrichment, but stops after 5 issues - use this first to sanity-check a change (like the Metron API retry/diagnostics fix) in under a minute instead of committing to the full multi-hour run blind.">Retry Metron Enrichment (Test 5)</button>
-        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRetryLocgEnrichmentTest" title="Same job as Retry Metron Enrichment, but sourced from LOCG instead - use this while Metron is blocked. Stops after 5 issues so you can check the result against LOCG's own site before running the full batch. Each issue needing a new LOCG week can take several minutes (LOCG's own rate limit), so this is slower per-issue than the Metron version.">Retry LOCG Enrichment (Test 5)</button>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRetryLocgEnrichmentTest" title="Same job as Retry Metron Enrichment, but sourced from LOCG instead - use this while Metron is blocked. Stops after 2 issues so you can check the result against LOCG's own site before running the full batch. Each issue needing a new LOCG week can take several minutes (LOCG's own rate limit), so this is slower per-issue than the Metron version - kept small on purpose.">Retry LOCG Enrichment (Test 2)</button>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRetryComicadeEnrichmentSpecific" title="Hand-picked check, not a random sample - runs comicade.com's FOC catalogue (one of the no-Cloudflare sources, real UPC included) against exactly two known issues (Absolute Wonder Woman #26, Absolute Flash #21) so you can compare the result by hand. Updates whatever's on file for these two either way. Comicade's own catalogue is forward-looking only - if either issue already shipped, it may not be found there.">Check Comicade (Wonder Woman #26 + Flash #21)</button>
+        <!-- Added 2026-11-24 - a distributor's own weekly release file
+             (real UPC/price/publisher/description/FOC date/street date,
+             PLUS a real embedded cover photo per row) read directly, with
+             nothing to scrape and nothing rate-limited or Cloudflare-
+             guarded. See IAutoFetchService.ImportLunarDistributionRelease.
+             Styled as a label wrapping a hidden InputFile so it matches
+             the other buttons instead of showing the browser's default
+             file-input control. -->
+        <label class="btn-primary btn-sm" style="cursor:pointer" title="Reads a Lunar Distribution weekly release .xlsx file directly - real UPC, price, publisher, FOC date, street date, and even the cover photo for every row, with nothing to scrape or rate-limit against. Pick the file your distributor sends you each week.">
+            Import Lunar Release (.xlsx)
+            <InputFile OnChange="OnLunarFileSelected" accept=".xlsx" style="display:none" disabled="@_checking" />
+        </label>
+        <!-- Added 2026-11-24 - downloads this week's release file AND the
+             current FOC file straight from lunardistribution.com itself
+             (a plain, cookie-less GET - see AutoFetchService.
+             FetchLunarReleaseFromWebsite), so there's no manual
+             download+upload step at all. The button above still exists
+             for whenever the site's layout changes and this breaks, or
+             for a file received some other way (e.g. emailed directly). -->
+        <button class="btn-primary btn-sm" disabled="@_checking" @onclick="RunLunarWebsiteFetch" title="Downloads this week's release file AND the current FOC file directly from lunardistribution.com - no file to save or upload yourself. Reads the same two dates the site's own 'Product Data File' buttons use right now.">Fetch Lunar Release (auto)</button>
+        <!-- Added 2026-11-25 - PRH's own "Comics Retail" solicitation
+             spreadsheet: already a clean, named-column table (ISBN/UPC,
+             Title, Creators, Imprint, price, Format, FOC Date, On-Sale
+             Date), covering PRH's FULL Direct Market distribution list
+             (Marvel, DC, Dark Horse, IDW, Oni Press, Kodansha, Seven
+             Seas, Titan Books and many more - not just Penguin Random
+             House's own imprints), not just a PRH-specific feed. See
+             IAutoFetchService.ImportPrhCatalogRelease. No embedded cover
+             photo in this one (unlike Lunar) - covers come from the
+             existing Comic Vine auto-link pass instead, same as any
+             other source without a photo of its own. Same hidden-
+             InputFile-under-a-label styling as the Lunar button above. -->
+        <label class="btn-primary btn-sm" style="cursor:pointer" title="Reads PRH's Comics Retail solicitation spreadsheet directly - ISBN/UPC, price, publisher, FOC date, and on-sale date for every title, covering PRH's full Direct Market distribution list (Marvel, DC, Dark Horse, IDW, Oni Press, Kodansha, and many more), not just PRH's own imprints. No cover photos in this file - those get filled in by Comic Vine auto-linking afterward.">
+            Import PRH Catalog (.xlsx)
+            <InputFile OnChange="OnPrhCatalogFileSelected" accept=".xlsx" style="display:none" disabled="@_checking" />
+        </label>
+        <!-- Added 2026-11-25/26 - downloads the catalog straight from
+             prhcomics.com itself instead of needing the file saved and
+             uploaded by hand: reads the catalog-landing-page, replays
+             the same WordPress-AJAX-plus-nonce chain its own "Download
+             Excel Spreadsheet" button performs, and feeds the result
+             through the exact same ImportPrhCatalogRelease pipeline as
+             the manual upload above. See AutoFetchService.
+             FetchPrhCatalogFromWebsite and PrhWebsiteFetcher's own class
+             comment for the full chain. catalogCode is PRH's "YYYY-MM"
+             solicitation-month code - defaults to next month (the
+             catalog that's normally open for ordering right now), but
+             stays a plain text box since PRH links to several months at
+             once rather than exposing one single "current" one the way
+             lunardistribution.com's homepage does. The manual upload
+             button above still exists for whenever prhcomics.com's
+             layout changes and this breaks, or for a file received some
+             other way. -->
+        <input type="text" class="form-control form-control-sm" style="width:90px;display:inline-block" @bind="_prhCatalogCode" disabled="@_checking" title="PRH catalog code, YYYY-MM (e.g. 2026-12)" />
+        <button class="btn-primary btn-sm" disabled="@_checking" @onclick="RunPrhWebsiteFetch" title="Downloads the Comics Retail catalog for the code above directly from prhcomics.com - no file to save or upload yourself.">Fetch PRH Catalog (auto)</button>
+        <!-- Added 2026-11-26 - the store asked for every available month,
+             not just one at a time. Discovers every catalog code
+             prhcomics.com's own public archive currently lists (confirmed
+             live it runs 2021-06 through whatever's newest right now -
+             60+ catalogs) and fetches each one, same spirit as Backfill
+             All Lunar History below - gated behind a confirm() for the
+             same reason (a lot of requests, takes a while), and also only
+             ever adds/updates inventory, never deletes. See
+             AutoFetchService.FetchAllAvailablePrhCatalogsFromWebsite. -->
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunFetchAllPrhCatalogs" title="Finds and downloads EVERY catalog prhcomics.com's own archive currently lists (2021 through now, 60+ months) instead of just the one code above. Can take a long time; only ever adds/updates inventory, never deletes anything.">Fetch All Available PRH Catalogs</button>
+        <!-- Added 2026-11-24, same night as the fix above - a one-time
+             cleanup pair for whatever duplicate series the bug already
+             created before the fix landed (a series split into "Name"
+             and "Name (2024)" rows). Find is read-only; Merge actually
+             changes the database, so it's gated behind a JS confirm()
+             and meant to be run only after checking Find's own output. -->
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunFindDuplicateSeries" title="Read-only - lists any series that look like they got split into two rows (e.g. by the 2026-11-24 Lunar '(YYYY)' title-parsing bug), with issue counts for each, so you can see what's there before merging anything.">Find Duplicate Series</button>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunMergeDuplicateSeries" title="Actually merges whatever Find Duplicate Series turns up - combines issues/covers onto whichever row looks most established and deletes the now-empty duplicate. Asks for confirmation first; not reversible from inside the app, so run Find Duplicate Series first and check its output.">Merge Duplicate Series</button>
+        <!-- Hand-picked one-time cleanup, added 2026-11-24 right after -
+             the user's real Find Duplicate Series scan turned up exactly
+             these two rows (Darkness, Zatanna) and asked for a plain
+             delete of the new duplicate instead of a merge, specifically
+             so the established issue's Publisher/Description/etc. are
+             never touched at all. See AutoFetchService.
+             DeleteKnownDuplicateSeries - hardcoded to these two series
+             ids, not a general tool. -->
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunDeleteKnownDuplicateSeries" title="One-time cleanup, hardcoded to the exact two duplicate series found tonight (Darkness #1972, Zatanna #1973) - deletes just those two rows outright and leaves the established series (#1706, #1761) completely untouched. Asks for confirmation first.">Delete Known Duplicates (Darkness/Zatanna)</button>
+        <!-- Added 2026-11-24, same night - the store asked for Lunar
+             history "as far back as it goes... then as far into the
+             future as possible", not just the one current week Fetch
+             Lunar Release (auto) covers. Walks the site's own date-nav
+             chain in both directions and imports every real week it finds
+             (see AutoFetchService.BackfillAllLunarHistory). This is
+             dozens of file downloads in one run, so it's gated behind a
+             confirm() warning how long it can take, same spirit as the
+             merge/delete buttons above (though this one only ever adds
+             data - it never deletes or changes anything already in
+             inventory). -->
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunBackfillAllLunarHistory" title="Walks lunardistribution.com's own date-nav as far back and as far forward as it goes, downloading and importing every week that has real data - roughly a year or more of history both directions. Can take several minutes; only ever adds/updates inventory, never deletes anything.">Backfill All Lunar History</button>
+        <!-- Added 2026-11-24 after the real backfill run above left some
+             Lunar covers with no real UPC (see AutoFetchService.
+             AddMissingCoverVariants - that bug is fixed now, but existing
+             placeholder rows from before the fix still need clearing out).
+             See AutoFetchService.DeleteLunarPlaceholderCovers's own doc
+             comment for exactly what this can identify and delete - only
+             Lunar covers that fell back to a generated barcode, never one
+             that already got a real UPC. Confirm-gated, same as the
+             Darkness/Zatanna cleanup above. -->
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunDeleteLunarPlaceholderCovers" title="Deletes any Lunar-imported cover that never got a real UPC (still shows a generated 'LUN-' barcode) - the ones left broken before today's enrichment fix. A Lunar cover that already has a real UPC is left alone. Also removes any issue/series that ends up with nothing left on it. Asks for confirmation first; not reversible from inside the app.">Delete Lunar Placeholders</button>
+        <!-- Dev/demo seed data, added 2026-11-24 - see AutoFetchService.
+             GenerateFakeCustomersAndSalesHistory's own doc comment for
+             exactly what "real" means here (any non-placeholder cover
+             already in inventory, not literally only Lunar's) and why
+             it's safe to click more than once. Not confirm-gated like the
+             delete buttons above - this only ever ADDS data, it never
+             removes or changes anything that was already there besides
+             decrementing stock the same way a real sale would. -->
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunGenerateFakeSeedData" title="Adds 15 fake customers, 60 fake past sales, and a few fake pull-list subscriptions per customer, drawn from whatever real (non-placeholder) covers are already in inventory, so Dashboard/History/Customers/FOC Report/Who's Pulling This all have something to show. Decrements stock for each fake sale (never below 0 - simulates receiving a few copies first if needed). Safe to run more than once - existing customers and subscriptions aren't duplicated, new fake sales just keep piling on.">Generate Fake Sales History</button>
+        <!-- Added 2026-11-24 - fixes persistent pixelation on covers that
+             were already saved before ComicVineService was fixed to prefer
+             Comic Vine's larger "super_url" image (every cover before today
+             was saved at the smaller "medium_url" size). Checks each
+             cover's actual saved image width and only touches ones under
+             ~400px, and only when an exact series+issue match is found on
+             Comic Vine - never deletes or guesses, just swaps in a higher-
+             resolution copy where a confident one exists. See
+             AutoFetchService.UpgradeLowResolutionCovers. -->
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunUpgradeLowResolutionCovers" title="Checks every cover's actual saved image size and re-fetches a higher-resolution copy from Comic Vine for any that are low-res - auto-links the series to Comic Vine first if it isn't already, then only swaps the cover when an exact issue match is found there. Never deletes anything; a cover with no confident match is left untouched.">Upgrade Low-Res Covers</button>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunUpgradeLowResolutionCoversTest" title="Same as Upgrade Low-Res Covers, but stops after 5 covers - use this first to confirm it's picking the right ones before running it against the whole catalog.">Upgrade Low-Res Covers (Test 5)</button>
+        <!-- Added 2026-11-25/26 - see AutoFetchService.
+             BackfillCoversFromPrhImageCdn's own doc comment. Different from
+             Upgrade Low-Res Covers above: that one only swaps in a BETTER
+             image for a cover that already has SOME image on file; this one
+             fills in a cover that's completely BLANK (most of what the
+             67-catalog PRH fetch just added) by looking its own barcode up
+             directly against PRH's public cover-image service - no Comic
+             Vine match needed at all, since the barcode IS the lookup key. -->
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunBackfillPrhCovers" title="Looks up every cover with nothing on file yet whose barcode is a real ISBN-13 or a full UPC+addon - PRH's own catalog-wide barcode shapes - directly against PRH's own public cover-image service. No Comic Vine match needed; a barcode with nothing on file there is just left blank.">Backfill PRH/ISBN Covers</button>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunBackfillPrhCoversTest" title="Same as Backfill PRH/ISBN Covers, but stops after 5 covers - use this first to confirm it's finding the right images before running it against everything.">Backfill PRH/ISBN Covers (Test 5)</button>
     </div>
 </div>
 
@@ -64,13 +212,48 @@
 
 @if (_showMonthTabs)
 {
-    <div class="month-pills">
-        <span class="month-pill @(_selectedMonthLabel == null ? "active" : "")" @onclick="@(() => SelectMonth(null))">All</span>
-        @foreach (var month in _monthTabs)
+    @* Was a flat row of one pill per distinct month - fine with a handful
+       of months, but the Lunar backfill now spans roughly a year back and
+       a year-plus forward (see AutoFetchService.BackfillAllLunarHistory),
+       so this could grow to 20-30+ pills wrapping across several lines.
+       User feedback 2026-11-24: "too many months available... make it a
+       better selection option." A dropdown scales to any number of months
+       without the layout falling apart, same pattern as the sort/type
+       selects right above. *@
+    <div class="toolbar" style="margin-top:-8px">
+        <select value="@(_selectedMonthLabel ?? "")" @onchange="@(e => SelectMonth(string.IsNullOrEmpty(e.Value?.ToString()) ? null : e.Value!.ToString()))">
+            <option value="">All months</option>
+            @foreach (var month in _monthTabs)
+            {
+                <option value="@month">@month</option>
+            }
+        </select>
+        @if (_selectedMonthLabel != _currentMonthLabel && _monthTabs.Contains(_currentMonthLabel))
         {
-            <span class="month-pill @(_selectedMonthLabel == month ? "active" : "")" @onclick="@(() => SelectMonth(month))">@month</span>
+            <button class="btn-ghost btn-sm" @onclick="@(() => SelectMonth(_currentMonthLabel))">Jump to current month</button>
         }
-        <span class="month-pill" style="margin-left:auto;font-weight:400;opacity:0.7" @onclick="@(() => SelectMonth(_currentMonthLabel))">Jump to current month</span>
+    </div>
+}
+
+@if (_showMonthTabs && _selectedMonthLabel != null && _weekStarts.Count > 1)
+{
+    @* Task #85 (2026-11-24): "add a buttons like how the monts used to
+       look before for quickly selcting which week to look at" - brought
+       back as a pill row, reusing the .month-pills/.month-pill CSS the
+       OLD month-pill row used before that became the dropdown above (see
+       its own doc comment for why a year-plus of months needed a
+       dropdown instead). A single selected month only ever has a
+       handful of weeks in it, so a pill row still works fine here and
+       matches what the store actually asked to get back. Only shown
+       once a specific month is picked (and only when that month has
+       more than one distinct week) - "all months" has nothing single
+       week-row-worth of weeks to show. *@
+    <div class="month-pills">
+        <button class="month-pill @(_selectedWeekStart == null ? "active" : "")" @onclick="@(() => SelectWeek(null))">All weeks</button>
+        @foreach (var week in _weekStarts)
+        {
+            <button class="month-pill @(_selectedWeekStart == week ? "active" : "")" @onclick="@(() => SelectWeek(week))">@week.ToString("MMM d", CultureInfo.InvariantCulture)</button>
+        }
     </div>
 }
 
@@ -109,6 +292,32 @@ else
             }
         </tbody>
     </table>
+
+    @if (_totalPages > 1)
+    {
+        @* Numbered pagination, added 2026-11-24 to replace the old
+           unlimited scroll within a selected month - matches the plain
+           "previous 1 2 3 ... next" convention the user asked for instead
+           of an endless table. *@
+        <div class="toolbar" style="margin-top:10px;flex-wrap:wrap;align-items:center">
+            <button class="btn-ghost btn-sm" disabled="@(_currentPage == 1)" @onclick="@(() => GoToPage(_currentPage - 1))">&laquo; previous</button>
+            @foreach (var p in GetPageNumbersToShow())
+            {
+                @if (p == null)
+                {
+                    <span class="help-text" style="padding:0 2px">&hellip;</span>
+                }
+                else
+                {
+                    <button class="@(p == _currentPage ? "btn-primary btn-sm" : "btn-ghost btn-sm")" @onclick="@(() => GoToPage(p.Value))">@p</button>
+                }
+            }
+            <button class="btn-ghost btn-sm" disabled="@(_currentPage == _totalPages)" @onclick="@(() => GoToPage(_currentPage + 1))">next &raquo;</button>
+            <span class="help-text" style="margin-left:10px">
+                Showing @((_currentPage - 1) * PageSize + 1)&ndash;@(Math.Min(_currentPage * PageSize, _totalIssueCount)) of @_totalIssueCount
+            </span>
+        </div>
+    }
 }
 
 <NewBookDetailModal Show="_showDetail" Issue="_detailIssue" OnClose="@(() => _showDetail = false)" />
@@ -119,12 +328,41 @@ else
     private const string SortFoc = "FOC Date";
     private const string SortRelease = "Release Date";
 
+    private const string TypeFilterAll = "All";
+    private const string TypeFilterSingle = "Single Issue";
+    private const string TypeFilterCollected = "Collected Edition";
+
     private string _sortBy = SortRelease;
+    private string _typeFilter = TypeFilterAll;
     private string _search = "";
     private string _status = "";
-    private string? _resultMessage;
-    private string? _resultTrace;
+
+    // Backed by NewBooksStatusContext (Scoped, one per circuit) instead of
+    // being a plain field, so the result banner and its trace box survive
+    // navigating away and back to this page - see that service's own doc
+    // comment for the full story. Every existing read/write site below
+    // (`_resultMessage = ...`, `@_resultMessage`, etc.) needed no changes
+    // at all - property access reads identically to field access from the
+    // caller's side.
+    private string? _resultMessage
+    {
+        get => StatusContext.ResultMessage;
+        set => StatusContext.ResultMessage = value;
+    }
+
+    private string? _resultTrace
+    {
+        get => StatusContext.ResultTrace;
+        set => StatusContext.ResultTrace = value;
+    }
+
     private bool _checking;
+
+    // Defaults to NEXT month's code ("YYYY-MM") since that's normally
+    // the catalog still open for ordering on any given day - a store
+    // owner wanting a different month (catching up on a missed one,
+    // say) just edits the box before clicking Fetch.
+    private string _prhCatalogCode = DateTime.Today.AddMonths(1).ToString("yyyy-MM", CultureInfo.InvariantCulture);
 
     private bool _showMonthTabs;
     private List<string> _monthTabs = new();
@@ -132,7 +370,23 @@ else
     private bool _monthFilterInitialized;
     private readonly string _currentMonthLabel = DateTime.Today.ToString("MMMM yyyy", CultureInfo.InvariantCulture);
 
+    // Task #85 (2026-11-24): week-level quick-select pills within whichever
+    // month is currently selected above - see RefreshGrid for how these
+    // get (re)computed and SelectWeek for how a click filters the list.
+    private List<DateOnly> _weekStarts = new();
+    private DateOnly? _selectedWeekStart;
+
     private List<DisplayRow> _displayRows = new();
+
+    // Added 2026-11-24, user feedback: within a single selected month the
+    // issue list had no limit at all - could be hundreds of rows on one
+    // unbroken scroll. Paginate like any normal numbered list instead;
+    // 50/page keeps a typical month to a handful of pages while still
+    // showing enough to scan quickly in one screen.
+    private const int PageSize = 50;
+    private int _currentPage = 1;
+    private int _totalPages = 1;
+    private int _totalIssueCount;
 
     private bool _showDetail;
     private Issue? _detailIssue;
@@ -149,6 +403,7 @@ else
     private void OnSearchInput(ChangeEventArgs e)
     {
         _search = e.Value?.ToString() ?? "";
+        _currentPage = 1;
         RefreshGrid();
     }
 
@@ -159,6 +414,15 @@ else
         _sortBy = e.Value?.ToString() ?? SortRelease;
         _selectedMonthLabel = null;
         _monthFilterInitialized = false;
+        _selectedWeekStart = null;
+        _currentPage = 1;
+        RefreshGrid();
+    }
+
+    private void OnTypeFilterChanged(ChangeEventArgs e)
+    {
+        _typeFilter = e.Value?.ToString() ?? TypeFilterAll;
+        _currentPage = 1;
         RefreshGrid();
     }
 
@@ -166,6 +430,10 @@ else
     {
         _selectedMonthLabel = label;
         _monthFilterInitialized = true;
+        // A week pill from the PREVIOUS month has no meaning under a new
+        // one (or under "All months") - drop back to "All weeks".
+        _selectedWeekStart = null;
+        _currentPage = 1;
         RefreshGrid();
         // Switching tabs re-renders the table in place (no page
         // navigation happens), so the browser doesn't naturally scroll
@@ -173,6 +441,55 @@ else
         // this, clicking a tab while scrolled partway down a long list
         // can look like the click "didn't go all the way back."
         try { await JS.InvokeVoidAsync("window.scrollTo", 0, 0); } catch { /* best effort */ }
+    }
+
+    private async Task SelectWeek(DateOnly? weekStart)
+    {
+        _selectedWeekStart = weekStart;
+        _currentPage = 1;
+        RefreshGrid();
+        try { await JS.InvokeVoidAsync("window.scrollTo", 0, 0); } catch { /* best effort */ }
+    }
+
+    // Monday of the week containing this date - matches the Monday-based
+    // weekly cadence the rest of the app already organizes releases by
+    // (see AutoFetchService.RunBackfillYearFromLocg, which walks every
+    // Monday). DateOnly.DayOfWeek: Sunday=0..Saturday=6; this maps
+    // Monday=0..Sunday=6 instead so subtracting it always lands on the
+    // Monday on/before the given date.
+    private static DateOnly WeekStart(DateOnly date) => date.AddDays(-(((int)date.DayOfWeek + 6) % 7));
+
+    private DateOnly GroupWeekFor(Issue issue) =>
+        WeekStart(_sortBy == SortFoc ? (issue.FocDate ?? DateOnly.MaxValue) : (issue.ReleaseDate ?? DateOnly.MaxValue));
+
+    private async Task GoToPage(int page)
+    {
+        if (page < 1 || page > _totalPages || page == _currentPage) return;
+        _currentPage = page;
+        RefreshGrid();
+        try { await JS.InvokeVoidAsync("window.scrollTo", 0, 0); } catch { /* best effort */ }
+    }
+
+    // Windowed page-number list (first, last, a small range around the
+    // current page, null entries rendered as "...") so a month with
+    // hundreds of pages doesn't render hundreds of page-number buttons.
+    private List<int?> GetPageNumbersToShow()
+    {
+        var pages = new List<int?>();
+        if (_totalPages <= 9)
+        {
+            for (var i = 1; i <= _totalPages; i++) pages.Add(i);
+            return pages;
+        }
+
+        pages.Add(1);
+        var start = Math.Max(2, _currentPage - 2);
+        var end = Math.Min(_totalPages - 1, _currentPage + 2);
+        if (start > 2) pages.Add(null);
+        for (var i = start; i <= end; i++) pages.Add(i);
+        if (end < _totalPages - 1) pages.Add(null);
+        pages.Add(_totalPages);
+        return pages;
     }
 
     private void OpenDetail(Issue issue)
@@ -217,6 +534,11 @@ else
                 (!string.IsNullOrWhiteSpace(i.Publisher) && i.Publisher.Contains(searchText, StringComparison.OrdinalIgnoreCase)));
         }
 
+        if (_typeFilter == TypeFilterSingle)
+            issues = issues.Where(i => i.Type == IssueType.SingleIssue);
+        else if (_typeFilter == TypeFilterCollected)
+            issues = issues.Where(i => i.Type == IssueType.CollectedEdition);
+
         IEnumerable<Issue> ordered = _sortBy switch
         {
             SortPublisher => issues.OrderBy(i => i.Publisher).ThenBy(i => i.Series.Name).ThenBy(i => i.IssueNumber),
@@ -253,17 +575,50 @@ else
 
             if (_selectedMonthLabel != null)
                 orderedList = orderedList.Where(i => GroupLabelFor(i, _sortBy) == _selectedMonthLabel).ToList();
+
+            // Task #85: week pills, computed from whatever's left in the
+            // currently-selected month only (so "weeks" always means
+            // "weeks within this month", never the whole list) - and only
+            // once a specific month is actually picked; "All months"
+            // would mix in weeks from a year-plus of history with no
+            // month to scope them to.
+            if (_selectedMonthLabel != null)
+            {
+                _weekStarts = orderedList
+                    .Select(GroupWeekFor)
+                    .Where(w => w != DateOnly.MaxValue)
+                    .Distinct()
+                    .OrderBy(w => w)
+                    .ToList();
+                if (_selectedWeekStart != null && !_weekStarts.Contains(_selectedWeekStart.Value))
+                    _selectedWeekStart = null;
+                if (_selectedWeekStart != null)
+                    orderedList = orderedList.Where(i => GroupWeekFor(i) == _selectedWeekStart.Value).ToList();
+            }
+            else
+            {
+                _weekStarts = new List<DateOnly>();
+                _selectedWeekStart = null;
+            }
         }
         else
         {
             _monthTabs = new List<string>();
+            _weekStarts = new List<DateOnly>();
+            _selectedWeekStart = null;
         }
+
+        _totalIssueCount = orderedList.Count;
+        _totalPages = Math.Max(1, (int)Math.Ceiling(_totalIssueCount / (double)PageSize));
+        if (_currentPage > _totalPages) _currentPage = _totalPages;
+        if (_currentPage < 1) _currentPage = 1;
+        var pageList = orderedList.Skip((_currentPage - 1) * PageSize).Take(PageSize).ToList();
 
         _displayRows = new List<DisplayRow>();
         string? lastGroupValue = null;
         var showInlineHeader = _sortBy != SortTitle && !(monthCapableSort && _selectedMonthLabel != null);
 
-        foreach (var issue in orderedList)
+        foreach (var issue in pageList)
         {
             var groupValue = GroupLabelFor(issue, _sortBy);
             if (showInlineHeader && groupValue != lastGroupValue)
@@ -498,21 +853,23 @@ else
     }
 
     // LOCG counterpart to RunRetryMetronEnrichmentTest above - same
-    // Test-5 "sanity-check before committing to the real thing" purpose,
-    // added 2026-11-23 while Metron itself is blocked (see
+    // "sanity-check before committing to the real thing" purpose, added
+    // 2026-11-23 while Metron itself is blocked (see
     // metron-integration-notes.md) so there's still a way to make
     // progress on the backfill. No un-capped "Retry LOCG Enrichment"
     // button yet on purpose - this is brand-new code hitting a slow,
-    // rate-limited site, so it's worth confirming a Test-5 run actually
+    // rate-limited site, so it's worth confirming a test run actually
     // matches LOCG's real data before ever running it uncapped against
-    // the full backlog.
+    // the full backlog. Dropped from 5 to 2 on 2026-11-24 - each LOCG
+    // week fetch alone can take several minutes, so 5 was a slow way to
+    // iterate while still shaking out ordering/matching bugs.
     private async Task RunRetryLocgEnrichmentTest()
     {
         if (_checking) return;
         _checking = true;
         _resultMessage = null;
         _resultTrace = null;
-        _status = "Test run (5 issues) - re-checking LOCG for issues whose publisher/UPC/price never came through...";
+        _status = "Test run (2 issues) - re-checking LOCG for issues whose publisher/UPC/price never came through...";
 
         AutoFetchResult? result = null;
         Exception? error = null;
@@ -525,7 +882,7 @@ else
                     _status = progressLine;
                     StateHasChanged();
                 });
-            }, limit: 5));
+            }, limit: 2));
         }
         catch (Exception ex)
         {
@@ -543,6 +900,858 @@ else
             var summary = $"Test run: re-enriched {result.Added.Count} issue(s) from LOCG.";
             if (result.Errors.Count > 0)
                 summary += " Some issues had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Added 2026-11-24 - see AutoFetchService.UpgradeLowResolutionCovers's
+    // own doc comment for the full story (both ComicVineService issue-fetch
+    // methods used to save covers at Comic Vine's smaller "medium_url" size;
+    // this is the catch-up pass for whatever got saved that way before
+    // today's fix). Not confirm-gated - same as Retry Metron Enrichment
+    // above, this only ever swaps in a better image for an existing cover,
+    // never deletes anything.
+    private async Task RunUpgradeLowResolutionCovers()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Checking covers for low resolution and re-fetching from Comic Vine where a confident match exists...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.UpgradeLowResolutionCovers(progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Upgrade low-res covers failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Upgraded {result.CoversBackfilled} low-resolution cover(s).";
+            if (result.Errors.Count > 0)
+                summary += " Some covers had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Same as RunUpgradeLowResolutionCovers above, just capped at 5 covers -
+    // a quick way to confirm the low-res detection and Comic Vine matching
+    // are picking the right covers before committing to the full catalog.
+    private async Task RunUpgradeLowResolutionCoversTest()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Test run (5 covers) - checking for low resolution and re-fetching from Comic Vine where a confident match exists...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.UpgradeLowResolutionCovers(progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }, limit: 5));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Upgrade low-res covers test run failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Test run: upgraded {result.CoversBackfilled} low-resolution cover(s).";
+            if (result.Errors.Count > 0)
+                summary += " Some covers had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Added 2026-11-25/26 - see AutoFetchService.
+    // BackfillCoversFromPrhImageCdn's own doc comment. Not confirm-gated -
+    // same as the other cover-backfill buttons on this page, this only ever
+    // fills in a cover that was completely blank, never deletes or changes
+    // anything else.
+    private async Task RunBackfillPrhCovers()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Looking up covers with a blank image against PRH's own cover-image service...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.BackfillCoversFromPrhImageCdn(progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Backfill PRH/ISBN covers failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Found {result.CoversBackfilled} cover(s) via PRH's image CDN.";
+            if (result.Errors.Count > 0)
+                summary += " Some covers had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Same as RunBackfillPrhCovers above, just capped at 5 covers - a quick
+    // way to confirm this is finding the right images before committing to
+    // the full catalog.
+    private async Task RunBackfillPrhCoversTest()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Test run (5 covers) - looking up covers against PRH's own cover-image service...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.BackfillCoversFromPrhImageCdn(progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }, limit: 5));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Backfill PRH/ISBN covers test run failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Test run: found {result.CoversBackfilled} cover(s) via PRH's image CDN.";
+            if (result.Errors.Count > 0)
+                summary += " Some covers had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Hand-picked diagnostic button, added 2026-11-24 - see
+    // AutoFetchService.RetryComicadeEnrichmentForSpecificIssues's own doc
+    // comment. Checks comicade.com (no Cloudflare) rather than LOCG,
+    // since LOCG itself was the thing acting up when this was built.
+    private async Task RunRetryComicadeEnrichmentSpecific()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Checking Comicade's FOC catalogue for Absolute Wonder Woman #26 and Absolute Flash #21...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.RetryComicadeEnrichmentForSpecificIssues(progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Comicade retry-enrichment (specific issues) failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Re-enriched {result.Added.Count}/2 target issue(s) from Comicade.";
+            if (result.Errors.Count > 0)
+                summary += " Some issues had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    private async Task OnLunarFileSelected(InputFileChangeEventArgs e)
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = $"Reading {e.File.Name}...";
+        StateHasChanged();
+
+        // A real weekly release file runs several MB (it embeds a cover
+        // photo for every row) - InputFile's own default cap is a tiny
+        // 500KB, which rejects any real file outright without a much
+        // larger explicit limit here.
+        var tempPath = Path.Combine(Path.GetTempPath(), $"lunar_{Guid.NewGuid():N}.xlsx");
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            await using (var fs = File.Create(tempPath))
+            {
+                await e.File.OpenReadStream(maxAllowedSize: 100_000_000).CopyToAsync(fs);
+            }
+
+            result = await Task.Run(() => AutoFetch.ImportLunarDistributionRelease(tempPath, progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+        finally
+        {
+            try { File.Delete(tempPath); } catch { /* best-effort cleanup only */ }
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Lunar Distribution import failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Imported {e.File.Name}: {result.NewIssuesAdded} new issue(s) added.";
+            if (result.Errors.Count > 0)
+                summary += $" {result.Errors.Count} row(s) had issues (see details below).";
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    private async Task OnPrhCatalogFileSelected(InputFileChangeEventArgs e)
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = $"Reading {e.File.Name}...";
+        StateHasChanged();
+
+        // Pure data, no embedded images - this file is tiny compared to
+        // a Lunar release (the real sample file was ~64KB), but there's
+        // no cost to being just as generous about the upload cap.
+        var tempPath = Path.Combine(Path.GetTempPath(), $"prh_{Guid.NewGuid():N}.xlsx");
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            await using (var fs = File.Create(tempPath))
+            {
+                await e.File.OpenReadStream(maxAllowedSize: 100_000_000).CopyToAsync(fs);
+            }
+
+            result = await Task.Run(() => AutoFetch.ImportPrhCatalogRelease(tempPath, progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+        finally
+        {
+            try { File.Delete(tempPath); } catch { /* best-effort cleanup only */ }
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"PRH Catalog import failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Imported {e.File.Name}: {result.NewIssuesAdded} new issue(s) added.";
+            if (result.Errors.Count > 0)
+                summary += $" {result.Errors.Count} row(s) had issues (see details below).";
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    private async Task RunPrhWebsiteFetch()
+    {
+        if (_checking) return;
+        var catalogCode = _prhCatalogCode.Trim();
+        if (string.IsNullOrWhiteSpace(catalogCode))
+        {
+            _resultMessage = "Enter a PRH catalog code (YYYY-MM) first.";
+            return;
+        }
+
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = $"Reading prhcomics.com's catalog page for {catalogCode}...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.FetchPrhCatalogFromWebsite(catalogCode, progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"PRH website fetch failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Fetched from prhcomics.com ({catalogCode}): {result.NewIssuesAdded} new issue(s) added.";
+            if (result.Errors.Count > 0)
+                summary += $" {result.Errors.Count} row(s)/file(s) had issues (see details below).";
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Downloads this week's release + FOC files directly from
+    // lunardistribution.com instead of asking the user to save and
+    // upload them (see AutoFetchService.FetchLunarReleaseFromWebsite) -
+    // added 2026-11-24. Same Task.Run/InvokeAsync threading pattern as
+    // RunMetronCheckNow above, since this can take a little while
+    // (downloading two multi-MB files, then running each through the
+    // full image-save/import pipeline).
+    private async Task RunLunarWebsiteFetch()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Reading lunardistribution.com for this week's release/FOC files...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.FetchLunarReleaseFromWebsite(progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Lunar website fetch failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Fetched from lunardistribution.com: {result.NewIssuesAdded} new issue(s) added.";
+            if (result.Errors.Count > 0)
+                summary += $" {result.Errors.Count} row(s)/file(s) had issues (see details below).";
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Read-only scan for the duplicate series the 2026-11-24 Lunar
+    // title-parsing bug could leave behind - see AutoFetchService.
+    // FindDuplicateSeries's own doc comment. Safe to click any time;
+    // makes no database changes.
+    private async Task RunFindDuplicateSeries()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Scanning for duplicate series (read-only - no changes made)...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.FindDuplicateSeries());
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Duplicate scan failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            _resultMessage = result.Added.Count == 0
+                ? "No duplicate series found."
+                : "Found possible duplicate series - see the full log below before merging anything.";
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // The real fix for whatever RunFindDuplicateSeries above turns up -
+    // see AutoFetchService.MergeDuplicateSeries's own doc comment. This
+    // one actually changes the database (not reversible from inside the
+    // app), so it's gated behind a plain JS confirm() rather than running
+    // the moment the button's clicked.
+    private async Task RunMergeDuplicateSeries()
+    {
+        if (_checking) return;
+
+        var confirmed = await JS.InvokeAsync<bool>("confirm",
+            "This merges duplicate series for real - issues/covers get combined onto one series and the extra series rows are deleted. This can't be undone from inside the app. Run \"Find Duplicate Series\" first and make sure you're OK with what it found.\n\nContinue?");
+        if (!confirmed) return;
+
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Merging duplicate series...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.MergeDuplicateSeries(progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Merge failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            _resultMessage = result.Added.Count == 0
+                ? "No duplicates found - nothing to merge."
+                : "Duplicate series merged - see the full log below for exactly what moved.";
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // One-time cleanup button - see AutoFetchService.
+    // DeleteKnownDuplicateSeries's own doc comment. Hardcoded to the
+    // exact two duplicate series found tonight; same confirm-first
+    // pattern as RunMergeDuplicateSeries since this also really deletes.
+    private async Task RunDeleteKnownDuplicateSeries()
+    {
+        if (_checking) return;
+
+        var confirmed = await JS.InvokeAsync<bool>("confirm",
+            "This deletes Series #1972 (\"DARKNESS (2025)\") and #1973 (\"ZATANNA (2026)\") outright - the established Darkness/Zatanna series are left untouched. Not reversible from inside the app.\n\nContinue?");
+        if (!confirmed) return;
+
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Deleting known duplicate series...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.DeleteKnownDuplicateSeries(progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Delete failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            _resultMessage = result.Added.Count == 0
+                ? "Nothing deleted - neither series was found (already removed?)."
+                : $"Deleted {result.Added.Count} series - see the full log below.";
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // See AutoFetchService.DeleteLunarPlaceholderCovers's own doc comment -
+    // only deletes Lunar covers that never got a real UPC (generated
+    // "LUN-" barcode); a cover that already has real data is left alone.
+    // Same confirm-first pattern as RunDeleteKnownDuplicateSeries above
+    // since this also really deletes.
+    private async Task RunDeleteLunarPlaceholderCovers()
+    {
+        if (_checking) return;
+
+        var confirmed = await JS.InvokeAsync<bool>("confirm",
+            "This deletes every Lunar-imported cover that never got a real UPC (still shows a generated 'LUN-' barcode), plus any issue or series left with nothing on it afterward. A Lunar cover that already has a real UPC is NOT touched. Not reversible from inside the app.\n\nContinue?");
+        if (!confirmed) return;
+
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Deleting Lunar placeholder covers...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.DeleteLunarPlaceholderCovers(progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Delete failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            _resultMessage = result.Added.Count == 0
+                ? "Nothing deleted - no Lunar placeholder covers found."
+                : result.Added[0];
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Dev/demo seed data - see AutoFetchService.
+    // GenerateFakeCustomersAndSalesHistory's own doc comment. Not
+    // confirm-gated unlike the delete buttons above - this only ever adds
+    // data (plus decrementing stock the same way a real sale would), so
+    // there's nothing here that needs a "this can't be undone" warning.
+    private async Task RunGenerateFakeSeedData()
+    {
+        if (_checking) return;
+
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Generating fake customers and sales history...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.GenerateFakeCustomersAndSalesHistory(onProgress: progressLine =>
+            {
+                InvokeAsync(() =>
+                {
+                    _status = progressLine;
+                    StateHasChanged();
+                });
+            }));
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Seed data generation failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            _resultMessage = result.Added.Count == 0
+                ? (result.Errors.FirstOrDefault() ?? "Nothing generated.")
+                : result.Added[0];
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Full historical backfill - see AutoFetchService.
+    // BackfillAllLunarHistory's own doc comment for the full
+    // investigation (the site's own date-nav AJAX endpoints, the
+    // "1/1/0001"/"12/31/2039" sentinels, and the rare gap-recovery case).
+    // Can genuinely take several minutes (a year-plus of weekly history
+    // in each direction, each week its own file download + full import),
+    // so it's confirm-gated and uses the same Task.Run/InvokeAsync
+    // progress-reporting pattern as every other long-running button here -
+    // unlike Merge/Delete above, this only ever adds or updates inventory,
+    // so the confirm is about the time it takes, not about risk of losing
+    // anything.
+    //
+    // Bug #11 fix (2026-11-24): a real run showed every date from partway
+    // through the backward walk onward, and the ENTIRE forward walk,
+    // failing with "Cannot access a disposed context instance" /
+    // "disposed object... sqlite3_stmt". Root cause: this used to run
+    // against AutoFetch above, which is injected per-circuit (lives only
+    // as long as this browser tab's Blazor Server connection does). This
+    // operation can run for a long time - long enough that the tab's
+    // connection can drop (sleep, a flaky network, the tab just being
+    // closed) before it finishes, and once that circuit is gone, ASP.NET
+    // Core disposes everything scoped to it - including the DbContext
+    // this was still running SaveChanges against on a background thread.
+    // Fix: give this one operation its OWN DI scope (same pattern
+    // BackgroundJobsService.RunOnceAsync uses for its hourly tick) so its
+    // DbContext's lifetime is tied to the operation itself, not to
+    // whether this tab stays open.
+    private async Task RunBackfillAllLunarHistory()
+    {
+        if (_checking) return;
+
+        var confirmed = await JS.InvokeAsync<bool>("confirm",
+            "This walks lunardistribution.com's full release/FOC history - roughly a year or more of weekly files in each direction - downloading and importing every week that has real data. It can take several minutes and makes a lot of requests to lunardistribution.com. It only ever adds/updates inventory; nothing is deleted.\n\nContinue?");
+        if (!confirmed) return;
+
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Starting full Lunar history backfill...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() =>
+            {
+                // Deliberately not AutoFetch (the page's circuit-scoped
+                // instance) - see this method's own comment above.
+                using var scope = ScopeFactory.CreateScope();
+                var scopedAutoFetch = scope.ServiceProvider.GetRequiredService<IAutoFetchService>();
+                return scopedAutoFetch.BackfillAllLunarHistory(progressLine =>
+                {
+                    InvokeAsync(() =>
+                    {
+                        _status = progressLine;
+                        StateHasChanged();
+                    });
+                });
+            });
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Lunar history backfill failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Backfilled Lunar history: {result.NewIssuesAdded} new issue(s) added across every week found.";
+            if (result.Errors.Count > 0)
+                summary += $" {result.Errors.Count} row(s)/week(s) had issues (see details below).";
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Same own-DI-scope reasoning as RunBackfillAllLunarHistory below -
+    // this can run for a long time (60+ catalogs, each its own
+    // download+import), long enough for the tab's circuit to drop before
+    // it finishes, which would otherwise dispose the DbContext this is
+    // still saving against on a background thread.
+    private async Task RunFetchAllPrhCatalogs()
+    {
+        if (_checking) return;
+
+        var confirmed = await JS.InvokeAsync<bool>("confirm",
+            "This finds and downloads EVERY catalog prhcomics.com's own archive currently lists - 2021 through whatever's newest right now, 60+ months - instead of just the one catalog code above. It can take a long time and makes a lot of requests to prhcomics.com. It only ever adds/updates inventory; nothing is deleted.\n\nContinue?");
+        if (!confirmed) return;
+
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Finding every available PRH catalog...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() =>
+            {
+                // Deliberately not AutoFetch (the page's circuit-scoped
+                // instance) - see this method's own comment above.
+                using var scope = ScopeFactory.CreateScope();
+                var scopedAutoFetch = scope.ServiceProvider.GetRequiredService<IAutoFetchService>();
+                return scopedAutoFetch.FetchAllAvailablePrhCatalogsFromWebsite(progressLine =>
+                {
+                    InvokeAsync(() =>
+                    {
+                        _status = progressLine;
+                        StateHasChanged();
+                    });
+                });
+            });
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"PRH full-history fetch failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Fetched every available PRH catalog: {result.NewIssuesAdded} new issue(s) added across every month found.";
+            if (result.Errors.Count > 0)
+                summary += $" {result.Errors.Count} row(s)/catalog(s) had issues (see details below).";
             _resultMessage = summary;
             _resultTrace = result.Trace;
         }
@@ -596,6 +1805,56 @@ else
             var summary = $"Added {result.NewIssuesAdded} new issue(s) from LOCG for {year}.";
             if (result.Errors.Count > 0)
                 summary += " Some weeks had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Second fallback, added 2026-11-24 with both Metron (IP/Cloudflare
+    // blocked) and LOCG (Cloudflare now actively rejecting the manual
+    // click too - see metron-integration-notes.md) down at the same
+    // time. This calls the ORIGINAL AutoFetchService.CheckForNewIssues() -
+    // ComicList + Extended Forecast + Comicade FOC + Comic Vine new-#1
+    // discovery, the four-source pipeline that ran this app before
+    // Metron existed. Still fully wired up and working, just demoted to
+    // "not the default" once Metron became primary - nothing new had to
+    // be built here, just a button pointing at code that was already
+    // there. No onProgress parameter on this one (unlike the Metron/LOCG
+    // methods) - every source it calls is a plain HTTP/REST request, so
+    // a full run is seconds, not hours, and doesn't need a live status
+    // line to avoid looking hung.
+    private async Task RunCheckForNewIssues()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Checking ComicList, Extended Forecast, Comicade FOC, and Comic Vine (no Metron, no LOCG, no Cloudflare)...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() => AutoFetch.CheckForNewIssues());
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Check failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Checked {result.SeriesChecked} series, linked {result.SeriesAutoLinked}, added {result.NewIssuesAdded} new issue(s), backfilled {result.CoversBackfilled} cover(s).";
+            if (result.Errors.Count > 0)
+                summary += " Some sources had errors: " + string.Join("; ", result.Errors.Take(10));
             _resultMessage = summary;
             _resultTrace = result.Trace;
         }
