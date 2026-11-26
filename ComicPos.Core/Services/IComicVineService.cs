@@ -71,4 +71,30 @@ public interface IComicVineService
     // Downloads a cover image to a local cache folder and returns the
     // saved file's full path, or null if the download failed.
     string? DownloadCoverImage(string imageUrl, string fileNameHint);
+
+    // Same destination folder/naming convention as DownloadCoverImage,
+    // but for image bytes the caller already has in hand - no network
+    // fetch at all. Added for AutoFetchService.ImportLunarDistributionRelease,
+    // whose source (a distributor's own Excel release file) embeds the
+    // real cover photo directly in the workbook rather than linking to
+    // one. Returns the saved file's full path, or throws on a genuine
+    // I/O failure (unlike DownloadCoverImage's "return null" on failure -
+    // there's no network flakiness to shrug off here, so a failure here
+    // is always worth surfacing as a real error to the caller).
+    string SaveCoverImageBytes(byte[] imageBytes, string fileNameHint, string extension = ".jpg");
+
+    // Added 2026-11-24 for the cover-image-pixelation fix (see
+    // AutoFetchService.UpgradeLowResolutionCovers) - a conservative,
+    // exact-match-only lookup of ONE issue's best available image URL,
+    // for retroactively upgrading a cover that was already saved at Comic
+    // Vine's smaller "medium_url" size (before GetIssuesInRange/
+    // GetNewNumberOneIssues were fixed to prefer "super_url" for every
+    // NEW download). Deliberately narrow: looks up the given volume's
+    // issues filtered to this exact issue number, and only returns a URL
+    // when exactly one issue matches - never guesses between several
+    // candidates, and never falls back to a fuzzy name search. Returns
+    // null (not an exception) for "no exact match" or "matched but has no
+    // image at all" - both mean "leave whatever cover is already on file
+    // alone", same spirit as DownloadCoverImage's null-on-failure.
+    string? FindBestCoverImageUrl(int volumeId, float issueNumber);
 }
