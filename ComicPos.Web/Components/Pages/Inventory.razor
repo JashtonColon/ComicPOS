@@ -13,7 +13,7 @@
 </div>
 
 <div class="toolbar">
-    <input type="text" class="search-box" placeholder="Search series name..." value="@_search" @oninput="OnSearchInput" />
+    <ClearableSearchBox Value="@_search" Placeholder="Search series name..." OnInput="OnSearchInput" />
     <button class="btn-primary" @onclick="OpenAddItem">+ Add New Item</button>
 </div>
 
@@ -47,7 +47,7 @@
 {
     @if (_seriesRows.Count == 0)
     {
-        <p class="empty-state">No series found.</p>
+        <p class="empty-state">@(string.IsNullOrWhiteSpace(_search) ? "Nothing received into inventory yet - check New Books for what's been discovered, and use \"+ Add New Item\" above (or scan it in) once it actually arrives." : "No received series match that search.")</p>
     }
     else
     {
@@ -232,7 +232,7 @@ else if (_level == 3)
         _issueId = null;
         _issueNumber = null;
         _saveError = null;
-        _seriesRows = InventoryService.SearchSeriesForDisplay(_search);
+        _seriesRows = InventoryService.SearchReceivedSeriesForDisplay(_search);
     }
 
     private void GoToTypeChoice(string seriesName)
@@ -252,7 +252,7 @@ else if (_level == 3)
         _issueId = null;
         _issueNumber = null;
         _saveError = null;
-        _issueRows = InventoryService.GetIssuesForSeries(_seriesName!, type).OrderBy(i => i.IssueNumber).ToList();
+        _issueRows = InventoryService.GetReceivedIssuesForSeries(_seriesName!, type).OrderBy(i => i.IssueNumber).ToList();
     }
 
     private void GoToCoverDetail(Issue issue)
