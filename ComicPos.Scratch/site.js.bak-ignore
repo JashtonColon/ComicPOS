@@ -1,0 +1,72 @@
+// Small activity watcher for the register's inactivity auto-lock
+// (CurrentWorkerContext/MainLayout - worker PIN + 1-minute lockout,
+// added 2026-11-24). Lives as a real static file loaded from App.razor's
+// own <script> tag (next to _framework/blazor.web.js), NOT as an inline
+// <script> tag written inside a Razor component - a <script> inserted
+// through Blazor's own render-tree diffing is not guaranteed to execute
+// the way a normal page-parsed <script> does, which would make the whole
+// lockout silently never arm. A real static file sidesteps that entirely.
+window.comicPosActivityWatch = {
+    start: function (dotnetRef) {
+        let lastSent = 0;
+        const notify = () => {
+            const now = Date.now();
+            // Throttled client-side - this only needs to know "was there
+            // ANY activity in roughly the last few seconds", not every
+            // single mousemove pixel, which would be a SignalR round-trip
+            // per pixel if sent unthrottled.
+            if (now - lastSent > 4000) {
+                lastSent = now;
+                dotnetRef.invokeMethodAsync('NotifyActivity');
+            }
+        };
+        ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart', 'click'].forEach(evt =>
+            document.addEventListener(evt, notify, { passive: true }));
+    }
+};
+
+// Cover-zoom "don't look pixelated" fix (2026-11-24, follow-up to the
+// zoom-image size fix in app.css's .zoom-overlay img rule). That CSS
+// forces an explicit width/height on the zoomed <img> so it actually
+// scales UP past its natural pixel size (max-width/max-height alone can
+// only ever shrink, never enlarge - see that rule's own doc comment) -
+// but a flat "always stretch to ~1200px" cap made a small
+// distributor-thumbnail-resolution cover (most covers on file here are a
+// few hundred pixels wide at most) look visibly blocky once stretched
+// that far, which is exactly what got reported after the first fix
+// shipped. Pure CSS can't see an image's real natural pixel size to
+// decide how far is "too far" - this does, via plain JS naturalWidth/
+// naturalHeight, and sets an inline style (which wins over the CSS rule)
+// capping the upscale at 3x the cover's own real resolution, still
+// bounded by the same 92% - viewport/1200px ceiling as before. A big,
+// genuinely high-res cover scan still fills that ceiling exactly like
+// before; a small thumbnail now stops enlarging at a point that still
+// looks reasonably sharp instead of stretching all the way to the cap.
+// No DotNet round-trip needed - this only touches the DOM, so it's pure
+// client-side, driven by a MutationObserver watching for the zoom
+// overlay's <img> appearing (ImageZoomOverlay.razor only renders it at
+// all while a cover is zoomed) or its src attribute changing (clicking a
+// different cover while already zoomed re-uses the same <img> element).
+(function () {
+    function applySize(img) {
+        if (!img || !img.naturalWidth || !img.naturalHeight) return;
+        var maxW = Math.min(window.innerWidth * 0.92, 1200);
+        var maxH = Math.min(window.innerHeight * 0.92, 1200);
+        var capW = Math.min(maxW, img.naturalWidth * 3);
+        var capH = Math.min(maxH, img.naturalHeight * 3);
+        var scale = Math.min(capW / img.naturalWidth, capH / img.naturalHeight);
+        img.style.width = Math.round(img.naturalWidth * scale) + 'px';
+        img.style.height = Math.round(img.naturalHeight * scale) + 'px';
+    }
+    function tryApply() {
+        var img = document.querySelector('.zoom-overlay img');
+        if (!img) return;
+        if (img.complete && img.naturalWidth) applySize(img);
+        else img.addEventListener('load', function () { applySize(img); }, { once: true });
+    }
+    if (document.body) {
+        new MutationObserver(tryApply).observe(document.body, {
+            childList: true, subtree: true, attributes: true, attributeFilter: ['src']
+        });
+    }
+})();
