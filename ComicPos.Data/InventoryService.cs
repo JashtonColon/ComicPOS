@@ -57,6 +57,27 @@ public class InventoryService : IInventoryService
             .ToList();
     }
 
+    // See IInventoryService's own doc comment for why these two exist
+    // separately from the pair just above (Inventory page only, never the
+    // Customers pull-list subscribe picker) and what "received" means here.
+    public List<Series> SearchReceivedSeriesForDisplay(string text)
+    {
+        return _db.AllSeries
+            .Where(s => EF.Functions.Like(s.Name, $"%{text}%")
+                && s.Issues.Any(i => i.Covers.Any(c => c.StockQuantity > 0)))
+            .ToList();
+    }
+
+    public List<Issue> GetReceivedIssuesForSeries(string seriesName, IssueType type)
+    {
+        return _db.Issues
+            .Include(i => i.Series)
+            .Include(i => i.Covers)
+            .Where(i => i.Series.Name == seriesName && i.Type == type
+                && i.Covers.Any(c => c.StockQuantity > 0))
+            .ToList();
+    }
+
     public Series? GetSeriesByName(string name)
     {
         return _db.AllSeries.FirstOrDefault(s => s.Name == name);
