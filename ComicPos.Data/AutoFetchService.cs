@@ -2505,8 +2505,83 @@ public class AutoFetchService : IAutoFetchService
     // scoped to the known bug, not a permanent change to how series are
     // matched going forward.
     private static readonly Regex DuplicateSeriesYearSuffix = new(@"\s*\(\s*(?:19|20)\d{2}-?\s*\)\s*$", RegexOptions.Compiled);
-    private static string DuplicateSeriesKey(string name) =>
-        SeriesNameKey.Normalize(DuplicateSeriesYearSuffix.Replace(name.Trim(), "").Trim());
+
+    // Widened 2026-11-26 after the user found a whole category of real
+    // duplicates this key was missing entirely: PRH's own collected-
+    // edition (TR/HC/NT format) titles bake the format and a volume
+    // marker directly into the title text, with no consistent spelling -
+    // confirmed live against real New Books rows for the exact same
+    // underlying book:
+    //   "Absolute Infinite Crisis (New Edition) (2026)"
+    //   "ABSOLUTE INFINITE CRISIS HC (2026 EDITION) (2026)"
+    // and
+    //   "ABSOLUTE SUPERMAN HC VOL 03 THE NEVERENDING BEGINS (2026)"
+    //   "ABSOLUTE SUPERMAN TP VOL 03 THE NEVERENDING BEGINS (2026)"
+    //   "Absolute Superman Vol. 3: The Neverending Begins (2026)"
+    // None of these share an exact SeriesName - PrhTitleParser.ApplyTitle
+    // deliberately does NOT try to strip format/volume wording out of a
+    // collected edition's title (see its own doc comment - PRH's format
+    // info comes from a separate column, not guessed from text), so the
+    // whole raw title ends up as SeriesName verbatim, and three
+    // differently-worded solicitations of the very same book become
+    // three different Series rows that this key never used to catch.
+    //
+    // Three extra passes, same "looser than SeriesNameKey.Normalize,
+    // ONLY for this dry-run/merge pair" spirit as the year-suffix strip
+    // above:
+    //  - DuplicateSeriesEditionParenthetical strips any "(... Edition)"
+    //    parenthetical note ("(New Edition)", "(2026 Edition)") - these
+    //    only ever describe which printing/package a book is, never a
+    //    different book. EXCEPT "(Facsimile Edition)" specifically
+    //    (negative lookahead guards this) - confirmed live 2026-11-26 via
+    //    a real "Find Duplicate Series" scan: this would otherwise have
+    //    paired 38 real series (Action Comics, Batman, Watchmen, etc.)
+    //    with their own "(Facsimile Edition)" counterpart as "duplicates"
+    //    - undoing the whole point of the earlier Lunar facsimile-title
+    //    fix (see that section further up this doc), which deliberately
+    //    gives a facsimile reprint its OWN distinct series/issue so it
+    //    never gets confused with a modern issue of the same number. A
+    //    facsimile reprint of a classic issue is a genuinely different
+    //    product from the current ongoing series sharing its name, never
+    //    "just another printing" the way "(New Edition)"/"(2026
+    //    Edition)" are - merging them would have filed, say, a facsimile
+    //    of a decades-old key issue as "another cover" of today's current
+    //    issue #1 of the same-named ongoing series.
+    //  - DuplicateSeriesFormatWord strips a bare HC/TP/SC/GN/OHC/OGN/TPB
+    //    format token.
+    //  - DuplicateSeriesVolumeMarker normalizes "Vol 03"/"Vol. 3"/"VOLUME
+    //    03" down to just the bare number (leading zeros dropped) -
+    //    deliberately keeping the NUMBER itself, not stripping it: PRH's
+    //    own collected-edition titles never carry a real "#N", so
+    //    PrhTitleParser.ApplyTitle always gives them IssueNumber = 1
+    //    regardless of which volume they actually are (see its own doc
+    //    comment) - the volume number living on INSIDE the series name is
+    //    the only thing in this whole app that tells "Vol. 3" apart from
+    //    "Vol. 4" of the same franchise, so losing it here would merge
+    //    two completely different books. Confirmed this can't happen:
+    //    "Absolute Superman Vol. 3: ..." and a hypothetical "...Vol. 4:
+    //    ..." still produce different keys ("3" vs "4").
+    //
+    // A merged result like this isn't data loss, either - see
+    // MergeDuplicateSeries' own doc comment: when the keeper's existing
+    // issue #1 already has a real (non-placeholder) Cover A, an incoming
+    // duplicate's cover doesn't overwrite it, it gets its own new letter
+    // via ResolveCoverLetters - so an HC/TP/reprint trio merges into ONE
+    // series/issue with up to three real Cover rows (one per real
+    // barcode/price), the exact same shape a single floppy issue's own
+    // Cover A/B/C variants already take.
+    private static readonly Regex DuplicateSeriesEditionParenthetical = new(@"\((?!\s*[^()]*\bfacsimile\b)[^()]*\bedition\b[^()]*\)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex DuplicateSeriesFormatWord = new(@"\b(?:HC|TP|SC|GN|OHC|OGN|TPB)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex DuplicateSeriesVolumeMarker = new(@"\bVol(?:ume)?\.?\s*0*(\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static string DuplicateSeriesKey(string name)
+    {
+        var t = DuplicateSeriesYearSuffix.Replace(name.Trim(), "").Trim();
+        t = DuplicateSeriesEditionParenthetical.Replace(t, "").Trim();
+        t = DuplicateSeriesFormatWord.Replace(t, "").Trim();
+        t = DuplicateSeriesVolumeMarker.Replace(t, "$1").Trim();
+        return SeriesNameKey.Normalize(t);
+    }
 
     // Read-only - added 2026-11-24 alongside the LunarTitleParser fix
     // above, specifically so the duplicate series that bug already
@@ -2635,7 +2710,33 @@ public class AutoFetchService : IAutoFetchService
 
                 foreach (var issue in dup.Issues.ToList())
                 {
-                    var existingIssue = keeper.Issues.FirstOrDefault(i => i.IssueNumber == issue.IssueNumber);
+                    // Bug #19 fix (2026-11-26): matching by IssueNumber
+                    // ALONE here was wrong whenever the widened
+                    // DuplicateSeriesKey (Bug #18) pairs an ongoing/
+                    // limited series (its own real issue #1, #2, ... as
+                    // IssueType.SingleIssue) with its OWN later collected
+                    // edition (always IssueType.CollectedEdition,
+                    // IssueNumber = 1 - see PrhTitleParser's own doc
+                    // comment) - confirmed live via a real "Find
+                    // Duplicate Series" scan surfacing 19 such groups
+                    // (e.g. "Clayface: Celebrity Dirt" - 6 real single
+                    // issues - grouped with "CLAYFACE CELEBRITY DIRT TP"
+                    // - 1 collected edition). Without the Type check, the
+                    // TP's real barcode/price would have been merged in
+                    // as just another COVER LETTER of the ongoing run's
+                    // real single issue #1 - filing a $19.99 trade as "an
+                    // alternate cover of the $3.99 single issue," which
+                    // is wrong, not just untidy (Checkout/Inventory would
+                    // show the trade's price/barcode nested under the
+                    // single issue instead of as its own catalog entry).
+                    // No unique index forces one Issue row per
+                    // (SeriesId, IssueNumber) - confirmed via Issue.cs -
+                    // so a same-series, same-number, different-Type pair
+                    // can coexist as two separate Issue rows with no
+                    // conflict; falling through to the "no conflict, just
+                    // move it" branch below is the correct outcome, not a
+                    // workaround.
+                    var existingIssue = keeper.Issues.FirstOrDefault(i => i.IssueNumber == issue.IssueNumber && i.Type == issue.Type);
                     if (existingIssue == null)
                     {
                         issue.SeriesId = keeper.Id;
@@ -4991,6 +5092,272 @@ public class AutoFetchService : IAutoFetchService
             // Best-effort - see doc comment above.
         }
     }
+
+    // See IAutoFetchService.BackfillCoverVariantsFromPrhBookPages's own
+    // doc comment for the full story. Candidate issues are chosen by the
+    // SAME "does this issue have a cover whose barcode is PRH's own real
+    // ISBN-13/17-digit-UPC shape" test as BackfillCoversFromPrhImageCdn's
+    // own candidate query just above (reused for the identical reason:
+    // that shape is what tells a genuinely PRH-sourced barcode apart from
+    // every other source's generated placeholder/fallback) - that same
+    // barcode is also exactly what's needed to find this issue's own
+    // prhcomics.com product page in the first place. When an issue
+    // already has more than one such cover, "A" is preferred as the one
+    // actually fetched - arbitrary but deterministic, and it doesn't
+    // matter which cover's page gets fetched, since every cover's own
+    // "Additional covers" carousel lists every OTHER cover of the same
+    // issue, never itself.
+    public AutoFetchResult BackfillCoverVariantsFromPrhBookPages(Action<string>? onProgress = null, int? limit = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Backfill cover variants from PRH's own book pages run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}" + (limit.HasValue ? $" (TEST RUN - capped at {limit} issue(s))" : ""));
+        trace.AppendLine(new string('=', 60));
+
+        static bool IsPrhShaped(string barcode)
+        {
+            var lookup = barcode.Split('#')[0];
+            return (lookup.Length == 13 || lookup.Length == 17) && lookup.All(char.IsDigit);
+        }
+
+        var rawIssues = _db.Issues
+            .Include(i => i.Series)
+            .Include(i => i.Covers)
+            .Where(i => i.Covers.Any())
+            .ToList();
+
+        var candidates = rawIssues
+            .Select(i => (
+                Issue: i,
+                QueryCover: i.Covers
+                    .Where(c => IsPrhShaped(c.Barcode))
+                    .OrderBy(c => string.Equals(c.CoverLetter, "A", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                    .ThenBy(c => c.CoverLetter, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault()))
+            .Where(x => x.QueryCover != null)
+            // Same closest-to-today ordering fix as every other retry/
+            // backfill method in this file (see BackfillCoversFromPrhImageCdn's
+            // own doc comment) - surfaces recently-shipped/about-to-ship
+            // issues first on a capped Test-N run, instead of whatever DB
+            // insertion order happens to be.
+            .OrderBy(x => x.Issue.ReleaseDate.HasValue
+                ? Math.Abs((x.Issue.ReleaseDate.Value.ToDateTime(TimeOnly.MinValue) - DateTime.Now).TotalDays)
+                : double.MaxValue)
+            .ToList();
+        if (limit.HasValue) candidates = candidates.Take(limit.Value).ToList();
+
+        onProgress?.Invoke($"Checking {candidates.Count} issue(s) that have a PRH-shaped barcode on file against prhcomics.com's own book pages...");
+
+        // Batch-wide, same spirit as AddMissingCoverVariants' own
+        // claimedBarcodes - seeded with every barcode already in the
+        // table so a real cross-issue collision (should be vanishingly
+        // rare here, since PRH's own additional-covers data carries a
+        // genuinely distinct barcode per cover) is still caught rather
+        // than silently violating the DB's unique index.
+        var claimedBarcodes = _db.Covers.Select(c => c.Barcode).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var done = 0;
+        var noPrhPageFound = 0;
+        foreach (var (issue, queryCover) in candidates)
+        {
+            done++;
+            var series = issue.Series;
+            var label = $"{series.Name} #{issue.IssueNumber:0.##}";
+            var lookupBarcode = queryCover!.Barcode.Split('#')[0];
+
+            // Added 2026-11-26 after the user flagged a real risk while a
+            // full uncapped run was already in progress: this method had
+            // ZERO pacing between requests, unlike every other scraper in
+            // this file (Metron's own documented 20 req/min limit enforced
+            // as a 3.5s wait; LOCG's multi-minute-per-week rate limit) -
+            // and an unthrottled multi-thousand-request burst against one
+            // site in a short window is exactly the traffic shape that got
+            // Metron's own API access IP-blocked earlier in this project
+            // (see that section above). prhcomics.com's book page has no
+            // documented rate limit to match against the way Metron's API
+            // does, so this is a deliberately modest, precautionary pace
+            // rather than a measured one - skipped on the very first
+            // request (nothing to be polite about pacing against yet).
+            if (done > 1) Thread.Sleep(300);
+
+            string? html;
+            try
+            {
+                html = PrhWebsiteFetcher.DownloadBookPageHtmlAsync(lookupBarcode).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                var errLine = $"{done}/{candidates.Count} {label}: {ex.Message}";
+                result.Errors.Add(errLine);
+                trace.AppendLine(errLine);
+                onProgress?.Invoke(errLine);
+                continue;
+            }
+
+            if (html == null)
+            {
+                // A genuine HTTP 404 - this barcode isn't actually a
+                // prhcomics.com product (see DownloadBookPageHtmlAsync's
+                // own doc comment) - not an error, not worth a trace line
+                // per miss, same spirit as BackfillCoversFromPrhImageCdn's
+                // own noCoverAvailable.
+                noPrhPageFound++;
+                if (done % 25 == 0 || done == candidates.Count)
+                {
+                    var (saved0, saveError0) = TrySaveChanges();
+                    if (!saved0) result.Errors.Add($"Batch ending at issue {done}: failed to save - {saveError0}");
+                }
+                continue;
+            }
+
+            var scraped = PrhWebsiteFetcher.ParseAdditionalCovers(html);
+
+            if (scraped.Count == 0)
+            {
+                // A real PRH page, genuinely single-cover - not worth a
+                // trace line (or even counting) per miss, same spirit as
+                // BackfillCoversFromPrhImageCdn's own noCoverAvailable.
+                if (done % 25 == 0 || done == candidates.Count)
+                {
+                    var (saved0, saveError0) = TrySaveChanges();
+                    if (!saved0) result.Errors.Add($"Batch ending at issue {done}: failed to save - {saveError0}");
+                }
+                continue;
+            }
+
+            var addedHere = 0;
+            var upgradedHere = 0;
+
+            foreach (var item in scraped)
+            {
+                // Reuses PrhTitleParser as-is - the scraped title is in
+                // the exact same "SERIES #N COVER X ARTIST VARIANT"
+                // grammar as the catalog importer's own Title column
+                // (confirmed live, identical wording), so there's no new
+                // parsing grammar to get wrong here. row.IssueNumber is
+                // read back only as a sanity check (this scrape should
+                // always describe THIS SAME issue, since it came from one
+                // of this issue's own covers' page) - a mismatch means
+                // prhcomics.com linked to a different issue/printing than
+                // expected, so it's skipped rather than risk filing a
+                // cover under the wrong issue.
+                //
+                // Confirmed live 2026-11-26 (real Test 5 run, The Amazing
+                // Spider-Man #1004 and Star Wars: The Book of Boba Fett
+                // #6): when an issue has NO real additional covers, the
+                // page's "Additional covers" container renders empty and
+                // ParseAdditionalCovers' 60000-char forward window keeps
+                // going past it and scrapes the NEXT carousel on the page
+                // instead (a "more issues in this series" widget, which
+                // reuses the exact same carousel-meta-isbn/title markup) -
+                // every single item it finds there is a different issue
+                // number, never a genuine cover of THIS issue. Since a
+                // real "Additional covers" carousel only ever lists
+                // siblings of the SAME issue, the first title that comes
+                // back for a DIFFERENT issue number is the signal we've
+                // crossed into that next, unrelated carousel - everything
+                // from here on is assumed to be more of the same, so this
+                // breaks out of the loop entirely rather than logging one
+                // "doesn't match" line per remaining item (confirmed live:
+                // Boba Fett #6 alone would otherwise have logged 7 of
+                // them). This is the ordinary, expected shape for the
+                // (common) single-cover issue, not a problem - so it's
+                // just a trace line, never result.Errors.
+                var row = new PrhCatalogRow();
+                PrhTitleParser.ApplyTitle(row, item.RawTitle);
+
+                if (row.IssueNumber.HasValue && Math.Abs(row.IssueNumber.Value - issue.IssueNumber) > 0.01f)
+                {
+                    trace.AppendLine($"{label}: additional-cover scrape rolled into an unrelated carousel at \"{item.RawTitle}\" (issue #{row.IssueNumber}) - stopping here, no real additional covers found.");
+                    break;
+                }
+
+                var coverLetter = row.CoverLetter; // defaults to "A" if no marker found - see PrhTitleParser; shouldn't happen for a genuine "additional cover"
+                decimal price = 0;
+                if (!string.IsNullOrWhiteSpace(item.PriceText))
+                {
+                    var priceDigits = item.PriceText.Replace("$", "").Replace("US", "", StringComparison.OrdinalIgnoreCase).Trim();
+                    decimal.TryParse(priceDigits, NumberStyles.Number, CultureInfo.InvariantCulture, out price);
+                }
+
+                var existingCover = issue.Covers.FirstOrDefault(c => string.Equals(c.CoverLetter, coverLetter, StringComparison.OrdinalIgnoreCase));
+                if (existingCover != null)
+                {
+                    // Already have this letter - only worth touching if
+                    // what's on file isn't a real, distinct barcode yet:
+                    // Bug #16's own derived "{barcode}#{letter}" fallback
+                    // ('#' never appears in a real numeric barcode - see
+                    // BackfillCoversFromPrhImageCdn's own doc comment), or
+                    // one of the other sources' generated placeholder (see
+                    // LooksLikePlaceholderCover). A cover that already has
+                    // its own clean, real, different barcode is left
+                    // alone even though it differs from this scrape -
+                    // never overwrite good data blind.
+                    var looksDerived = existingCover.Barcode.Contains('#');
+                    if ((looksDerived || LooksLikePlaceholderCover(existingCover)) && !claimedBarcodes.Contains(item.Isbn))
+                    {
+                        existingCover.Barcode = item.Isbn;
+                        if (price > 0) existingCover.Price = price;
+                        if (string.IsNullOrWhiteSpace(existingCover.CoverArtist) && !string.IsNullOrWhiteSpace(row.VariantText))
+                            existingCover.CoverArtist = row.VariantText;
+                        claimedBarcodes.Add(item.Isbn);
+                        upgradedHere++;
+                        result.CoversBackfilled++;
+                    }
+                    continue;
+                }
+
+                if (claimedBarcodes.Contains(item.Isbn))
+                {
+                    // Bug #21 fix (2026-11-26): this branch used to add to result.Errors
+                    // with no matching trace.AppendLine, unlike every other error branch in
+                    // this method (the catch block above, and the TrySaveChanges failure
+                    // checks below) - so a real cross-issue barcode collision was counted in
+                    // the run's final "N error(s)" summary but never showed up anywhere in
+                    // the pasted trace text itself. Added the missing trace line so this is
+                    // visible like every other error this method can report.
+                    var conflictLine = $"{label}: skipped additional cover {coverLetter} (barcode {item.Isbn}) - already in use by a different issue; needs a manual look.";
+                    result.Errors.Add(conflictLine);
+                    trace.AppendLine(conflictLine);
+                    continue;
+                }
+
+                var newCover = new Cover
+                {
+                    CoverLetter = coverLetter,
+                    Barcode = item.Isbn,
+                    Price = price,
+                    StockQuantity = 0,
+                    CoverArtist = row.VariantText
+                };
+                issue.Covers.Add(newCover);
+                claimedBarcodes.Add(item.Isbn);
+                addedHere++;
+                result.CoverVariantsAdded++;
+            }
+
+            if (addedHere > 0 || upgradedHere > 0)
+            {
+                var outcomeLine = $"{done}/{candidates.Count} {label}: found {addedHere} new cover(s), upgraded {upgradedHere} barcode(s) via PRH's own book page ({lookupBarcode}).";
+                result.Added.Add(outcomeLine);
+                trace.AppendLine(outcomeLine);
+                onProgress?.Invoke(outcomeLine);
+            }
+
+            if (done % 25 == 0 || done == candidates.Count)
+            {
+                var (saved, saveError) = TrySaveChanges();
+                if (!saved) result.Errors.Add($"Batch ending at issue {done}: failed to save - {saveError}");
+            }
+        }
+
+        trace.AppendLine();
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}. Found {result.CoverVariantsAdded} new cover(s) and upgraded {result.CoversBackfilled} existing barcode(s) via PRH's own book pages; {noPrhPageFound} candidate(s) weren't real prhcomics.com products; {result.Errors.Count} error(s).");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+
+        return result;
+    }
 }
 
 // Tiny helper for AutoFetchService.FetchLunarReleaseFromWebsite - reading
@@ -5410,6 +5777,108 @@ internal static class PrhWebsiteFetcher
         using var resp = await Http.GetAsync(url).ConfigureAwait(false);
         if (!resp.IsSuccessStatusCode) return null;
         return await resp.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+    }
+
+    // One scraped row from a book page's own "Additional covers"
+    // carousel - see ParseAdditionalCovers below. RawTitle is in PRH's
+    // familiar "SERIES #N COVER X ARTIST VARIANT" grammar (same one
+    // PrhTitleParser already parses for the catalog importer), so the
+    // caller (AutoFetchService.BackfillCoverVariantsFromPrhBookPages)
+    // reuses that class directly rather than this file inventing a
+    // second parsing grammar for the same text shape.
+    public sealed record PrhAdditionalCover(string Isbn, string RawTitle, string? PriceText);
+
+    // Plain, public, unauthenticated per-product detail page - confirmed
+    // live 2026-11-26 this needs no cookies/session at all (fetch()'d
+    // with credentials:'omit' from a totally cold page load and it still
+    // returned the full page, including the real "Additional covers"
+    // carousel - not something a click/AJAX call lazily fills in after
+    // the fact; it's already in the server-rendered HTML). isbn can be
+    // ANY cover's own real barcode for the issue - PRH's own product
+    // page always lists every OTHER cover of that same issue here, never
+    // itself, so which sibling you start from doesn't matter. See
+    // ParseAdditionalCovers below and AutoFetchService.
+    // BackfillCoverVariantsFromPrhBookPages's own doc comment for the
+    // full story of how this was found.
+    public static async Task<string?> DownloadBookPageHtmlAsync(string isbn)
+    {
+        var url = $"https://prhcomics.com/book/?isbn={Uri.EscapeDataString(isbn)}";
+        using var resp = await Http.GetAsync(url).ConfigureAwait(false);
+        // A genuine HTTP 404 here - confirmed live 2026-11-26 against real
+        // candidates (Feral #28, Lost Fantasy #14, Absolute Wonder Woman
+        // #26, all non-PRH-distributed titles) - means this barcode,
+        // while shaped like a real PRH ISBN/UPC, isn't actually a
+        // prhcomics.com product at all. Same root cause already called out
+        // in BackfillCoversFromPrhImageCdn's own candidate-query doc
+        // comment: the "13 or 17 digit numeric" shape test isn't
+        // provenance-based, so a real UPC from a non-PRH-distributed
+        // publisher (Image, or DC/other titles PRH doesn't carry) can
+        // still pass it. Treated as a soft miss (null), not an error - the
+        // same spirit as that method's own "nothing on file yet" case.
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+    }
+
+    // Pulls every sibling cover out of a book page's own "Additional
+    // covers" carousel (confirmed live against several real titles
+    // 2026-11-26, including an incentive cover with no final art yet -
+    // see BackfillCoverVariantsFromPrhBookPages's own doc comment). The
+    // carousel's markup repeats itself once in full (a second, hidden
+    // copy for a different screen-width layout - confirmed live, byte-
+    // for-byte identical to the first), so results are de-duplicated by
+    // ISBN as they're found rather than trusting the page to only list
+    // each sibling once. Each item's own isbn comes from a dedicated
+    // data-component="carousel-meta-isbn" element rather than scraped out
+    // of an <img alt="..."> attribute - the <img> markup itself turned
+    // out to vary (a plain "Main Cover"-style item has no incentive-
+    // ribbon SVG in front of it; an incentive one does), while the
+    // data-component-tagged isbn/title/price elements stayed identically
+    // shaped across every title tested. Returns an empty list (not an
+    // error) for a genuinely single-cover issue - confirmed live this
+    // section is simply absent from the page in that case.
+    public static List<PrhAdditionalCover> ParseAdditionalCovers(string html)
+    {
+        var results = new List<PrhAdditionalCover>();
+        var sectionIdx = html.IndexOf("Additional covers", StringComparison.Ordinal);
+        if (sectionIdx < 0) return results;
+
+        // Caps the scan window well past the end of a realistic carousel
+        // (every title tested so far, including a 5-cover one, fit
+        // comfortably inside this) rather than parsing the rest of the
+        // page - prhcomics.com's own book pages run 500KB-1MB+ of HTML
+        // total (confirmed live), most of it unrelated carousels further
+        // down (related titles, etc.).
+        var scopeLen = Math.Min(60000, html.Length - sectionIdx);
+        var scope = html.Substring(sectionIdx, scopeLen);
+
+        var isbnRegex = new Regex(@"data-component=""carousel-meta-isbn"">(\d+)<", RegexOptions.Compiled);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (Match m in isbnRegex.Matches(scope))
+        {
+            var isbn = m.Groups[1].Value;
+            if (!seen.Add(isbn)) continue; // the mobile-layout repeat - see this method's own doc comment
+
+            // The title/price elements for this same item sit BEFORE the
+            // isbn element in the markup (title, then author, then isbn,
+            // then price - confirmed live), so the match window looks
+            // backward from the isbn hit, not forward.
+            var windowStart = Math.Max(0, m.Index - 3000);
+            var windowEnd = Math.Min(scope.Length, m.Index + 600);
+            var block = scope.Substring(windowStart, windowEnd - windowStart);
+
+            var titleMatch = Regex.Match(block, @"data-component=""carousel-meta-title"">\s*<a[^>]*>([^<]+)");
+            var priceMatch = Regex.Match(block, @"price-usa[^>]*>\s*([^<]+?)\s*</span>");
+
+            var rawTitle = titleMatch.Success ? System.Net.WebUtility.HtmlDecode(titleMatch.Groups[1].Value).Trim() : "";
+            if (rawTitle.Length == 0) continue; // nothing usable to parse a cover letter out of - skip rather than guess "A"
+
+            results.Add(new PrhAdditionalCover(
+                isbn,
+                rawTitle,
+                priceMatch.Success ? priceMatch.Groups[1].Value.Trim() : null));
+        }
+        return results;
     }
 
     // Finds `'key': '....'` exactly as it appears in the page's own
