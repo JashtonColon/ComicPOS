@@ -186,8 +186,8 @@ public class ComicVineService : IComicVineService
                 if (item.TryGetProperty("store_date", out var sd) && sd.ValueKind == JsonValueKind.String && DateOnly.TryParse(sd.GetString(), out var date))
                     issue.StoreDate = date;
 
-                if (item.TryGetProperty("image", out var img) && img.ValueKind == JsonValueKind.Object && img.TryGetProperty("medium_url", out var mu))
-                    issue.ImageUrl = mu.GetString();
+                if (item.TryGetProperty("image", out var img) && img.ValueKind == JsonValueKind.Object)
+                    issue.ImageUrl = GetBestImageUrl(img);
 
                 results.Add(issue);
             }
@@ -196,6 +196,59 @@ public class ComicVineService : IComicVineService
         }
 
         return results;
+    }
+
+    // Added 2026-11-24 for the cover-image-pixelation fix (see
+    // AutoFetchService.UpgradeLowResolutionCovers) - a narrow, one-issue
+    // lookup for retroactively upgrading a cover that was already saved at
+    // the old "medium_url" size, before GetBestImageUrl above existed.
+    // Filters Comic Vine's own issue list to this exact volume + exact
+    // issue number (the same filter shape GetIssuesInRange uses, just
+    // narrowed with an extra issue_number clause) rather than fetching the
+    // whole volume's issue list and matching client-side - cheaper, and it
+    // means Comic Vine itself is doing the exact-match work, not this code.
+    // Returns null (never throws) when nothing matches, when more than one
+    // issue matches (shouldn't happen for a real volume+number pair, but a
+    // bad/duplicate catalog entry is a reason to do nothing, not guess), or
+    // when the one match has no image at all - every case means "leave
+    // whatever cover is already on file alone".
+    public string? FindBestCoverImageUrl(int volumeId, float issueNumber)
+    {
+        var apiKey = RequireApiKey();
+        var numberText = issueNumber == Math.Floor(issueNumber)
+            ? ((int)issueNumber).ToString()
+            : issueNumber.ToString("0.#");
+        var filter = $"volume:{volumeId},issue_number:{Uri.EscapeDataString(numberText)}";
+
+        var url = "https://comicvine.gamespot.com/api/issues/" +
+                   $"?api_key={Uri.EscapeDataString(apiKey)}&format=json" +
+                   $"&filter={Uri.EscapeDataString(filter)}" +
+                   "&field_list=issue_number,image&limit=5";
+
+        var json = FetchString(url);
+        using var doc = JsonDocument.Parse(json);
+        RequireOkStatus(doc, $"looking up volume {volumeId} issue #{issueNumber:0.##} for a higher-resolution cover");
+
+        if (!doc.RootElement.TryGetProperty("results", out var resultsEl) || resultsEl.ValueKind != JsonValueKind.Array)
+            return null;
+
+        JsonElement? exactMatch = null;
+        var matchCount = 0;
+        foreach (var item in resultsEl.EnumerateArray())
+        {
+            if (!item.TryGetProperty("issue_number", out var num)) continue;
+            var numStr = num.ValueKind == JsonValueKind.String ? num.GetString() : num.ToString();
+            if (!float.TryParse(numStr, out var parsed) || parsed != issueNumber) continue;
+
+            matchCount++;
+            exactMatch = item;
+        }
+
+        if (matchCount != 1 || exactMatch == null) return null; // no match, or ambiguous - don't guess
+
+        return exactMatch.Value.TryGetProperty("image", out var img) && img.ValueKind == JsonValueKind.Object
+            ? GetBestImageUrl(img)
+            : null;
     }
 
     // Every #1 issue in the date window, across every volume/publisher -
@@ -240,8 +293,8 @@ public class ComicVineService : IComicVineService
                 if (item.TryGetProperty("store_date", out var sd) && sd.ValueKind == JsonValueKind.String && DateOnly.TryParse(sd.GetString(), out var date))
                     issue.StoreDate = date;
 
-                if (item.TryGetProperty("image", out var img) && img.ValueKind == JsonValueKind.Object && img.TryGetProperty("medium_url", out var mu))
-                    issue.ImageUrl = mu.GetString();
+                if (item.TryGetProperty("image", out var img) && img.ValueKind == JsonValueKind.Object)
+                    issue.ImageUrl = GetBestImageUrl(img);
 
                 if (item.TryGetProperty("volume", out var vol) && vol.ValueKind == JsonValueKind.Object)
                 {
@@ -592,23 +645,38 @@ public class ComicVineService : IComicVineService
             if (PlaceholderImageRegistry.IsKnownPlaceholder(hash))
                 return null;
 
-            var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ComicPos", "CoverImages");
-            Directory.CreateDirectory(folder);
-
             var ext = Path.GetExtension(new Uri(imageUrl).LocalPath);
             if (string.IsNullOrWhiteSpace(ext)) ext = ".jpg";
 
-            var invalid = Path.GetInvalidFileNameChars();
-            var safeName = new string(fileNameHint.Select(ch => invalid.Contains(ch) ? '_' : ch).ToArray());
-            var path = Path.Combine(folder, $"{safeName}{ext}");
-
-            File.WriteAllBytes(path, bytes);
-            return path;
+            return SaveBytesToCache(bytes, fileNameHint, ext);
         }
         catch
         {
             return null;
         }
+    }
+
+    // Same destination folder/naming convention DownloadCoverImage has
+    // always used - distinct from DownloadCoverImage itself only in that
+    // there's no network fetch and no placeholder-hash check (nothing to
+    // be flaky about or to confuse with a source's own stock "no art yet"
+    // graphic when the caller already has real bytes in hand), and a
+    // genuine I/O failure is thrown rather than swallowed into a null -
+    // see IComicVineService.SaveCoverImageBytes's own doc comment for why.
+    public string SaveCoverImageBytes(byte[] imageBytes, string fileNameHint, string extension = ".jpg")
+        => SaveBytesToCache(imageBytes, fileNameHint, extension);
+
+    private static string SaveBytesToCache(byte[] bytes, string fileNameHint, string extension)
+    {
+        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ComicPos", "CoverImages");
+        Directory.CreateDirectory(folder);
+
+        var invalid = Path.GetInvalidFileNameChars();
+        var safeName = new string(fileNameHint.Select(ch => invalid.Contains(ch) ? '_' : ch).ToArray());
+        var path = Path.Combine(folder, $"{safeName}{extension}");
+
+        File.WriteAllBytes(path, bytes);
+        return path;
     }
 
     // Comic Vine answers with HTTP 200 and a JSON body even when something
@@ -660,6 +728,28 @@ public class ComicVineService : IComicVineService
 
     private static string GetString(JsonElement el, string prop) =>
         el.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
+
+    // Added 2026-11-24 - both issue-fetching methods used to read only
+    // "medium_url" (one of Comic Vine's smaller preview sizes, ~400px wide)
+    // out of the "image" object every issue response already includes in
+    // full regardless of field_list - root-causing persistent pixelation
+    // whenever a Comic-Vine-sourced cover is shown any larger than that on
+    // screen (e.g. the New Books detail modal's cover card, which is a
+    // completely different element from the zoom-overlay's own, separately-
+    // fixed, display-side scaling cap). "super_url" is comfortably larger
+    // (a real display-quality size) without going all the way to
+    // "original_url", which can be an enormous, unprocessed source scan.
+    // Falls back to "medium_url" only if "super_url" genuinely isn't present
+    // on this particular response (seen on some older/obscure entries) -
+    // never fails the whole fetch over a missing image size.
+    private static string? GetBestImageUrl(JsonElement img)
+    {
+        if (img.TryGetProperty("super_url", out var su) && su.ValueKind == JsonValueKind.String)
+            return su.GetString();
+        if (img.TryGetProperty("medium_url", out var mu) && mu.ValueKind == JsonValueKind.String)
+            return mu.GetString();
+        return null;
+    }
 
     private string RequireApiKey()
     {
