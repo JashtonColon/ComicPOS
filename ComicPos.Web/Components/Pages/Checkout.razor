@@ -21,7 +21,7 @@
         <div class="toolbar">
             <ClearableSearchBox Value="@_barcode" Placeholder="Scan barcode..."
                    OnInput="e => _barcode = e.Value?.ToString() ?? string.Empty"
-                   OnKeyDown="HandleBarcodeKeyDown" />
+                   OnKeyDown="HandleBarcodeKeyDown" DebounceMs="0" />
         </div>
         @if (_scanError != null)
         {
