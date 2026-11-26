@@ -4,6 +4,17 @@
     <ProjectReference Include="..\ComicPos.Core\ComicPos.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Reads the Lunar Distribution weekly release .xlsx file -
+         LunarDistributionParser needs both its named-column cell data
+         and its embedded per-row cover images, which rules out a plain
+         fast-forward reader like ExcelDataReader (no image support at
+         all). MIT-licensed, unlike EPPlus (v5+ requires a paid
+         commercial license for exactly this use - a for-profit store's
+         own software - see LunarDistributionParser's own doc comment). -->
+    <PackageReference Include="ClosedXML" Version="0.105.1" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
