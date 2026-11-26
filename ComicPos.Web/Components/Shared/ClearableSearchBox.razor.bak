@@ -1,0 +1,33 @@
+@* Reusable search input with a clear ("X") button that appears once
+   there's text - added 2026-11-24 (user asked for an X on every search
+   box app-wide). Wraps the existing .search-box styling (app.css)
+   rather than replacing it, so it looks identical to the plain
+   <input class="search-box"> every page already used - just with a
+   clear button added. The clear button fires the SAME OnInput callback
+   a page already wires up for typing, with an empty value, so clearing
+   runs through the exact same filter-reset logic a page already has for
+   clearing the box by hand (resetting any page/selection state tied to
+   the search) - no second "clear" method needed on any page that uses
+   this. *@
+@namespace ComicPos.Web.Components.Shared
+
+<div class="search-box-wrap">
+    <input type="text" class="search-box" placeholder="@Placeholder" value="@Value" @oninput="OnInput" @onkeydown="OnKeyDown" />
+    @if (!string.IsNullOrEmpty(Value))
+    {
+        <button type="button" class="search-box-clear" title="Clear" @onclick="Clear">&times;</button>
+    }
+</div>
+
+@code {
+    [Parameter] public string Value { get; set; } = "";
+    [Parameter] public string Placeholder { get; set; } = "Search...";
+    [Parameter] public EventCallback<ChangeEventArgs> OnInput { get; set; }
+
+    // Optional - only Checkout's barcode-scan box needs this (Enter to
+    // submit the scan). Left unset, @onkeydown just calls an EventCallback
+    // with nothing subscribed, which is a harmless no-op.
+    [Parameter] public EventCallback<KeyboardEventArgs> OnKeyDown { get; set; }
+
+    private Task Clear() => OnInput.InvokeAsync(new ChangeEventArgs { Value = "" });
+}
