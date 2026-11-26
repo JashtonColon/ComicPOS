@@ -66,7 +66,13 @@ static class Program
         // (browser mode only gets that) - this is purely keeping the
         // shared backend wiring here compiling.
         var locg = new LocgService();
-        var autoFetch = new AutoFetchService(db, comicVine, comicList, comicadeFoc, gcd, metron, locg, storeSettings);
+        // Same story as locg above - AutoFetchService's constructor picked
+        // up an ICustomerService dependency (for the web-only "Generate
+        // Fake Sales History" seed-data button) and this call fell out of
+        // sync with it. customers already exists above (line 40) for
+        // checkout, so just pass it through - no new WinForms feature,
+        // purely keeping the shared backend wiring here compiling.
+        var autoFetch = new AutoFetchService(db, comicVine, comicList, comicadeFoc, gcd, metron, locg, storeSettings, customers);
 
         Application.Run(new MainForm(inventory, checkout, history, customers, pullLists, issueHolds, import, focReport, email, emailSettings, dashboard, storeSettings, backupService, autoFetch));
     }
