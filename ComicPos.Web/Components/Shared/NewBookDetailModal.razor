@@ -15,6 +15,14 @@
         {
             <p class="help-text" style="background:var(--accent-soft);padding:8px 12px;border-radius:8px">&#10003; @_pullListMessage</p>
         }
+        @* Every cover on an issue almost always carries the same
+           solicitation blurb (whichever source set it stamps the same
+           text onto EVERY Cover row for the issue, not just the primary
+           one - see AutoFetchService.BuildCoversFromEntry). Showing it
+           once here, instead of once per cover below, avoids the exact
+           same paragraph repeating under Cover A, B, C and D - confirmed
+           live on a Lunar-sourced multi-cover issue. *@
+        <p style="font-size:13px;color:var(--text-muted);margin:4px 0 12px">@IssueDescription</p>
         <p class="list-row-title">@(Issue.Covers.Count == 1 ? "Cover" : $"Covers ({Issue.Covers.Count})")</p>
         <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px">
             @foreach (var cover in Issue.Covers.OrderBy(c => c.CoverLetter))
@@ -26,7 +34,6 @@
                          @onclick="@(() => OpenZoom(cover))" />
                     <p style="font-weight:600;margin:8px 0 2px">@(cover.CoverLetter == "A" ? "Cover A (main)" : $"Cover {cover.CoverLetter}")</p>
                     <p class="help-text" style="margin:0 0 6px">@(cover.Price > 0 ? cover.Price.ToString("C") : "Price not set yet")</p>
-                    <p style="font-size:13px;color:var(--text-muted)">@(string.IsNullOrWhiteSpace(cover.Description) ? "No description available yet." : cover.Description)</p>
                 </div>
             }
         </div>
@@ -72,6 +79,14 @@
             return string.Join("   •   ", parts);
         }
     }
+
+    // Every cover's own Description is usually the same issue-level
+    // blurb copied onto each one - the first non-blank one found is as
+    // good as any other, so this doesn't try to reconcile covers whose
+    // text genuinely differs (rare, and not worth the complexity here).
+    private string IssueDescription =>
+        Issue?.Covers.Select(c => c.Description).FirstOrDefault(d => !string.IsNullOrWhiteSpace(d))
+        ?? "No description available yet.";
 
     private static bool HasImage(Cover cover) => !string.IsNullOrWhiteSpace(cover.CoverImagePath) && File.Exists(cover.CoverImagePath);
 
