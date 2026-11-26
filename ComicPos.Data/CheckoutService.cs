@@ -75,7 +75,32 @@ public class CheckoutService : ICheckoutService
         }
 
         _db.Sales.Add(sale);
-        _db.SaveChanges();
+        try
+        {
+            _db.SaveChanges();
+        }
+        catch (Exception ex)
+        {
+            // Same cascading-failure risk documented on AutoFetchService.
+            // TrySaveChanges, and sharper here: this DbContext is scoped
+            // PER CIRCUIT in Blazor Server - one instance for a customer's
+            // ENTIRE browsing session on the Checkout page, not just this
+            // one click (see Program.cs's AddDbContext<ComicDbContext>
+            // comment). Without clearing the tracker, a save failure here
+            // would leave this half-applied sale tracked and poison every
+            // later save this same browser tab makes for the rest of the
+            // session - not just the next checkout attempt, but anything
+            // else this circuit's services touch. Confirmed 2026-11-24:
+            // this is also what was making the Low Stock Warning modal's
+            // Yes/No/X buttons all look "broken" at once - CompleteSale
+            // threw here uncaught, which crashed the whole Blazor Server
+            // circuit (not just this one button), so EVERY button on the
+            // page stopped responding until the page was reloaded. Now
+            // caught and re-thrown as a plain message Checkout.razor's
+            // FinishSale can show in _completeError instead.
+            _db.ChangeTracker.Clear();
+            throw new InvalidOperationException($"Couldn't save this sale: {ex.Message}", ex);
+        }
 
         // The ledger debit is written AFTER the sale itself is saved, not
         // before - StoreCreditTransaction.SaleId wants the sale's real,
