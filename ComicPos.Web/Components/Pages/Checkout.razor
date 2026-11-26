@@ -4,8 +4,10 @@
 @using ComicPos.Core.Services
 @inject ICheckoutService CheckoutService
 @inject ICustomerService Customers
+@inject ISalesHistoryService SalesHistory
 @inject IStoreSettingsService StoreSettingsService
 @inject ComicPos.Web.Services.CurrentWorkerContext CurrentWorker
+@inject ComicPos.Web.Services.CurrentSaleContext SaleContext
 @rendermode InteractiveServer
 
 <PageTitle>Checkout - Comic POS</PageTitle>
@@ -17,9 +19,9 @@
 <div class="checkout-layout">
     <div class="checkout-main">
         <div class="toolbar">
-            <input type="text" class="search-box" placeholder="Scan barcode..." value="@_barcode"
-                   @oninput="e => _barcode = e.Value?.ToString() ?? string.Empty"
-                   @onkeydown="HandleBarcodeKeyDown" />
+            <ClearableSearchBox Value="@_barcode" Placeholder="Scan barcode..."
+                   OnInput="e => _barcode = e.Value?.ToString() ?? string.Empty"
+                   OnKeyDown="HandleBarcodeKeyDown" />
         </div>
         @if (_scanError != null)
         {
@@ -47,7 +49,7 @@
                             <td><input type="text" style="width:70px" value="@row.PriceEach" @onchange="e => SavePriceEach(row, e.Value?.ToString() ?? string.Empty)" /></td>
                             <td><input type="text" style="width:60px" value="@row.Discount" @onchange="e => SaveDiscount(row, e.Value?.ToString() ?? string.Empty)" /></td>
                             <td>@row.LineTotal.ToString("C")</td>
-                            <td><button class="btn-ghost btn-sm" @onclick="@(() => RemoveLine(row.Line))">Remove</button></td>
+                            <td><button class="btn-ghost btn-sm btn-remove" @onclick="@(() => RemoveLine(row.Line))">Remove</button></td>
                         </tr>
                     }
                 </tbody>
@@ -58,7 +60,7 @@
     <div class="checkout-side">
         <div class="panel">
             <p class="list-row-title">@_customerLabel</p>
-            <input type="text" class="search-box" placeholder="Search customer (optional)..." value="@_customerSearch" @oninput="OnCustomerSearchInput" />
+            <ClearableSearchBox Value="@_customerSearch" Placeholder="Search customer (optional)..." OnInput="OnCustomerSearchInput" />
             @if (_customerResults.Count > 0)
             {
                 <div class="list-rows" style="margin-top:8px">
@@ -137,6 +139,16 @@
     </Modal>
 }
 
+@if (_priorPurchaseWarning != null)
+{
+    <Modal Show="true" Title="Already Purchased" OnBackdropClick="DismissPriorPurchaseWarning">
+        <p>@_priorPurchaseWarning</p>
+        <div class="form-actions">
+            <button class="btn-primary" @onclick="DismissPriorPurchaseWarning">OK</button>
+        </div>
+    </Modal>
+}
+
 <ReceiptModal Show="_showReceipt" Body="@_receiptBody" StoreName="@_receiptStoreName"
               Address="@_receiptAddress" Phone="@_receiptPhone" HasLogo="_receiptHasLogo" OnClose="CloseReceipt" />
 
@@ -161,6 +173,15 @@
     private string? _completeError;
     private List<string>? _lowStockWarnings;
 
+    // Set right after a successful scan when the selected customer's own
+    // sales history already has this exact cover on it (see
+    // CheckPriorPurchase) - purely informational, same spirit as the
+    // customer asking "didn't I already get this one?" at the counter.
+    // Deliberately doesn't block or remove anything from the cart; the
+    // clerk can still hit Remove on that line themselves if it really was
+    // a mis-scan.
+    private string? _priorPurchaseWarning;
+
     private decimal _storeCreditBalance;
     private string _storeCreditToApplyInput = "";
     private string? _storeCreditError;
@@ -182,9 +203,30 @@
         public decimal LineTotal { get; set; }
     }
 
+    // Resumes the in-progress sale from CurrentSaleContext when one's
+    // already there (navigated away and back within the same circuit),
+    // instead of unconditionally starting a brand-new one every time this
+    // page component is created - see CurrentSaleContext's own doc
+    // comment for why that was happening. A genuinely new sale (first
+    // visit this circuit, or right after FinishSale cleared the context)
+    // still goes through CheckoutService.StartSale() exactly as before.
     protected override void OnInitialized()
     {
-        _sale = CheckoutService.StartSale();
+        if (SaleContext.Sale != null)
+        {
+            _sale = SaleContext.Sale;
+            _selectedCustomerName = SaleContext.SelectedCustomerName;
+            _customerLabel = _selectedCustomerName != null ? $"Customer: {_selectedCustomerName}" : "Customer: Walk-in";
+            _cashTendered = SaleContext.CashTendered;
+            _storeCreditToApplyInput = SaleContext.StoreCreditToApplyInput;
+            if (_sale.CustomerId.HasValue)
+                _storeCreditBalance = Customers.GetStoreCreditBalance(_sale.CustomerId.Value);
+        }
+        else
+        {
+            _sale = CheckoutService.StartSale();
+            SaleContext.SetSale(_sale, null);
+        }
         RefreshCart();
     }
 
@@ -238,6 +280,7 @@
     private void OnCashTenderedInput(ChangeEventArgs e)
     {
         _cashTendered = e.Value?.ToString() ?? "";
+        SaleContext.CashTendered = _cashTendered;
         UpdateChangeDue();
     }
 
@@ -255,9 +298,43 @@
         else
         {
             RefreshCart();
+            CheckPriorPurchase(barcode);
         }
         _barcode = "";
     }
+
+    // Added 2026-11-24 - the store asked for a heads-up when a customer's
+    // already bought the exact book that just got scanned, so a clerk
+    // doesn't sell someone a second copy of the same single issue by
+    // mistake. Deliberately keyed on the scanned Cover's own Id (this
+    // exact variant/cover-letter), not just the Issue - a customer buying
+    // Cover A today and Cover B next week is two different collectibles,
+    // not a duplicate, so that pair should never trigger this. Only fires
+    // when a customer is actually attached to the sale (walk-in sales have
+    // no history to check), and ignores any sale that's since been voided
+    // (CheckoutService.VoidSale already treats a void as undoing the
+    // purchase - stock and store credit both get put back - so the
+    // warning shouldn't act like it still happened).
+    private void CheckPriorPurchase(string barcode)
+    {
+        if (!_sale.CustomerId.HasValue) return;
+
+        var scannedLine = _sale.Lines.FirstOrDefault(l => l.Cover.Barcode == barcode);
+        if (scannedLine == null) return;
+
+        var priorPurchase = SalesHistory.GetHistoryForCustomer(_sale.CustomerId.Value)
+            .Where(h => !h.Sale.IsVoided && h.CoverId == scannedLine.CoverId)
+            .OrderByDescending(h => h.Sale.SoldAt)
+            .FirstOrDefault();
+
+        if (priorPurchase != null)
+        {
+            var issue = priorPurchase.Cover.Issue;
+            _priorPurchaseWarning = $"{_selectedCustomerName} already bought {issue.Series.Name} #{issue.IssueNumber:0.##} [{priorPurchase.Cover.CoverLetter}] on {priorPurchase.Sale.SoldAt:MMM d, yyyy}.";
+        }
+    }
+
+    private void DismissPriorPurchaseWarning() => _priorPurchaseWarning = null;
 
     private void SaveQuantity(CartRow row, string newValue)
     {
@@ -306,6 +383,7 @@
         _sale.CustomerId = customer.Id;
         _customerLabel = $"Customer: {customer.Name}";
         _selectedCustomerName = customer.Name;
+        SaleContext.SetCustomer(customer.Name);
         _customerSearch = "";
         _customerResults = new List<Customer>();
         _storeCreditBalance = Customers.GetStoreCreditBalance(customer.Id);
@@ -321,6 +399,7 @@
     private void OnStoreCreditInputChanged(ChangeEventArgs e)
     {
         _storeCreditToApplyInput = e.Value?.ToString() ?? "";
+        SaleContext.StoreCreditToApplyInput = _storeCreditToApplyInput;
         _storeCreditError = null;
 
         if (string.IsNullOrWhiteSpace(_storeCreditToApplyInput))
@@ -351,6 +430,7 @@
         {
             _storeCreditError = ex.Message;
         }
+        SaleContext.StoreCreditToApplyInput = _storeCreditToApplyInput;
         RecalculateTotals();
     }
 
@@ -361,6 +441,7 @@
         {
             CheckoutService.ApplyStoreCredit(_sale, cap);
             _storeCreditToApplyInput = cap.ToString("0.00");
+            SaleContext.StoreCreditToApplyInput = _storeCreditToApplyInput;
             _storeCreditError = null;
         }
         catch (InvalidOperationException ex)
@@ -417,10 +498,37 @@
         // database (and its store-credit ledger debit, if any, is
         // written - see CheckoutService.CompleteSale) - the receipt
         // wants a real receipt number, not 0.
-        CheckoutService.CompleteSale(completingSale);
+        //
+        // Wrapped in try/catch added 2026-11-24 - this call used to be
+        // unguarded, unlike every other risky call in this file
+        // (OnStoreCreditInputChanged/ApplyMaxStoreCredit both already
+        // caught their own InvalidOperationException). An uncaught
+        // exception here doesn't just fail this one sale - it crashes the
+        // whole Blazor Server circuit for this browser tab, which looks
+        // exactly like "every button on the page stopped responding"
+        // (confirmed live: this is what made the Low Stock Warning
+        // modal's Yes/No/X all look broken together - clicking Yes threw
+        // here, and once the circuit was down, No and X couldn't respond
+        // either, even though neither of them does anything risky on its
+        // own). The cart/sale are untouched at this point (nothing below
+        // has run yet), so returning here leaves everything exactly as it
+        // was and lets the person retry or adjust quantities instead of
+        // losing the whole page.
+        try
+        {
+            CheckoutService.CompleteSale(completingSale);
+        }
+        catch (Exception ex)
+        {
+            _lowStockWarnings = null;
+            _completeError = $"Couldn't complete the sale: {ex.Message}";
+            return;
+        }
         var receiptBody = BuildReceipt(completingSale, customerNameForReceipt, servedByForReceipt, subtotal, tax, total, storeCreditUsed, amountDue, tendered, change);
 
         _sale = CheckoutService.StartSale();
+        SaleContext.Clear();
+        SaleContext.SetSale(_sale, null);
         _customerLabel = "Customer: Walk-in";
         _selectedCustomerName = null;
         _customerSearch = "";
