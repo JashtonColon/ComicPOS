@@ -1,8 +1,12 @@
+using System.Globalization;
+using System.Net.Http;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using ComicPos.Core;
 using ComicPos.Core.Models;
 using ComicPos.Core.Services;
+using ComicPos.Importers;
 using Microsoft.EntityFrameworkCore;
 
 namespace ComicPos.Data;
@@ -17,8 +21,9 @@ public class AutoFetchService : IAutoFetchService
     private readonly IMetronService _metron;
     private readonly ILocgService _locg;
     private readonly IStoreSettingsService _storeSettings;
+    private readonly ICustomerService _customers;
 
-    public AutoFetchService(ComicDbContext db, IComicVineService comicVine, IComicListService comicList, IComicadeFocService comicadeFoc, IGcdService gcd, IMetronService metron, ILocgService locg, IStoreSettingsService storeSettings)
+    public AutoFetchService(ComicDbContext db, IComicVineService comicVine, IComicListService comicList, IComicadeFocService comicadeFoc, IGcdService gcd, IMetronService metron, ILocgService locg, IStoreSettingsService storeSettings, ICustomerService customers)
     {
         _db = db;
         _comicVine = comicVine;
@@ -28,6 +33,7 @@ public class AutoFetchService : IAutoFetchService
         _metron = metron;
         _locg = locg;
         _storeSettings = storeSettings;
+        _customers = customers;
     }
 
     public DateTime? LastCheckedAt() => _storeSettings.Load().LastAutoFetchRun;
@@ -669,6 +675,13 @@ public class AutoFetchService : IAutoFetchService
         // GCD, a separate and independent source, keeps going for all of
         // them regardless.
         var comicVineRateLimited = false;
+        // Two new-this-round counters (see the auto-link branch
+        // below) - PRH's own feed never includes a cover image or a
+        // Comic Vine id, so a brand-new PRH-sourced series starts
+        // completely unlinked, and before this fix only Metron/GCD
+        // (below) ever got a shot at its missing covers.
+        var newlyLinkedThisRescan = 0;
+        var skippedAutoLinkCooldown = 0;
         // GCD's anonymous access is capped around 30 requests/hour
         // (confirmed on GCD's own gcd-tech mailing list) - a hard quota,
         // not something a longer per-call delay can avoid. Once it trips,
@@ -700,12 +713,43 @@ public class AutoFetchService : IAutoFetchService
             result.SeriesChecked++;
             var missingBefore = series.Issues.Count(i => i.Covers.Any(c => string.IsNullOrWhiteSpace(c.CoverImagePath)));
 
-            if (series.ComicVineVolumeId != null && !comicVineRateLimited)
+            if (!comicVineRateLimited)
             {
                 try
                 {
-                    ReverifyVolumeLink(series, result);
-                    BackfillFromComicVine(series, result);
+                    if (series.ComicVineVolumeId != null)
+                    {
+                        ReverifyVolumeLink(series, result);
+                        BackfillFromComicVine(series, result);
+                    }
+                    // A never-linked series never got a link ATTEMPT here
+                    // before this fix - only Metron/GCD ran for it below,
+                    // and Metron's IP-blocked while GCD caps out around 30
+                    // requests/hour. The PRH automation (see
+                    // metron-integration-notes.md) made this the dominant
+                    // case overnight: thousands of brand-new PRH-sourced
+                    // series/issues with zero cover art and zero Comic Vine
+                    // link, since PRH's own feed never includes a cover
+                    // image or a Comic Vine id. TryAutoLink already applies
+                    // the "never guess" exact-match-or-nothing rule (plus
+                    // its own collected-edition fallback, which matters a
+                    // lot given how omnibus/TP-heavy PRH's catalog is) and
+                    // stamps LastAutoLinkAttempt itself - the cooldown
+                    // check here just avoids re-asking Comic Vine about a
+                    // title it already said no to within the last 24h.
+                    else if (series.LastAutoLinkAttempt == null ||
+                             DateTime.Now - series.LastAutoLinkAttempt.Value >= AutoLinkRetryCooldown)
+                    {
+                        if (TryAutoLink(series, result))
+                        {
+                            newlyLinkedThisRescan++;
+                            BackfillFromComicVine(series, result);
+                        }
+                    }
+                    else
+                    {
+                        skippedAutoLinkCooldown++;
+                    }
                 }
                 catch (Exception ex) when (IsRateLimitError(ex))
                 {
@@ -796,6 +840,7 @@ public class AutoFetchService : IAutoFetchService
                 result.Added.Add($"{series.Name}: backfilled {backfilledThisSeries} cover(s) ({missingAfter} still missing).");
         }
 
+        trace.AppendLine($"Comic Vine auto-link (previously-unlinked series): {newlyLinkedThisRescan} linked and backfilled this run" + (skippedAutoLinkCooldown > 0 ? $" ({skippedAutoLinkCooldown} skipped - auto-link tried within the last {AutoLinkRetryCooldown.TotalHours:0}h and didn't match)." : "."));
         trace.AppendLine($"Metron backfilled {backfilledFromMetron} cover(s) out of {metronAttempts} attempt(s); GCD (fallback) backfilled {backfilledFromGcd} cover(s) out of {gcdAttempts} attempt(s) (on top of whatever Comic Vine backfilled above).");
         if (gcdReasonCounts.Count > 0)
         {
@@ -903,6 +948,58 @@ public class AutoFetchService : IAutoFetchService
     // far worse than a gap in the results that a second run (same year)
     // can simply fill back in, since already-known issues are
     // skipped/merged rather than duplicated either way.
+    // Shared by every long-running method below that calls SaveChanges()
+    // once per week/chunk/file in a loop against this SAME _db instance
+    // (RunBackfillYearFromLocg, RunCheckForNewIssuesViaMetron,
+    // ImportLunarDistributionRelease/WalkAndImportLunarDates) - added
+    // 2026-11-24 after a real "Backfill All Lunar History" run showed
+    // EVERY SINGLE week after the first real failure also failing, all
+    // with the exact same generic "An error occurred while saving the
+    // entity changes. See the inner exception for details." message
+    // repeated upwards of 80 times in a row (109 "weeks imported" were
+    // logged by the walk, but only the first 5 actually saved anything -
+    // see WalkAndImportLunarDates' own counter fix, same bug, same root
+    // cause).
+    //
+    // Root cause: EF Core does NOT automatically revert entities to
+    // their pre-change state when SaveChanges() throws - a half-applied
+    // batch of Added/Modified entities stays tracked exactly as it was -
+    // so the VERY NEXT SaveChanges() call on the SAME DbContext tries
+    // (and fails) to save those same bad entities all over again, on top
+    // of whatever new data that next iteration added, compounding
+    // forever. A single bad week/chunk/file was silently taking down
+    // every later one in the same run. The three loops above all reuse
+    // one shared _db for their whole (often hours-long) run specifically
+    // so earlier iterations' work gets flushed to disk incrementally
+    // (see each one's own "persist incrementally" comment) - exactly the
+    // design that makes this failure mode possible if a save ever does
+    // fail partway through.
+    //
+    // Fix: clear the change tracker immediately after a failed save, so
+    // the next iteration starts clean regardless of what the failed one
+    // left behind. Also walks the real InnerException chain for the
+    // actual detail (DbUpdateException's own Message is always the same
+    // unhelpful boilerplate - the real SQLite/EF reason, e.g. which
+    // unique index was violated, is one or more levels down), so a
+    // future failure like this one is diagnosable from the trace log
+    // instead of needing to be guessed at the way this one had to be.
+    private (bool Success, string? Error) TrySaveChanges()
+    {
+        try
+        {
+            _db.SaveChanges();
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            _db.ChangeTracker.Clear();
+            var parts = new List<string>();
+            for (var e = ex; e != null; e = e.InnerException)
+                parts.Add(e.Message);
+            return (false, string.Join(" -> ", parts));
+        }
+    }
+
     private void RunBackfillYearFromLocg(int year, AutoFetchResult result, System.Text.StringBuilder trace, Action<string>? onProgress = null)
     {
         var allSeries = _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers).ToList();
@@ -936,9 +1033,13 @@ public class AutoFetchService : IAutoFetchService
                 var beforeCount = result.NewIssuesAdded;
                 AddEntriesAsIssues(allSeries, entries, week, "LOCG", result);
                 var added = result.NewIssuesAdded - beforeCount;
-                progressLine = $"Week {i + 1}/{mondays.Count} ({week:MM/dd/yyyy}): {entries.Count} entries from LOCG, +{added} new issue(s).";
+                // persist incrementally - a later week's failure shouldn't lose earlier weeks' work
+                var (saved, saveError) = TrySaveChanges();
+                progressLine = saved
+                    ? $"Week {i + 1}/{mondays.Count} ({week:MM/dd/yyyy}): {entries.Count} entries from LOCG, +{added} new issue(s)."
+                    : $"Week {i + 1}/{mondays.Count} ({week:MM/dd/yyyy}): {entries.Count} entries matched but FAILED TO SAVE - {saveError}";
                 trace.AppendLine(progressLine);
-                _db.SaveChanges(); // persist incrementally - a later week's failure shouldn't lose earlier weeks' work
+                if (!saved) result.Errors.Add($"LOCG week of {week:MM/dd/yyyy}: failed to save - {saveError}");
             }
             catch (Exception ex)
             {
@@ -1040,9 +1141,13 @@ public class AutoFetchService : IAutoFetchService
                 var beforeCount = result.NewIssuesAdded;
                 AddEntriesAsIssues(allSeries, entries, start, "MTR", result);
                 var added = result.NewIssuesAdded - beforeCount;
-                progressLine = $"Week {i + 1}/{chunks.Count} ({start:MM/dd/yyyy}-{end:MM/dd/yyyy}): {entries.Count} issue(s) from Metron, +{added} new issue(s).";
+                // persist incrementally - a later chunk's failure shouldn't lose earlier chunks' work
+                var (saved, saveError) = TrySaveChanges();
+                progressLine = saved
+                    ? $"Week {i + 1}/{chunks.Count} ({start:MM/dd/yyyy}-{end:MM/dd/yyyy}): {entries.Count} issue(s) from Metron, +{added} new issue(s)."
+                    : $"Week {i + 1}/{chunks.Count} ({start:MM/dd/yyyy}-{end:MM/dd/yyyy}): {entries.Count} issue(s) matched but FAILED TO SAVE - {saveError}";
                 trace.AppendLine(progressLine);
-                _db.SaveChanges(); // persist incrementally - a later chunk's failure shouldn't lose earlier chunks' work
+                if (!saved) result.Errors.Add($"Metron {start:MM/dd/yyyy}-{end:MM/dd/yyyy}: failed to save - {saveError}");
             }
             catch (Exception ex)
             {
@@ -1093,23 +1198,40 @@ public class AutoFetchService : IAutoFetchService
             .Include(i => i.Covers)
             .ToList()
             .Where(i => i.Covers.Any(c => c.Price == 0 && c.Barcode.StartsWith("MTR-")))
-            // Most recent release first, not whatever order SQLite's table
-            // scan happens to return (effectively insertion order) - added
-            // 2026-11-23 after a Test 5 run on the LOCG counterpart below
-            // picked 5 of the OLDEST unenriched rows, which turned out to
-            // all be old solicitation-catalog/digital-only junk (Marvel
-            // Previews, an IDW title catalog, several "Infinity Comic"
-            // digital exclusives) sitting outside GetNewBooks' 3-month
-            // window - not representative of what this button is actually
-            // for, and a wasted ~10 minutes confirming nothing useful.
-            // Newest-first means a `limit` test run samples real, recent
-            // single issues instead.
-            .OrderByDescending(i => i.ReleaseDate)
+            // Closest to TODAY first, not whatever order SQLite's table
+            // scan happens to return (effectively insertion order) and not
+            // a plain OrderByDescending either - added 2026-11-23 after two
+            // failed attempts at ordering the LOCG counterpart below:
+            // unordered picked 5 of the OLDEST unenriched rows, which
+            // turned out to be old solicitation-catalog/digital-only junk
+            // (Marvel Previews, an IDW title catalog, several "Infinity
+            // Comic" digital exclusives); plain newest-first then picked
+            // issues solicited as far out as March 2027 - 15 months away -
+            // which LOCG's own site couldn't reliably serve (HTTP 403,
+            // self-interrupted navigations), presumably because its new-
+            // releases calendar doesn't really have usable data that far
+            // ahead. Sorting by DISTANCE from today instead (not direction)
+            // means a `limit` test run samples whatever's actually close to
+            // "now" either way - real, current single issues, the same
+            // kind GetNewBooks' 3-month window shows.
+            .OrderBy(i => i.ReleaseDate.HasValue
+                ? Math.Abs((i.ReleaseDate.Value.ToDateTime(TimeOnly.MinValue) - DateTime.Now).TotalDays)
+                : double.MaxValue)
             .ToList();
         if (limit.HasValue) candidates = candidates.Take(limit.Value).ToList();
 
         onProgress?.Invoke($"Found {candidates.Count} Metron-sourced issue(s) still showing placeholder price/barcode.");
 
+        // Shared across every issue in this run - see Bug #10's fix on
+        // AddMissingCoverVariants/AddEntriesAsIssues' batchClaimedBarcodes
+        // for why a per-issue set isn't enough.
+        // Bug #12 fix (2026-11-24): seeded from the WHOLE Covers table, not
+        // left empty - see AddEntriesAsIssues' own batchClaimedBarcodes doc
+        // comment for the full story (a cover here can collide with one
+        // created by a totally different earlier run, e.g. a facsimile
+        // reprint whose barcode got merged onto the wrong issue before the
+        // facsimile-title fix existed).
+        var batchClaimedBarcodes = _db.Covers.Select(c => c.Barcode).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var done = 0;
         foreach (var issue in candidates)
         {
@@ -1166,7 +1288,7 @@ public class AutoFetchService : IAutoFetchService
                 // above.
                 var variantsFound = tempEntry.Variants.Count;
                 tempEntry.MetronIssueId = null;
-                AddMissingCoverVariants(issue, new List<ComicListEntry> { tempEntry }, seriesName, "MTR", result);
+                AddMissingCoverVariants(issue, new List<ComicListEntry> { tempEntry }, seriesName, "MTR", result, batchClaimedBarcodes);
 
                 outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: re-enriched from Metron ({variantsFound} variant(s) on file there).";
                 result.Added.Add(outcomeLine);
@@ -1247,16 +1369,19 @@ public class AutoFetchService : IAutoFetchService
             .Include(i => i.Covers)
             .ToList()
             .Where(i => i.Covers.Any(c => c.Price == 0 && (c.Barcode.StartsWith("MTR-") || c.Barcode.StartsWith("LOCG-"))))
-            // Most recent release first - see the identical comment on
+            // Closest to today first - see the identical comment on
             // RetryMetronEnrichment's candidate query above. Confirmed
-            // live 2026-11-23: an unordered Test 5 run picked 5 old
-            // solicitation-catalog/digital-only entries (Marvel Previews,
-            // an IDW title catalog, several "Infinity Comic" exclusives) -
-            // real LOCG data, correctly matched, but none of them
-            // representative single issues and none inside GetNewBooks'
-            // 3-month window, so there was nothing useful to check the
-            // result against.
-            .OrderByDescending(i => i.ReleaseDate)
+            // live 2026-11-23, twice: unordered picked 5 old solicitation-
+            // catalog/digital-only entries (Marvel Previews, an IDW title
+            // catalog, several "Infinity Comic" exclusives); plain
+            // newest-first then picked issues solicited as far out as
+            // March 2027, which LOCG's own site 403'd or self-interrupted
+            // navigating to (its new-releases calendar doesn't seem to
+            // have usable data that far ahead). Distance-from-today avoids
+            // both extremes.
+            .OrderBy(i => i.ReleaseDate.HasValue
+                ? Math.Abs((i.ReleaseDate.Value.ToDateTime(TimeOnly.MinValue) - DateTime.Now).TotalDays)
+                : double.MaxValue)
             .ToList();
         if (limit.HasValue) candidates = candidates.Take(limit.Value).ToList();
 
@@ -1264,6 +1389,16 @@ public class AutoFetchService : IAutoFetchService
 
         var weekCache = new Dictionary<DateOnly, (List<ComicListEntry>? Entries, string? Error)>();
 
+        // Shared across every issue in this run - see Bug #10's fix on
+        // AddMissingCoverVariants/AddEntriesAsIssues' batchClaimedBarcodes
+        // for why a per-issue set isn't enough.
+        // Bug #12 fix (2026-11-24): seeded from the WHOLE Covers table, not
+        // left empty - see AddEntriesAsIssues' own batchClaimedBarcodes doc
+        // comment for the full story (a cover here can collide with one
+        // created by a totally different earlier run, e.g. a facsimile
+        // reprint whose barcode got merged onto the wrong issue before the
+        // facsimile-title fix existed).
+        var batchClaimedBarcodes = _db.Covers.Select(c => c.Barcode).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var done = 0;
         foreach (var issue in candidates)
         {
@@ -1374,7 +1509,7 @@ public class AutoFetchService : IAutoFetchService
                 // actually turned into a new Cover row - exactly like a
                 // brand-new issue already works.
                 primary.DetailUrl = null;
-                AddMissingCoverVariants(issue, matches, seriesName, "LOCG", result);
+                AddMissingCoverVariants(issue, matches, seriesName, "LOCG", result, batchClaimedBarcodes);
 
                 outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: re-enriched from LOCG ({matches.Count} matching entr{(matches.Count == 1 ? "y" : "ies")} that week).";
                 result.Added.Add(outcomeLine);
@@ -1401,6 +1536,1664 @@ public class AutoFetchService : IAutoFetchService
         // otherwise a trivial run (nothing to retry) would leave the debug
         // file showing a stale trace from whatever ran before it.
         DebugLog.WriteCheckNowLog(result.Trace);
+        return result;
+    }
+
+    // Hand-picked verification target, added 2026-11-24 - NOT LOCG (see
+    // RetryLocgEnrichment above), deliberately one of the no-Cloudflare
+    // sources instead: comicade.com's FOC catalogue, the same one
+    // "Check Now (no Cloudflare)" already uses. Built after both the
+    // LOCG candidate query AND a manual LOCG click stopped working the
+    // same evening (Cloudflare rejecting even a real human click - see
+    // metron-integration-notes.md), so this checks two SPECIFIC,
+    // already-known issues against a source that has no Cloudflare step
+    // to get stuck on at all - comicade.com's Inertia JSON endpoint is a
+    // plain HTTP GET. Deliberately hardcoded, not a general "enrich any
+    // issue by name" feature - a one-off diagnostic button.
+    //
+    // Important limitation, inherited from IComicadeFocService.
+    // GetUpcomingFocEntries: comicade.com's own catalogue is FORWARD-
+    // looking only (today through roughly 2 months out) - there's no way
+    // to ask it for an already-past week the way LOCG's dated URL allows.
+    // If either target issue's FOC/street date has already passed,
+    // Comicade simply won't have it on file any more, and this reports
+    // that plainly rather than silently finding nothing.
+    //
+    // Does NOT require the issue to currently show a placeholder price/
+    // barcode (unlike RetryLocgEnrichment/RetryMetronEnrichment) - these
+    // two may already have real data on file, and the point here is
+    // purely to confirm the match/enrich logic produces the right answer
+    // for issues the user can check against Comicade's own site by hand.
+    public AutoFetchResult RetryComicadeEnrichmentForSpecificIssues(Action<string>? onProgress = null)
+    {
+        var targets = new (string SeriesName, float IssueNumber)[]
+        {
+            ("Absolute Wonder Woman", 26f),
+            ("Absolute Flash", 21f)
+        };
+
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Retry Comicade FOC enrichment (specific issues) run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
+
+        var allIssues = _db.Issues.Include(i => i.Series).Include(i => i.Covers).ToList();
+        var candidates = new List<Issue>();
+        foreach (var (targetName, targetNumber) in targets)
+        {
+            var targetKey = SeriesNameKey.Normalize(targetName);
+            var found = allIssues.FirstOrDefault(i =>
+                SeriesNameKey.Normalize(i.Series.Name) == targetKey
+                && Math.Abs(i.IssueNumber - targetNumber) < 0.01f);
+            if (found != null)
+            {
+                candidates.Add(found);
+            }
+            else
+            {
+                var line = $"{targetName} #{targetNumber:0.##}: not found in inventory at all - can't retry something that was never added.";
+                result.Errors.Add(line);
+                trace.AppendLine(line);
+            }
+        }
+
+        onProgress?.Invoke($"Found {candidates.Count}/{targets.Length} target issue(s) in inventory - checking comicade.com's FOC catalogue...");
+
+        // Shared across every issue in this run - see Bug #10's fix on
+        // AddMissingCoverVariants/AddEntriesAsIssues' batchClaimedBarcodes
+        // for why a per-issue set isn't enough.
+        // Bug #12 fix (2026-11-24): seeded from the WHOLE Covers table, not
+        // left empty - see AddEntriesAsIssues' own batchClaimedBarcodes doc
+        // comment for the full story (a cover here can collide with one
+        // created by a totally different earlier run, e.g. a facsimile
+        // reprint whose barcode got merged onto the wrong issue before the
+        // facsimile-title fix existed).
+        var batchClaimedBarcodes = _db.Covers.Select(c => c.Barcode).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        List<ComicListEntry> comicadeEntries;
+        try
+        {
+            comicadeEntries = _comicadeFoc.GetUpcomingFocEntries();
+        }
+        catch (Exception ex)
+        {
+            var line = $"Comicade FOC catalogue unreachable: {ex.Message}";
+            result.Errors.Add(line);
+            trace.AppendLine(line);
+            trace.AppendLine();
+            trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}.");
+            result.Trace = trace.ToString();
+            DebugLog.WriteCheckNowLog(result.Trace);
+            return result;
+        }
+
+        var done = 0;
+        foreach (var issue in candidates)
+        {
+            done++;
+            var seriesName = issue.Series.Name;
+            string outcomeLine;
+            try
+            {
+                var seriesKey = SeriesNameKey.Normalize(seriesName);
+                var matches = comicadeEntries
+                    .Where(e => !string.IsNullOrWhiteSpace(e.SeriesName)
+                        && SeriesNameKey.Normalize(e.SeriesName!) == seriesKey
+                        && e.IssueNumber.HasValue
+                        && Math.Abs(e.IssueNumber.Value - issue.IssueNumber) < 0.01f)
+                    .ToList();
+
+                if (matches.Count == 0)
+                {
+                    outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: not in Comicade's current FOC window ({comicadeEntries.Count} entries total right now) - likely already past its FOC/street date, which this source doesn't keep historical data for.";
+                    result.Errors.Add(outcomeLine);
+                }
+                else
+                {
+                    // Comicade entries already carry everything (Upc,
+                    // Price, Description, CoverImageUrl) straight off its
+                    // own JSON - no separate detail-page fetch needed the
+                    // way LOCG/Metron require (see ComicadeFocService).
+                    var primary = matches.FirstOrDefault(e => string.Equals(e.CoverLetter, "A", StringComparison.OrdinalIgnoreCase)) ?? matches[0];
+
+                    var primaryCover = issue.Covers.FirstOrDefault(c => string.Equals(c.CoverLetter, "A", StringComparison.OrdinalIgnoreCase))
+                        ?? issue.Covers.FirstOrDefault();
+                    if (primaryCover != null)
+                    {
+                        if (!string.IsNullOrWhiteSpace(primary.Upc)) primaryCover.Barcode = primary.Upc!;
+                        if (primary.Price.HasValue) primaryCover.Price = primary.Price.Value;
+                        if (!string.IsNullOrWhiteSpace(primary.Description)) primaryCover.Description = primary.Description;
+                    }
+                    if (!string.IsNullOrWhiteSpace(primary.Publisher))
+                        issue.Publisher = primary.Publisher;
+
+                    AddMissingCoverVariants(issue, matches, seriesName, "CFC", result, batchClaimedBarcodes);
+
+                    outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: re-enriched from Comicade ({matches.Count} matching entr{(matches.Count == 1 ? "y" : "ies")}) - Barcode={primaryCover?.Barcode}, Price={primaryCover?.Price}, Publisher={issue.Publisher}.";
+                    result.Added.Add(outcomeLine);
+                }
+            }
+            catch (Exception ex)
+            {
+                outcomeLine = $"{done}/{candidates.Count} {seriesName} #{issue.IssueNumber:0.##}: retry enrichment failed: {ex.Message}";
+                result.Errors.Add(outcomeLine);
+            }
+
+            trace.AppendLine(outcomeLine);
+            onProgress?.Invoke(outcomeLine);
+        }
+
+        _db.SaveChanges();
+        trace.AppendLine();
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}.");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+        return result;
+    }
+
+    // Imports a Lunar Distribution weekly release Excel file - added
+    // 2026-11-24 after confirming (via direct Python/openpyxl inspection
+    // of a real file) that it carries real UPC, price, publisher,
+    // description, FOC date, street date, AND an embedded real cover
+    // photo for every single product row, all with zero network/
+    // Cloudflare/rate-limit risk since it's a file the store receives
+    // directly from its own distributor rather than anything scraped.
+    // See LunarDistributionParser/LunarTitleParser (ComicPos.Importers)
+    // for how the file itself gets read and its titles parsed - this
+    // method's own job is just the glue: save each row's embedded image
+    // to disk (there's no URL to download, see ComicListEntry.
+    // CoverImageLocalPath), turn each row into a ComicListEntry, and feed
+    // the whole batch through the SAME AddEntriesAsIssues pipeline every
+    // other source (ComicList/GCD/Metron/LOCG/Comicade) already uses -
+    // not IImportService.ImportFromCsv's separate, older pipeline, which
+    // has no cover-image handling at all. (Correction, 2026-11-24: an
+    // earlier version of this comment claimed ImportFromCsv had "no UI
+    // entry point" - that was wrong, it's Import.razor at /import, just a
+    // separate CSV-only page from this one.)
+    //
+    // Called once per uploaded file (see NewBooks.razor's file picker) OR
+    // once per FetchLunarReleaseFromWebsite call below, which downloads
+    // the file itself instead of needing it uploaded by hand.
+    public AutoFetchResult ImportLunarDistributionRelease(string filePath, Action<string>? onProgress = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Lunar Distribution import run at {DateTime.Now:yyyy-MM-dd HH:mm:ss} ({Path.GetFileName(filePath)})");
+        trace.AppendLine(new string('=', 60));
+
+        LunarParseResult parsed;
+        try
+        {
+            parsed = LunarDistributionParser.Parse(filePath);
+        }
+        catch (Exception ex)
+        {
+            var line = $"Couldn't read the file: {ex.Message}";
+            result.Errors.Add(line);
+            trace.AppendLine(line);
+            trace.AppendLine();
+            trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}.");
+            result.Trace = trace.ToString();
+            DebugLog.WriteCheckNowLog(result.Trace);
+            return result;
+        }
+
+        result.Errors.AddRange(parsed.Errors);
+        foreach (var e in parsed.Errors) trace.AppendLine(e);
+
+        onProgress?.Invoke($"Parsed {parsed.Rows.Count} comic row(s) from the file - saving cover images and matching against inventory...");
+
+        var allSeries = _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers).ToList();
+        var entries = new List<ComicListEntry>();
+
+        int imagesSaved = 0, imagesFailed = 0;
+        foreach (var row in parsed.Rows)
+        {
+            string? localImagePath = null;
+            if (row.ImageBytes is { Length: > 0 })
+            {
+                try
+                {
+                    var hint = $"{row.SeriesName}_{row.IssueNumber:0.##}_{row.CoverLetter}_{Guid.NewGuid():N}".Replace(" ", "_");
+                    localImagePath = _comicVine.SaveCoverImageBytes(row.ImageBytes, hint, ".jpg");
+                    imagesSaved++;
+                }
+                catch (Exception ex)
+                {
+                    imagesFailed++;
+                    result.Errors.Add($"{row.SeriesName} #{row.IssueNumber:0.##}: couldn't save its embedded cover image: {ex.Message}");
+                }
+            }
+
+            entries.Add(new ComicListEntry
+            {
+                Publisher = row.Publisher,
+                RawTitle = row.RawTitle,
+                SeriesName = row.SeriesName,
+                IssueNumber = row.IssueNumber,
+                CoverLetter = row.CoverLetter,
+                Price = row.Price,
+                ReleaseDate = row.ReleaseDate,
+                FocDate = row.FocDate,
+                Upc = row.Upc,
+                Description = row.Description,
+                CoverImageLocalPath = localImagePath,
+                // A printing marker ("2ND Printing") is worth showing
+                // over a bare artist name when both are somehow present -
+                // see BuildCoversFromEntry's CoverArtist = e.VariantLabel.
+                VariantLabel = row.PrintingLabel ?? row.VariantText,
+                // Only set when Lunar's own title carried a "(YYYY)"
+                // volume-year disambiguator (now stripped out of
+                // SeriesName itself - see LunarTitleParser.
+                // VolumeYearMarker) - lets AddEntriesAsIssues seed a
+                // brand-new series with its real start year instead of
+                // guessing from this week's release date, same as
+                // Metron's own SeriesStartYearHint usage above.
+                SeriesStartYearHint = row.SeriesStartYearHint
+            });
+        }
+
+        trace.AppendLine($"{imagesSaved} cover image(s) saved to disk, {imagesFailed} failed.");
+        onProgress?.Invoke($"{entries.Count} comic entr{(entries.Count == 1 ? "y" : "ies")} ready - matching against inventory...");
+
+        AddEntriesAsIssues(allSeries, entries, DateOnly.FromDateTime(DateTime.Today), "LUN", result);
+
+        // Was a bare _db.SaveChanges() - confirmed live 2026-11-24 that a
+        // single file's failed save (e.g. a duplicate Cover.Barcode within
+        // the batch - see AddEntriesAsIssues' cover-candidate de-dup fix
+        // the same night) left its half-applied entities tracked on this
+        // shared _db, so every LATER call to this same method from
+        // WalkAndImportLunarDates' loop (one call per week during a full
+        // backfill) failed the exact same way trying to re-save them -
+        // see TrySaveChanges' own doc comment for the full story. Using
+        // it here, same as the other two multi-iteration backfill loops,
+        // means one bad file can no longer take an entire backfill run
+        // down with it.
+        var (saved, saveError) = TrySaveChanges();
+        result.Saved = saved;
+        if (!saved)
+        {
+            var line = $"Matched {entries.Count} entr{(entries.Count == 1 ? "y" : "ies")} but FAILED TO SAVE: {saveError}";
+            result.Errors.Add(line);
+            trace.AppendLine(line);
+        }
+
+        trace.AppendLine();
+        if (result.Added.Count > 0)
+        {
+            trace.AppendLine("Added:");
+            foreach (var line in result.Added) trace.AppendLine("  " + line);
+            trace.AppendLine();
+        }
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}. {(saved ? result.NewIssuesAdded : 0)} new issue(s) added.");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+        onProgress?.Invoke(saved
+            ? $"Done - {result.NewIssuesAdded} new issue(s) added, {imagesSaved} cover image(s) saved."
+            : $"Done - save failed, nothing from this file was added: {saveError}");
+        return result;
+    }
+
+    // Imports PRH's "Comics Retail" solicitation spreadsheet - added
+    // 2026-11-25, see IAutoFetchService's own doc comment for the full
+    // rationale. Unlike ImportLunarDistributionRelease, this feed is
+    // pure data (ISBN/UPC, Title, Creators, Imprint, price, Format, FOC/
+    // On-Sale dates) with no embedded cover photo per row - a brand-new
+    // series/issue from here starts with no cover at all, exactly like
+    // any Metron/LOCG/GCD-sourced one that Comic Vine hasn't backfilled
+    // yet, and gets picked up the same way by the existing auto-link +
+    // cover-fetch pass (TryAutoLink / UpgradeLowResolutionCovers).
+    //
+    // PRH's own Format column (CB/TR/HC/NT/DG) is read straight onto
+    // ComicListEntry.TypeHint rather than left for AddEntriesAsIssues'
+    // usual name-pattern guess - see PrhCatalogRow.TypeHint's own doc
+    // comment for why that guess alone isn't reliable enough for PRH's
+    // naming conventions specifically.
+    public AutoFetchResult ImportPrhCatalogRelease(string filePath, Action<string>? onProgress = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"PRH Comics Retail import run at {DateTime.Now:yyyy-MM-dd HH:mm:ss} ({Path.GetFileName(filePath)})");
+        trace.AppendLine(new string('=', 60));
+
+        PrhCatalogParseResult parsed;
+        try
+        {
+            parsed = PrhCatalogParser.Parse(filePath);
+        }
+        catch (Exception ex)
+        {
+            var line = $"Couldn't read the file: {ex.Message}";
+            result.Errors.Add(line);
+            trace.AppendLine(line);
+            trace.AppendLine();
+            trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}.");
+            result.Trace = trace.ToString();
+            DebugLog.WriteCheckNowLog(result.Trace);
+            return result;
+        }
+
+        result.Errors.AddRange(parsed.Errors);
+        foreach (var e in parsed.Errors) trace.AppendLine(e);
+
+        onProgress?.Invoke($"Parsed {parsed.Rows.Count} row(s) from the file - matching against inventory...");
+
+        var allSeries = _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers).ToList();
+        var entries = parsed.Rows.Select(row => new ComicListEntry
+        {
+            Publisher = row.Publisher,
+            RawTitle = row.RawTitle,
+            SeriesName = row.SeriesName,
+            IssueNumber = row.IssueNumber,
+            CoverLetter = row.CoverLetter,
+            Price = row.Price,
+            ReleaseDate = row.ReleaseDate,
+            FocDate = row.FocDate,
+            Upc = row.Upc,
+            Description = row.Creators,
+            VariantLabel = row.VariantText,
+            TypeHint = row.TypeHint
+        }).ToList();
+
+        onProgress?.Invoke($"{entries.Count} entr{(entries.Count == 1 ? "y" : "ies")} ready - matching against inventory...");
+
+        AddEntriesAsIssues(allSeries, entries, DateOnly.FromDateTime(DateTime.Today), "PRH", result);
+
+        // Same per-file TrySaveChanges (rather than a bare SaveChanges)
+        // as ImportLunarDistributionRelease - see that method's own doc
+        // comment for why: one bad row's failed save shouldn't leave
+        // half-applied entities tracked on this shared _db for whatever
+        // gets imported next.
+        var (saved, saveError) = TrySaveChanges();
+        result.Saved = saved;
+        if (!saved)
+        {
+            var line = $"Matched {entries.Count} entr{(entries.Count == 1 ? "y" : "ies")} but FAILED TO SAVE: {saveError}";
+            result.Errors.Add(line);
+            trace.AppendLine(line);
+        }
+
+        trace.AppendLine();
+        if (result.Added.Count > 0)
+        {
+            trace.AppendLine("Added:");
+            foreach (var line in result.Added) trace.AppendLine("  " + line);
+            trace.AppendLine();
+        }
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}. {(saved ? result.NewIssuesAdded : 0)} new issue(s) added.");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+        onProgress?.Invoke(saved
+            ? $"Done - {result.NewIssuesAdded} new issue(s) added. Covers (if any) will come from Comic Vine auto-linking, same as any other source with no photo of its own."
+            : $"Done - save failed, nothing from this file was added: {saveError}");
+        return result;
+    }
+
+    // Automated counterpart to ImportPrhCatalogRelease above - added
+    // 2026-11-25/26 after confirming, step by step in a real browser
+    // (see claude/metron-integration-notes.md for the full write-up),
+    // exactly what prhcomics.com's own "Download Excel Spreadsheet"
+    // button does: a four-step WordPress-AJAX-plus-nonce chain ending in
+    // a POST to a separate REST microservice (sales-docgen.prh.com) that
+    // hands back the actual .xlsx, base64-encoded - see
+    // PrhWebsiteFetcher's own class comment (bottom of this file) for
+    // the full chain. Confirmed live that NONE of it needs a PRH
+    // account or login (window.prhbl_user_is_logged_in was false on a
+    // totally anonymous page load that still completed the whole
+    // chain) - so, same as FetchLunarReleaseFromWebsite above, this
+    // needs nothing but a plain HttpClient, no Playwright/browser
+    // window.
+    //
+    // catalogCode is PRH's own "YYYY-MM" solicitation-month code (e.g.
+    // "2026-12" for the catalog covering December 2026's FOC/on-sale
+    // dates) - there's no single "current" catalog to discover
+    // automatically the way Lunar's homepage exposes one (PRH's catalog
+    // list page just links to several months at once), so the caller
+    // passes the month it wants rather than this method guessing one.
+    public AutoFetchResult FetchPrhCatalogFromWebsite(string catalogCode, Action<string>? onProgress = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"PRH website fetch run at {DateTime.Now:yyyy-MM-dd HH:mm:ss} (catalog {catalogCode})");
+        trace.AppendLine(new string('=', 60));
+
+        FetchOnePrhCatalog(catalogCode, result, trace, onProgress);
+
+        trace.AppendLine(new string('=', 60));
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}. {result.NewIssuesAdded} new issue(s) added.");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+        onProgress?.Invoke(result.Saved
+            ? $"Done - {result.NewIssuesAdded} new issue(s) added from the PRH {catalogCode} catalog."
+            : $"Done - couldn't complete the PRH {catalogCode} import.");
+        return result;
+    }
+
+    // Downloads and imports one catalog code, merging into the caller's
+    // running result/trace rather than returning its own - same shape as
+    // FetchOneLunarFile above, shared between the single-month method
+    // just above and FetchAllAvailablePrhCatalogsFromWebsite below so
+    // neither one duplicates the download+import logic. Returns whether
+    // this catalog's data actually made it into the database (false on
+    // either a fetch failure or a save failure), same meaning as
+    // FetchOneLunarFile's own return value.
+    private bool FetchOnePrhCatalog(string catalogCode, AutoFetchResult result, System.Text.StringBuilder trace, Action<string>? onProgress)
+    {
+        var tempPath = Path.Combine(Path.GetTempPath(), $"prh_{catalogCode.Replace('-', '_')}_{Guid.NewGuid():N}.xlsx");
+        try
+        {
+            byte[] bytes;
+            try
+            {
+                bytes = PrhWebsiteFetcher.DownloadCatalogXlsxAsync(catalogCode, onProgress).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                var line = $"Couldn't fetch the PRH {catalogCode} catalog from prhcomics.com: {ex.Message}";
+                result.Errors.Add(line);
+                trace.AppendLine(line);
+                return false;
+            }
+
+            File.WriteAllBytes(tempPath, bytes);
+            trace.AppendLine($"Downloaded catalog {catalogCode} ({bytes.Length:N0} bytes).");
+
+            var sub = ImportPrhCatalogRelease(tempPath, onProgress);
+            result.NewIssuesAdded += sub.NewIssuesAdded;
+            result.CoversBackfilled += sub.CoversBackfilled;
+            result.Added.AddRange(sub.Added);
+            result.Errors.AddRange(sub.Errors);
+            result.Saved = sub.Saved;
+            trace.AppendLine(sub.Trace);
+            return sub.Saved;
+        }
+        finally
+        {
+            try { File.Delete(tempPath); } catch { /* best-effort cleanup only */ }
+        }
+    }
+
+    // Fetches every catalog prhcomics.com's own public archive currently
+    // lists, not just the one month FetchPrhCatalogFromWebsite above
+    // covers - added 2026-11-26 after the store asked for all available
+    // months, not just one at a time. Discovers the real list via
+    // PrhWebsiteFetcher.DiscoverAvailableCatalogCodesAsync (see its own
+    // doc comment) rather than guessing a date range, then fetches each
+    // one in turn through the same FetchOnePrhCatalog helper the single-
+    // month method uses - same relationship BackfillAllLunarHistory has
+    // to FetchOneLunarFile above. Confirmed live 2026-11-26 the real
+    // archive currently runs from 2021-06 (PRH's own comics-distribution
+    // start) through whatever month is newest right now - that's 60+
+    // catalogs, each its own full download+import, so this is a
+    // genuinely long-running operation; same "run by hand, never on a
+    // timer" reasoning as BackfillAllLunarHistory.
+    public AutoFetchResult FetchAllAvailablePrhCatalogsFromWebsite(Action<string>? onProgress = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"PRH full-history website fetch run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
+
+        List<string> codes;
+        try
+        {
+            codes = PrhWebsiteFetcher.DiscoverAvailableCatalogCodesAsync(onProgress).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            var line = $"Couldn't read prhcomics.com's catalog archive listing: {ex.Message}";
+            result.Errors.Add(line);
+            trace.AppendLine(line);
+            result.Trace = trace.ToString();
+            DebugLog.WriteCheckNowLog(result.Trace);
+            onProgress?.Invoke($"Done - couldn't reach prhcomics.com: {ex.Message}");
+            return result;
+        }
+
+        if (codes.Count == 0)
+        {
+            var line = "Found no available catalogs on prhcomics.com's archive listing - its page layout may have changed since this was built.";
+            result.Errors.Add(line);
+            trace.AppendLine(line);
+            result.Trace = trace.ToString();
+            DebugLog.WriteCheckNowLog(result.Trace);
+            onProgress?.Invoke("Done - found no available catalogs.");
+            return result;
+        }
+
+        trace.AppendLine($"Found {codes.Count} available catalog(s): {string.Join(", ", codes)}");
+        onProgress?.Invoke($"Found {codes.Count} available PRH catalog(s) - fetching each one...");
+
+        var catalogsOk = 0;
+        var catalogsFailed = 0;
+        for (var i = 0; i < codes.Count; i++)
+        {
+            var code = codes[i];
+            onProgress?.Invoke($"Fetching PRH catalog {code} ({i + 1} of {codes.Count})...");
+            if (FetchOnePrhCatalog(code, result, trace, onProgress))
+                catalogsOk++;
+            else
+                catalogsFailed++;
+        }
+
+        trace.AppendLine(new string('=', 60));
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}. {catalogsOk} catalog(s) fetched cleanly, {catalogsFailed} had issues. {result.NewIssuesAdded} new issue(s) added total.");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+        onProgress?.Invoke($"Done - {codes.Count} catalog(s) processed, {result.NewIssuesAdded} new issue(s) added total.");
+        return result;
+    }
+
+    // Automated counterpart to ImportLunarDistributionRelease above -
+    // added 2026-11-24 once it was confirmed (see
+    // metron-integration-notes.md) that lunardistribution.com's own
+    // homepage is plain server-rendered HTML (no JavaScript needed to
+    // read it) that already embeds, as two <button class="datafile
+    // release"/"datafile foc" data-val="MM/dd/yyyy h:mm:ss AM/PM"> tags,
+    // the exact dates for "this week's release file" and "the current
+    // FOC-cutoff file" - and that the actual file download
+    // (/home/productdatafile?release=<date> or ?foc=<date>) needs no
+    // cookies, session or login at all: a bare anonymous GET, verified
+    // with credentials deliberately stripped, still returns a real
+    // .xlsx with correct Content-Disposition/Content-Type/Content-Length
+    // headers. So this needs nothing but a plain HttpClient - no
+    // Playwright, no browser window, nothing Cloudflare-guarded like
+    // LOCG - to do exactly what clicking both "Product Data File"
+    // buttons on the homepage and uploading each result would do by
+    // hand: read the homepage once to find today's two current dates,
+    // download both files the same way the site's own buttons do, and
+    // run each one through ImportLunarDistributionRelease (reusing 100%
+    // of its parsing/image-saving/AddEntriesAsIssues logic - the only
+    // thing this adds is how the .xlsx bytes are obtained).
+    //
+    // Deliberately NOT part of the weekly automatic CheckForNewIssues
+    // rotation (unlike Metron) - the homepage only ever exposes ONE
+    // current release date and ONE current FOC date at a time (see the
+    // "previous"/"next" date-nav arrows sitting right next to each
+    // button in the same HTML), so running this on a timer between the
+    // store's own weekly visits would just re-download that same single
+    // week's file repeatedly rather than discovering anything new. This
+    // is a one-click stand-in for the manual download+upload step, meant
+    // to be run by hand whenever the store wants this week's file - same
+    // onProgress/threading contract as every other method here (assume
+    // nothing about which thread calls this on).
+    public AutoFetchResult FetchLunarReleaseFromWebsite(Action<string>? onProgress = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Lunar Distribution website fetch run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
+
+        string html;
+        try
+        {
+            onProgress?.Invoke("Reading lunardistribution.com's homepage for this week's current release/FOC dates...");
+            html = LunarWebsiteFetcher.Http.GetStringAsync("https://www.lunardistribution.com/").GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            var line = $"Couldn't reach lunardistribution.com: {ex.Message}";
+            result.Errors.Add(line);
+            trace.AppendLine(line);
+            result.Trace = trace.ToString();
+            DebugLog.WriteCheckNowLog(result.Trace);
+            return result;
+        }
+
+        var releaseDate = LunarWebsiteFetcher.FindDataVal(html, "release");
+        var focDate = LunarWebsiteFetcher.FindDataVal(html, "foc");
+
+        if (releaseDate == null && focDate == null)
+        {
+            var line = "Couldn't find the site's current release/FOC date buttons on the homepage - lunardistribution.com's page layout may have changed since this was built.";
+            result.Errors.Add(line);
+            trace.AppendLine(line);
+            result.Trace = trace.ToString();
+            DebugLog.WriteCheckNowLog(result.Trace);
+            return result;
+        }
+
+        if (releaseDate != null)
+            FetchOneLunarFile("release", releaseDate, result, trace, onProgress);
+        if (focDate != null)
+            FetchOneLunarFile("foc", focDate, result, trace, onProgress);
+
+        trace.AppendLine(new string('=', 60));
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}. {result.NewIssuesAdded} new issue(s) added total.");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+        onProgress?.Invoke($"Done - {result.NewIssuesAdded} new issue(s) added total.");
+        return result;
+    }
+
+    // Downloads one file (kind is "release" or "foc") for the given
+    // site-supplied date-val string, saves it to a throwaway temp path,
+    // and runs it through ImportLunarDistributionRelease - merging that
+    // sub-result into the running total rather than returning it on its
+    // own, so FetchLunarReleaseFromWebsite can report both files' results
+    // as a single combined number instead of asking the caller to add
+    // two results together itself.
+    // Returns whether this file's data actually made it into the database -
+    // added 2026-11-24 (previously void) so WalkAndImportLunarDates' own
+    // "weeks imported" count only counts a REAL success instead of every
+    // attempt (see that method's own counter - it used to increment
+    // regardless of whether the save underneath actually worked, which is
+    // how a real backfill run's trace ended up claiming "109 weeks
+    // imported" when only 5 actually were). FetchLunarReleaseFromWebsite
+    // itself still ignores the return value - it already reports success
+    // via NewIssuesAdded/Errors the way it always has, nothing about that
+    // one-shot path needed to change.
+    private bool FetchOneLunarFile(string kind, string dateVal, AutoFetchResult result, System.Text.StringBuilder trace, Action<string>? onProgress)
+    {
+        var tempPath = Path.Combine(Path.GetTempPath(), $"lunar_{kind}_{Guid.NewGuid():N}.xlsx");
+        try
+        {
+            onProgress?.Invoke($"Downloading this week's {kind} file ({dateVal})...");
+            var url = $"https://www.lunardistribution.com/home/productdatafile?{kind}={Uri.EscapeDataString(dateVal)}";
+            var bytes = LunarWebsiteFetcher.Http.GetByteArrayAsync(url).GetAwaiter().GetResult();
+            File.WriteAllBytes(tempPath, bytes);
+            trace.AppendLine($"Downloaded {kind} file for {dateVal} ({bytes.Length:N0} bytes).");
+
+            var sub = ImportLunarDistributionRelease(tempPath, onProgress);
+            result.NewIssuesAdded += sub.NewIssuesAdded;
+            result.CoversBackfilled += sub.CoversBackfilled;
+            result.Added.AddRange(sub.Added);
+            result.Errors.AddRange(sub.Errors);
+            trace.AppendLine(sub.Trace);
+            return sub.Saved;
+        }
+        catch (Exception ex)
+        {
+            var line = $"{kind} file ({dateVal}) failed: {ex.Message}";
+            result.Errors.Add(line);
+            trace.AppendLine(line);
+            return false;
+        }
+        finally
+        {
+            try { File.Delete(tempPath); } catch { /* best-effort cleanup only */ }
+        }
+    }
+
+    // Full historical backfill, added 2026-11-24 after FetchLunarReleaseFromWebsite
+    // above (which only ever grabs the ONE current week in each direction) -
+    // the store asked for "as far back as it goes... then as far into the
+    // future as possible". Confirmed live against lunardistribution.com
+    // (see metron-integration-notes.md for the full investigation) that the
+    // homepage's "previous"/"next" date-nav arrows are driven by two small
+    // JSON AJAX endpoints the site's own jQuery calls on click:
+    //   POST /home/instoreproducts  { body: JSON-encoded "M/d/yyyy" string }
+    //   POST /home/focproducts      { body: JSON-encoded "M/d/yyyy" string }
+    // Each returns { success, products[], previous, next, current } for a
+    // real catalog date, or a bare {"success":true} with none of those
+    // other fields for a date with nothing on file - confirmed as the one
+    // real "nothing here" signal (rather than guessing from downloaded
+    // file size, which was the first approach tried and would have worked
+    // but needed a full file download just to tell "empty" from "real").
+    // Also confirmed /home/productdatafile itself accepts the exact same
+    // plain "M/d/yyyy" string these nav endpoints use (not just the
+    // "...12:00:00 AM" form the homepage's own buttons carry), so this
+    // walks and downloads using one single date-string format throughout.
+    //
+    // Walking backward via "previous" from today found the server's own
+    // built-in floor live: the oldest real release date (2025-11-18 at the
+    // time this was written/tested) reports "1/1/0001" as ITS OWN
+    // previous - .NET's DateTime.MinValue, unmistakably a deliberate "nothing
+    // earlier exists" sentinel rather than just another date. Walking
+    // forward via "next" on the FOC side similarly ran out around mid-2027
+    // before jumping to a "12/31/2039" far-future sentinel. Both are
+    // detected by parsed year rather than an exact string match (see
+    // WalkAndImportLunarDates below), in case the exact sentinel value
+    // ever changes on their end.
+    //
+    // One wrinkle confirmed live: the server's own previous/next chain
+    // isn't perfectly gapless - once in roughly a year of weekly history
+    // during testing, a "previous" pointer led to a dead date that itself
+    // came back as the bare no-fields response, even though real data
+    // existed even further back. Simply stopping there would have silently
+    // truncated the backfill a few months early, so the walk below
+    // recovers from a dead date by stepping one calendar day at a time
+    // (bounded by a dead-streak limit) until it finds a real date again,
+    // then resumes using the server's own chain from there - confirmed
+    // live that this correctly steps across the one gap found during
+    // testing (which spanned about a week of dead dates).
+    //
+    // This can mean dozens of file downloads+imports in one run (a little
+    // over a year of weekly history both ways at the time this was
+    // written), so it reuses FetchOneLunarFile's existing per-file
+    // error handling (one bad week's failure doesn't stop the rest) and
+    // reports progress once per week like BackfillYearFromLocg/
+    // CheckForNewIssuesViaMetron do. Meant to be run once (or
+    // occasionally, to pick up newly-published future weeks) by hand from
+    // NewBooks.razor - never on a timer, same reasoning as
+    // FetchLunarReleaseFromWebsite above.
+    public AutoFetchResult BackfillAllLunarHistory(Action<string>? onProgress = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Lunar full-history backfill run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
+
+        string html;
+        try
+        {
+            onProgress?.Invoke("Reading lunardistribution.com's homepage for today's current release/FOC dates...");
+            html = LunarWebsiteFetcher.Http.GetStringAsync("https://www.lunardistribution.com/").GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            var line = $"Couldn't reach lunardistribution.com: {ex.Message}";
+            result.Errors.Add(line);
+            trace.AppendLine(line);
+            result.Trace = trace.ToString();
+            DebugLog.WriteCheckNowLog(result.Trace);
+            return result;
+        }
+
+        var releaseDate = LunarWebsiteFetcher.FindDataVal(html, "release");
+        var focDate = LunarWebsiteFetcher.FindDataVal(html, "foc");
+
+        if (releaseDate == null && focDate == null)
+        {
+            var line = "Couldn't find the site's current release/FOC date buttons on the homepage - lunardistribution.com's page layout may have changed since this was built.";
+            result.Errors.Add(line);
+            trace.AppendLine(line);
+            result.Trace = trace.ToString();
+            DebugLog.WriteCheckNowLog(result.Trace);
+            return result;
+        }
+
+        // The datafile buttons' own data-val carries a "...12:00:00 AM"
+        // time suffix (see LunarWebsiteFetcher.FindDataVal) - the nav
+        // endpoints want the plain date with no time, so just the part
+        // before the first space is kept as the walk's starting point.
+        var releaseStart = releaseDate?.Split(' ')[0];
+        var focStart = focDate?.Split(' ')[0];
+
+        // Generous safety cap, not a real expected count - the real
+        // backward walk observed live during testing took ~65 steps to
+        // cover a little over a year of weekly history, so this leaves
+        // roughly 6x headroom in case the real cadence is ever denser
+        // (and the dead-streak/sentinel checks inside the walk itself are
+        // what actually stops it under normal conditions long before this
+        // would ever be hit).
+        const int maxSteps = 400;
+
+        if (releaseStart != null)
+        {
+            onProgress?.Invoke("Walking backward through Lunar's release history as far as it goes...");
+            WalkAndImportLunarDates("/home/instoreproducts", "release", releaseStart, direction: -1, maxSteps, result, trace, onProgress);
+        }
+
+        if (focStart != null)
+        {
+            onProgress?.Invoke("Walking forward through Lunar's FOC solicitations as far as they go...");
+            WalkAndImportLunarDates("/home/focproducts", "foc", focStart, direction: +1, maxSteps, result, trace, onProgress);
+        }
+
+        trace.AppendLine(new string('=', 60));
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}. {result.NewIssuesAdded} new issue(s) added total.");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+        onProgress?.Invoke($"Done - {result.NewIssuesAdded} new issue(s) added total across all of Lunar's available history.");
+        return result;
+    }
+
+    // One direction of the walk described in BackfillAllLunarHistory's own
+    // doc comment above - direction -1 walks backward using each
+    // response's "previous" (release/in-store history), +1 walks forward
+    // using "next" (FOC solicitations). Shared between both directions
+    // since the logic (gap recovery, sentinel detection, per-week import)
+    // is identical; only the AJAX path, the productdatafile query key, and
+    // which of previous/next to follow differ.
+    private void WalkAndImportLunarDates(
+        string navPath,
+        string fileQueryKey,
+        string startDate,
+        int direction,
+        int maxSteps,
+        AutoFetchResult result,
+        System.Text.StringBuilder trace,
+        Action<string>? onProgress)
+    {
+        var current = startDate;
+        var deadStreak = 0;
+
+        // One real gap found during live testing spanned about a week of
+        // consecutive dead dates before the chain picked back up; this
+        // gives 3x margin above that without walking forever into
+        // genuinely empty territory once history (or the future horizon)
+        // really does end.
+        const int deadStreakLimit = 21;
+        var weeksImported = 0;
+
+        for (var step = 0; step < maxSteps; step++)
+        {
+            LunarNavResult nav;
+            try
+            {
+                nav = PostLunarNav(navPath, current);
+            }
+            catch (Exception ex)
+            {
+                trace.AppendLine($"{navPath} lookup for {current} failed: {ex.Message} - stopping this direction.");
+                break;
+            }
+
+            if (!nav.HasNav)
+            {
+                deadStreak++;
+                trace.AppendLine($"{current}: no catalog data here (dead/gap date).");
+                if (deadStreak > deadStreakLimit)
+                {
+                    trace.AppendLine($"{deadStreakLimit} consecutive empty day(s) - treating this as the real end of {(direction < 0 ? "history" : "the solicitation horizon")}.");
+                    break;
+                }
+
+                if (!DateOnly.TryParseExact(current, "M/d/yyyy", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var dead))
+                {
+                    trace.AppendLine($"Couldn't parse '{current}' as a date to step past the gap - stopping.");
+                    break;
+                }
+                current = FormatLunarDate(dead.AddDays(direction));
+                continue;
+            }
+
+            deadStreak = 0;
+
+            if (nav.ProductCount > 0)
+            {
+                onProgress?.Invoke($"{(direction < 0 ? "Backfilling" : "Forward-filling")} {current} ({nav.ProductCount} item(s))...");
+                // Only counts a REAL success (see FetchOneLunarFile's own
+                // doc comment) - used to increment unconditionally here,
+                // which is how a real run's trace ended up claiming "109
+                // week(s) imported" when a cascading SaveChanges failure
+                // (see TrySaveChanges) meant only 5 of them actually were.
+                if (FetchOneLunarFile(fileQueryKey, current, result, trace, onProgress))
+                    weeksImported++;
+            }
+            else
+            {
+                trace.AppendLine($"{current}: real catalog date, 0 items.");
+            }
+
+            var onward = direction < 0 ? nav.Previous : nav.Next;
+            if (string.IsNullOrEmpty(onward))
+            {
+                trace.AppendLine($"{current}: no further {(direction < 0 ? "previous" : "next")} date - stopping.");
+                break;
+            }
+
+            // The server's own floor/ceiling sentinel - .NET
+            // DateTime.MinValue ("1/1/0001") going backward, and a
+            // deliberately-far placeholder ("12/31/2039" at the time this
+            // was tested) going forward. Checked by parsed year range
+            // rather than an exact string match, in case the exact
+            // sentinel value ever changes on their end.
+            if (!DateOnly.TryParseExact(onward, "M/d/yyyy", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var onwardParsed)
+                || onwardParsed.Year is < 2000 or > 2100)
+            {
+                trace.AppendLine($"Reached the site's own end-of-data marker ({onward}) - stopping.");
+                break;
+            }
+
+            current = onward;
+        }
+
+        trace.AppendLine($"{(direction < 0 ? "Backward" : "Forward")} walk finished: {weeksImported} week(s) with real data imported.");
+    }
+
+    private static string FormatLunarDate(DateOnly d) => $"{d.Month}/{d.Day}/{d.Year}";
+
+    private sealed class LunarNavResult
+    {
+        // True only when the response carried a "previous" field at all -
+        // the one real signal (confirmed live) that this was a real
+        // catalog date rather than the bare {"success":true} a dead/gap
+        // date returns.
+        public bool HasNav;
+        public int ProductCount;
+        public string? Previous;
+        public string? Next;
+    }
+
+    // POSTs a plain "M/d/yyyy" date string (JSON-encoded, matching exactly
+    // what the site's own jQuery sends - see the big comment on
+    // BackfillAllLunarHistory above for how this was confirmed) to one of
+    // the site's two small nav AJAX endpoints and reads back whichever of
+    // success/products/previous/next it included.
+    private static LunarNavResult PostLunarNav(string path, string dateVal)
+    {
+        var body = System.Text.Json.JsonSerializer.Serialize(dateVal);
+        using var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+        using var resp = LunarWebsiteFetcher.Http.PostAsync("https://www.lunardistribution.com" + path, content).GetAwaiter().GetResult();
+        resp.EnsureSuccessStatusCode();
+        var json = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        var hasNav = root.TryGetProperty("previous", out var prevEl);
+        var count = 0;
+        if (root.TryGetProperty("products", out var productsEl) && productsEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+            count = productsEl.GetArrayLength();
+
+        return new LunarNavResult
+        {
+            HasNav = hasNav,
+            ProductCount = count,
+            Previous = hasNav ? prevEl.GetString() : null,
+            Next = hasNav && root.TryGetProperty("next", out var nextEl) ? nextEl.GetString() : null
+        };
+    }
+
+    // A looser match than SeriesNameKey.Normalize - ALSO strips a trailing
+    // "(YYYY)"/"(YYYY-)" volume-year marker, same pattern as
+    // LunarTitleParser.VolumeYearMarker (SeriesNameKey.Normalize itself
+    // strips a leading "The " plus colon/dash subtitle-separator noise as
+    // of 2026-11-24 - see its own doc comment - but deliberately does NOT
+    // touch a trailing year, since that one CAN be a real disambiguator
+    // between two genuinely different volumes that happen to share a
+    // title). ONLY used by FindDuplicateSeries/MergeDuplicateSeries
+    // below, to spot the specific split the 2026-11-24 Lunar
+    // "(YYYY)"-before-the-issue-number parser bug could produce (a series
+    // ending up both as "Name" and "Name (2024)" as two separate rows) -
+    // deliberately NOT folded into SeriesNameKey.Normalize itself, since
+    // that key decides whether AddEntriesAsIssues creates a brand-new
+    // series at all, and two DIFFERENT real volumes that happen to share
+    // a title (genuinely disambiguated by their year on purpose) should
+    // still stay separate there. This merge tool is a one-time cleanup
+    // scoped to the known bug, not a permanent change to how series are
+    // matched going forward.
+    private static readonly Regex DuplicateSeriesYearSuffix = new(@"\s*\(\s*(?:19|20)\d{2}-?\s*\)\s*$", RegexOptions.Compiled);
+    private static string DuplicateSeriesKey(string name) =>
+        SeriesNameKey.Normalize(DuplicateSeriesYearSuffix.Replace(name.Trim(), "").Trim());
+
+    // Read-only - added 2026-11-24 alongside the LunarTitleParser fix
+    // above, specifically so the duplicate series that bug already
+    // created (before the fix landed) can be reviewed BEFORE anything
+    // merges them - see MergeDuplicateSeries just below for the action
+    // this is meant to be checked against first. Makes no database
+    // changes at all.
+    public AutoFetchResult FindDuplicateSeries()
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Duplicate-series scan at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
+
+        var allSeries = _db.AllSeries.Include(s => s.Issues).ToList();
+        var groups = allSeries
+            .GroupBy(s => DuplicateSeriesKey(s.Name), StringComparer.OrdinalIgnoreCase)
+            .Where(g => g.Count() > 1)
+            .ToList();
+
+        if (groups.Count == 0)
+        {
+            trace.AppendLine("No duplicate series found.");
+        }
+        else
+        {
+            foreach (var group in groups)
+            {
+                trace.AppendLine();
+                trace.AppendLine($"Possible duplicate: \"{group.Key}\"");
+                foreach (var s in group.OrderByDescending(s => s.Issues.Count))
+                {
+                    var line = $"  Series #{s.Id}: \"{s.Name}\" - {s.Issues.Count} issue(s), StartYear {s.StartYear}"
+                        + (s.ComicVineVolumeId != null ? $", Comic Vine volume {s.ComicVineVolumeId}" : "")
+                        + (s.MetronSeriesId != null ? $", Metron series {s.MetronSeriesId}" : "");
+                    result.Added.Add(line);
+                    trace.AppendLine(line);
+                }
+            }
+        }
+
+        trace.AppendLine();
+        trace.AppendLine($"Found {groups.Count} possible duplicate group(s). This is a dry run - no changes were made.");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+        return result;
+    }
+
+    // Actually performs the merge for every group FindDuplicateSeries
+    // above would report - run this only after reviewing that dry run's
+    // output, since this one really changes the database (not reversible
+    // from inside the app - back up comic_pos.db first if in doubt).
+    //
+    // Picks the "keeper" in each group as whichever member has the most
+    // issues already, tie-broken by whichever is linked to a real
+    // external identity (Comic Vine volume, then Metron series id), then
+    // by lowest Id (the oldest/most-established row) - a brand-new,
+    // mostly-empty series created by tonight's parser bug should never
+    // outrank an already-established one just by chance ordering.
+    //
+    // For every OTHER series in a group: an issue whose number doesn't
+    // already exist on the keeper is simply re-parented onto it (cheap -
+    // just a SeriesId reassignment). An issue number that DOES already
+    // exist on the keeper (a genuine overlap, not just a name-level
+    // split) gets its covers merged in instead, in three tiers (updated
+    // 2026-11-24 after a real run on "Black Tower: The Raven Conspiracy"
+    // #4 showed the original two-tier version leaving a stale, never-
+    // upgraded placeholder cover sitting right next to the duplicate's
+    // real one): (1) a cover whose Barcode already exists on the keeper's
+    // copy is dropped as a true duplicate (Cover.Barcode has a DB-level
+    // unique index - see ComicDbContext - so two rows could never
+    // legitimately share one anyway); (2) a cover whose LETTER matches one
+    // already on the keeper's issue, where the keeper's own cover still
+    // looks like a placeholder (LooksLikePlaceholderCover - same check
+    // Bug #7's AddMissingCoverVariants fix uses), gets its real data
+    // copied onto that EXISTING keeper cover in place (keeping the
+    // keeper's own Cover row/Id, in case a sale line or hold already
+    // references it) rather than being kept as a separate, re-lettered
+    // row; (3) everything else gets a free cover letter via the same
+    // ResolveCoverLetters normal variant-cover discovery already uses.
+    // The now-emptied duplicate issue itself is deleted once its covers
+    // have all been consumed one of these three ways. Any PullListEntry
+    // pointing at a series being removed is re-pointed at the keeper
+    // first, so no subscriber's pull list silently breaks.
+    public AutoFetchResult MergeDuplicateSeries(Action<string>? onProgress = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Duplicate-series merge run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
+
+        var allSeries = _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers).ToList();
+        var groups = allSeries
+            .GroupBy(s => DuplicateSeriesKey(s.Name), StringComparer.OrdinalIgnoreCase)
+            .Where(g => g.Count() > 1)
+            .ToList();
+
+        if (groups.Count == 0)
+        {
+            trace.AppendLine("No duplicate series found - nothing to merge.");
+            result.Trace = trace.ToString();
+            DebugLog.WriteCheckNowLog(result.Trace);
+            onProgress?.Invoke("No duplicates found - nothing to merge.");
+            return result;
+        }
+
+        int seriesRemoved = 0, issuesMoved = 0, issuesMerged = 0, coversDropped = 0;
+
+        foreach (var group in groups)
+        {
+            var members = group
+                .OrderByDescending(s => s.Issues.Count)
+                .ThenByDescending(s => s.ComicVineVolumeId.HasValue)
+                .ThenByDescending(s => s.MetronSeriesId.HasValue)
+                .ThenBy(s => s.Id)
+                .ToList();
+
+            var keeper = members[0];
+            onProgress?.Invoke($"Merging \"{group.Key}\" - keeping Series #{keeper.Id} (\"{keeper.Name}\", {keeper.Issues.Count} issue(s))...");
+            trace.AppendLine();
+            trace.AppendLine($"\"{group.Key}\": keeping Series #{keeper.Id} (\"{keeper.Name}\")");
+
+            foreach (var dup in members.Skip(1))
+            {
+                trace.AppendLine($"  merging Series #{dup.Id} (\"{dup.Name}\", {dup.Issues.Count} issue(s)) into it...");
+
+                foreach (var issue in dup.Issues.ToList())
+                {
+                    var existingIssue = keeper.Issues.FirstOrDefault(i => i.IssueNumber == issue.IssueNumber);
+                    if (existingIssue == null)
+                    {
+                        issue.SeriesId = keeper.Id;
+                        keeper.Issues.Add(issue);
+                        issuesMoved++;
+                        trace.AppendLine($"    issue #{issue.IssueNumber:0.##}: moved onto Series #{keeper.Id} (no conflict).");
+                    }
+                    else
+                    {
+                        var existingLetters = existingIssue.Covers.Select(c => c.CoverLetter).ToList();
+                        var claimedBarcodes = existingIssue.Covers.Select(c => c.Barcode).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                        var candidates = new List<(Cover Cover, bool IsGuess)>();
+                        var upgradedCovers = 0;
+                        foreach (var cover in issue.Covers.ToList())
+                        {
+                            if (claimedBarcodes.Contains(cover.Barcode))
+                            {
+                                _db.Covers.Remove(cover);
+                                coversDropped++;
+                                trace.AppendLine($"    issue #{issue.IssueNumber:0.##}: dropped duplicate cover (barcode {cover.Barcode} already on Series #{keeper.Id}'s copy).");
+                                continue;
+                            }
+
+                            // Added 2026-11-24 after a real merge run (Black
+                            // Tower: The Raven Conspiracy #4) showed exactly
+                            // the gap this closes: the keeper's own Cover A
+                            // was still a $0/placeholder row (its Lunar row
+                            // had landed under the DUPLICATE series instead,
+                            // back before Bug #6's SeriesNameKey widening
+                            // fix existed), and the old code below would
+                            // have just bolted the duplicate's real Cover A
+                            // on as a brand-new, re-lettered variant via
+                            // ResolveCoverLetters - leaving the original
+                            // placeholder sitting there untouched, wrong,
+                            // and now confusingly duplicated. Same
+                            // placeholder-upgrade check AddMissingCoverVariants
+                            // uses for Bug #7, applied here too: a cover on
+                            // the keeper that shares this one's LETTER and
+                            // still looks like a placeholder gets its real
+                            // data copied in (keeping the keeper's own Cover
+                            // row/Id, in case anything - a sale line, a hold -
+                            // already references it), instead of the
+                            // duplicate's richer cover being kept as a
+                            // second, separately-lettered row next to a
+                            // stale placeholder that never gets cleaned up.
+                            var matchByLetter = existingIssue.Covers.FirstOrDefault(c =>
+                                string.Equals(c.CoverLetter, cover.CoverLetter, StringComparison.OrdinalIgnoreCase));
+                            if (matchByLetter != null && LooksLikePlaceholderCover(matchByLetter))
+                            {
+                                matchByLetter.Barcode = cover.Barcode;
+                                matchByLetter.Price = cover.Price;
+                                if (string.IsNullOrWhiteSpace(matchByLetter.Description)) matchByLetter.Description = cover.Description;
+                                if (string.IsNullOrWhiteSpace(matchByLetter.CoverArtist)) matchByLetter.CoverArtist = cover.CoverArtist;
+                                if (string.IsNullOrWhiteSpace(matchByLetter.CoverImagePath)) matchByLetter.CoverImagePath = cover.CoverImagePath;
+                                claimedBarcodes.Add(cover.Barcode);
+                                issue.Covers.Remove(cover);
+                                _db.Covers.Remove(cover);
+                                upgradedCovers++;
+                                trace.AppendLine($"    issue #{issue.IssueNumber:0.##}: upgraded Series #{keeper.Id}'s placeholder Cover {matchByLetter.CoverLetter} with the duplicate's real price/UPC.");
+                                continue;
+                            }
+
+                            cover.IssueId = existingIssue.Id;
+                            // Explicit detach from the old issue's
+                            // navigation collection rather than relying on
+                            // EF's change-tracker fixup to notice the FK
+                            // moved before _db.Issues.Remove(issue) runs
+                            // below - issue.Covers is a required
+                            // relationship, and a cover still sitting in
+                            // that collection in memory when its parent
+                            // gets removed is exactly the kind of ambiguity
+                            // that risks cascade-deleting a cover that was
+                            // actually just supposed to move.
+                            issue.Covers.Remove(cover);
+                            candidates.Add((cover, true));
+                            claimedBarcodes.Add(cover.Barcode);
+                        }
+                        if (candidates.Count > 0)
+                        {
+                            ResolveCoverLetters(candidates, existingLetters);
+                            foreach (var (cover, _) in candidates) existingIssue.Covers.Add(cover);
+                            trace.AppendLine($"    issue #{issue.IssueNumber:0.##}: merged {candidates.Count} cover(s) onto Series #{keeper.Id}'s existing issue.");
+                        }
+                        if (upgradedCovers > 0)
+                            trace.AppendLine($"    issue #{issue.IssueNumber:0.##}: {upgradedCovers} placeholder cover(s) upgraded in place.");
+                        _db.Issues.Remove(issue);
+                        issuesMerged++;
+                    }
+                }
+
+                var pullListEntries = _db.PullListEntries.Where(p => p.SeriesId == dup.Id).ToList();
+                foreach (var p in pullListEntries) p.SeriesId = keeper.Id;
+                if (pullListEntries.Count > 0)
+                    trace.AppendLine($"    re-pointed {pullListEntries.Count} pull-list entr{(pullListEntries.Count == 1 ? "y" : "ies")} from Series #{dup.Id} to #{keeper.Id}.");
+
+                _db.AllSeries.Remove(dup);
+                seriesRemoved++;
+            }
+        }
+
+        _db.SaveChanges();
+
+        trace.AppendLine();
+        trace.AppendLine($"Done. {groups.Count} duplicate group(s) merged, {seriesRemoved} empty series removed, {issuesMoved} issue(s) moved outright, {issuesMerged} issue(s) merged (covers combined), {coversDropped} exact-duplicate cover(s) dropped.");
+        result.Added.Add($"Merged {groups.Count} duplicate series group(s) - {seriesRemoved} empty series removed.");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+        onProgress?.Invoke($"Done - merged {groups.Count} duplicate group(s).");
+        return result;
+    }
+
+    // Hand-picked one-time cleanup, added 2026-11-24 - hardcoded to the
+    // exact two duplicate series FindDuplicateSeries turned up on the
+    // user's own real data that night (Series #1972 "DARKNESS (2025)"
+    // and #1973 "ZATANNA (2026)", both brand-new single-issue rows the
+    // Lunar parser bug created), not a general-purpose "delete any
+    // series" feature - same spirit as RetryComicadeEnrichmentForSpecificIssues
+    // above. Deliberately a plain delete rather than MergeDuplicateSeries:
+    // the user asked for this specifically to avoid MergeDuplicateSeries'
+    // cover-merging touching the already-correct established issue at
+    // all (its Publisher/Description/etc. stay completely untouched this
+    // way, instead of gaining a second, oddly-lettered cover). The
+    // established series (#1706 "The Darkness", #1761 "Zatanna") are
+    // never modified - only the two new rows are removed, after
+    // re-pointing any PullListEntry that might already point at one
+    // (unlikely for a series created hours earlier, but cheap to check).
+    public AutoFetchResult DeleteKnownDuplicateSeries(Action<string>? onProgress = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Known-duplicate delete run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
+
+        // (duplicate series id, established/keeper series id to re-point
+        // any pull-list entry to instead of just deleting it)
+        var targets = new (int DupId, int KeeperId)[]
+        {
+            (1972, 1706), // "DARKNESS (2025)" -> "The Darkness"
+            (1973, 1761), // "ZATANNA (2026)" -> "Zatanna"
+        };
+
+        foreach (var (dupId, keeperId) in targets)
+        {
+            var dup = _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers)
+                .FirstOrDefault(s => s.Id == dupId);
+            if (dup == null)
+            {
+                var line = $"Series #{dupId}: not found (already removed?) - skipped.";
+                result.Errors.Add(line);
+                trace.AppendLine(line);
+                continue;
+            }
+
+            onProgress?.Invoke($"Deleting Series #{dup.Id} (\"{dup.Name}\")...");
+
+            var pullListEntries = _db.PullListEntries.Where(p => p.SeriesId == dupId).ToList();
+            foreach (var p in pullListEntries) p.SeriesId = keeperId;
+            if (pullListEntries.Count > 0)
+                trace.AppendLine($"  re-pointed {pullListEntries.Count} pull-list entr{(pullListEntries.Count == 1 ? "y" : "ies")} from Series #{dupId} to #{keeperId} instead of deleting them.");
+
+            foreach (var issue in dup.Issues.ToList())
+            {
+                foreach (var cover in issue.Covers.ToList())
+                    _db.Covers.Remove(cover);
+                _db.Issues.Remove(issue);
+            }
+            _db.AllSeries.Remove(dup);
+
+            var removedLine = $"Deleted Series #{dup.Id} (\"{dup.Name}\") - {dup.Issues.Count} issue(s), {dup.Issues.Sum(i => i.Covers.Count)} cover(s). Series #{keeperId} was left untouched.";
+            result.Added.Add(removedLine);
+            trace.AppendLine(removedLine);
+        }
+
+        _db.SaveChanges();
+
+        trace.AppendLine();
+        trace.AppendLine($"Done. {result.Added.Count} series deleted.");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+        onProgress?.Invoke($"Done - {result.Added.Count} series deleted.");
+        return result;
+    }
+
+    // One-time cleanup, added 2026-11-24 right alongside the
+    // AddMissingCoverVariants fix (see its own doc comment) - the store
+    // asked to wipe any Lunar book that never actually got real data so a
+    // fresh re-import (now that the enrichment bug is fixed) starts
+    // clean, rather than leaving broken rows around for the fix to find
+    // later on its own.
+    //
+    // Deliberately narrower than "every book Lunar ever touched": there is
+    // no column anywhere that records which source added a given Cover
+    // (Barcode is real inventory data, not a provenance tag), so a cover
+    // that Lunar imported WITH a real UPC is completely indistinguishable
+    // from one Metron or LOCG found first - and, now that
+    // AddMissingCoverVariants is fixed, that data is correctly saved and
+    // there is no reason to throw it away. The only Lunar rows that are
+    // actually broken, and the only ones this can safely identify, are
+    // the ones that never got a real UPC at all - LunarDistributionParser
+    // falls back to a generated "LUN-{ProductCode}" barcode for those (see
+    // its own Parse method), which is a safe, unambiguous marker since no
+    // other source ever generates a barcode starting with "LUN-". This
+    // deletes exactly those placeholder covers, then cleans up any issue
+    // or series that's left with nothing on it as a result - mirroring
+    // DeleteKnownDuplicateSeries's cascade-delete shape above.
+    public AutoFetchResult DeleteLunarPlaceholderCovers(Action<string>? onProgress = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Lunar placeholder-cover delete run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
+
+        onProgress?.Invoke("Scanning for Lunar covers that never got a real UPC...");
+
+        var placeholders = _db.Covers
+            .Include(c => c.Issue).ThenInclude(i => i.Series)
+            .Where(c => c.Barcode.StartsWith("LUN-"))
+            .ToList();
+
+        if (placeholders.Count == 0)
+        {
+            var noneLine = "Nothing to delete - no Lunar placeholder covers found.";
+            trace.AppendLine(noneLine);
+            result.Trace = trace.ToString();
+            DebugLog.WriteCheckNowLog(result.Trace);
+            onProgress?.Invoke(noneLine);
+            return result;
+        }
+
+        var coversDeleted = 0;
+        var issuesDeleted = 0;
+        var touchedSeriesIds = new HashSet<int>();
+
+        foreach (var issueGroup in placeholders.GroupBy(c => c.Issue))
+        {
+            var issue = issueGroup.Key;
+            var series = issue.Series;
+            var toRemove = issueGroup.ToList();
+
+            foreach (var cover in toRemove)
+            {
+                issue.Covers.Remove(cover);
+                _db.Covers.Remove(cover);
+            }
+            coversDeleted += toRemove.Count;
+
+            if (issue.Covers.Count == 0)
+            {
+                var line = $"\"{series.Name}\" #{issue.IssueNumber:0.##}: only had placeholder cover(s) - deleting the issue too.";
+                trace.AppendLine(line);
+                onProgress?.Invoke(line);
+                touchedSeriesIds.Add(issue.SeriesId);
+                _db.Issues.Remove(issue);
+                issuesDeleted++;
+            }
+            else
+            {
+                var line = $"\"{series.Name}\" #{issue.IssueNumber:0.##}: removed {toRemove.Count} placeholder cover(s), kept {issue.Covers.Count} real one(s).";
+                trace.AppendLine(line);
+                onProgress?.Invoke(line);
+            }
+        }
+
+        var (saved, saveError) = TrySaveChanges();
+        if (!saved)
+        {
+            var failLine = $"FAILED TO SAVE: {saveError}";
+            result.Errors.Add(failLine);
+            trace.AppendLine(failLine);
+            result.Trace = trace.ToString();
+            DebugLog.WriteCheckNowLog(result.Trace);
+            onProgress?.Invoke(failLine);
+            return result;
+        }
+
+        // A series can only have lost issues above, never gained one, so
+        // re-checking just the series this run actually touched (rather
+        // than every series in the store) is enough to catch any that are
+        // now completely empty.
+        var seriesDeleted = 0;
+        foreach (var seriesId in touchedSeriesIds)
+        {
+            var series = _db.AllSeries.Include(s => s.Issues).FirstOrDefault(s => s.Id == seriesId);
+            if (series != null && series.Issues.Count == 0)
+            {
+                var line = $"\"{series.Name}\" has no issues left - deleting the series too.";
+                trace.AppendLine(line);
+                onProgress?.Invoke(line);
+                _db.AllSeries.Remove(series);
+                seriesDeleted++;
+            }
+        }
+        if (seriesDeleted > 0)
+        {
+            var (saved2, saveError2) = TrySaveChanges();
+            if (!saved2)
+            {
+                var failLine = $"Series cleanup FAILED TO SAVE: {saveError2}";
+                result.Errors.Add(failLine);
+                trace.AppendLine(failLine);
+                onProgress?.Invoke(failLine);
+            }
+        }
+
+        var summary = $"Deleted {coversDeleted} placeholder cover(s), {issuesDeleted} now-empty issue(s), {seriesDeleted} now-empty series.";
+        result.Added.Add(summary);
+        trace.AppendLine();
+        trace.AppendLine($"Done. {summary}");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+        onProgress?.Invoke($"Done - {summary}");
+        return result;
+    }
+
+    // Dev/demo seed data - added 2026-11-24, the store asked for fake
+    // customers and a fake sales history built FROM the real inventory
+    // that actually came in through the recent Lunar imports, so the
+    // Dashboard/History/Customers pages have something realistic to show
+    // while the rest of the app is still being built out, instead of
+    // sitting empty.
+    //
+    // "Built from the real Lunar imports" can't be taken completely
+    // literally: there is no column anywhere that records which source
+    // added a given Cover (see DeleteLunarPlaceholderCovers's own doc
+    // comment for the same limitation), so a Lunar-imported cover with a
+    // real UPC is indistinguishable from one Metron or LOCG found first.
+    // What this uses instead is every REAL (non-placeholder) cover
+    // currently in inventory - which, given how much of the catalog the
+    // Lunar backfill just added, is overwhelmingly Lunar's own real,
+    // successfully-imported data anyway. Placeholder covers (see
+    // LooksLikePlaceholderCover) are skipped so a fake sale never cites a
+    // $0 price or a generated barcode as if it were a real past purchase.
+    //
+    // Purely additive and safe to click more than once: existing fake (or
+    // real) customers whose name already matches one of the pool below
+    // are left alone rather than duplicated, but each run still adds a
+    // fresh batch of backdated Sales (and tops up anyone under-subscribed
+    // on fake pull-list entries - see below) on top of whatever's already
+    // there - that's the point of an "add some fake info" button, not a
+    // one-shot seeder. Real inventory stock is decremented for each fake
+    // sale, the same way CheckoutService.CompleteSale does for a real
+    // one - though unlike a real sale, this never lets stock go negative
+    // (see the stock-bump comment inline below) - so the Inventory/New
+    // Books screens stay internally consistent with the fake history
+    // this generates instead of showing full stock next to a customer
+    // who "already bought" the last copy, or a negative count on
+    // something that was never actually received.
+    private static readonly string[] FakeFirstNames =
+    {
+        "Alex", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Jamie", "Avery",
+        "Sam", "Drew", "Quinn", "Reese", "Harper", "Rowan", "Skyler", "Emerson",
+        "Kai", "Dakota", "Finley", "Peyton"
+    };
+    private static readonly string[] FakeLastNames =
+    {
+        "Nguyen", "Garcia", "Smith", "Patel", "Kim", "Johnson", "Martinez", "Lee",
+        "Brown", "Ortiz", "Clark", "Singh", "Wright", "Hughes", "Flores", "Bennett",
+        "Reyes", "Foster", "Hayes", "Sullivan"
+    };
+
+    public AutoFetchResult GenerateFakeCustomersAndSalesHistory(int customerCount = 15, int saleCount = 60, Action<string>? onProgress = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Fake seed-data run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
+
+        var pool = _db.Covers
+            .Include(c => c.Issue).ThenInclude(i => i.Series)
+            .Where(c => c.Price > 0)
+            .ToList()
+            .Where(c => !LooksLikePlaceholderCover(c))
+            .ToList();
+
+        if (pool.Count == 0)
+        {
+            var noneLine = "Nothing to seed from - no real (non-placeholder) covers found in inventory yet. Import some books first.";
+            trace.AppendLine(noneLine);
+            result.Errors.Add(noneLine);
+            result.Trace = trace.ToString();
+            onProgress?.Invoke(noneLine);
+            return result;
+        }
+
+        var rng = new Random();
+
+        onProgress?.Invoke($"Found {pool.Count} real cover(s) to draw fake sales from. Creating fake customers...");
+
+        var existingNames = _db.Customers.Select(c => c.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var customers = new List<Customer>();
+        var attempts = 0;
+        while (customers.Count < customerCount && attempts < customerCount * 4)
+        {
+            attempts++;
+            var name = $"{FakeFirstNames[rng.Next(FakeFirstNames.Length)]} {FakeLastNames[rng.Next(FakeLastNames.Length)]}";
+            if (!existingNames.Add(name)) continue; // already exists (or already picked this run) - skip, don't duplicate
+
+            var email = $"{name.Replace(" ", ".").ToLowerInvariant()}@example.com";
+            var phone = $"555-{rng.Next(1000, 9999)}";
+            var customer = _customers.AddCustomer(name, email, phone);
+            customers.Add(customer);
+        }
+        var newCustomerLine = $"Added {customers.Count} new fake customer(s).";
+        trace.AppendLine(newCustomerLine);
+        onProgress?.Invoke(newCustomerLine);
+
+        // Also sell to any customer already on file (real or from an
+        // earlier run of this same button) - otherwise re-running this
+        // would only ever grow the customer list for one visit each and
+        // never give anyone a repeat-purchase history.
+        var allCustomers = _db.Customers.Where(c => c.IsActive).ToList();
+        if (allCustomers.Count == 0)
+        {
+            var noCustomersLine = "No active customers to sell to (even after adding fake ones) - nothing to do.";
+            trace.AppendLine(noCustomersLine);
+            result.Errors.Add(noCustomersLine);
+            result.Trace = trace.ToString();
+            onProgress?.Invoke(noCustomersLine);
+            return result;
+        }
+
+        var salesCreated = 0;
+        var linesCreated = 0;
+        var receivedCovers = new HashSet<int>();
+        for (var i = 0; i < saleCount; i++)
+        {
+            var customer = allCustomers[rng.Next(allCustomers.Count)];
+            // Spread across the last ~120 days so History/Dashboard charts
+            // show a real-looking spread instead of every fake sale
+            // bunched on today's date.
+            var soldAt = DateTime.Now.AddDays(-rng.Next(0, 120)).AddHours(-rng.Next(0, 10));
+
+            var sale = new Sale { CustomerId = customer.Id, SoldAt = soldAt };
+            var lineItemCount = rng.Next(1, 4);
+            for (var j = 0; j < lineItemCount; j++)
+            {
+                var cover = pool[rng.Next(pool.Count)];
+                if (sale.Lines.Any(l => l.CoverId == cover.Id)) continue; // don't double up the same cover within one fake sale
+
+                sale.Lines.Add(new SaleLine
+                {
+                    Cover = cover,
+                    CoverId = cover.Id,
+                    Quantity = 1,
+                    PriceEach = cover.Price,
+                    // A small fraction look like a loyalty/member discount
+                    // rather than every single fake sale selling at exact
+                    // sticker price.
+                    DiscountPercent = rng.Next(0, 10) == 0 ? 10 : 0,
+                });
+
+                // Changed 2026-11-24: used to mirror CheckoutService.
+                // CompleteSale's own stock deduction exactly, deliberately
+                // letting it go negative (an "honest oversell signal"). A
+                // real run showed why that's wrong for SEED data
+                // specifically: the pool here draws from every real,
+                // non-placeholder cover in the whole catalog, which after
+                // the Lunar backfill is overwhelmingly stuff that was only
+                // ever DISCOVERED (Metron/Lunar enrichment can fill in a
+                // real price/UPC long before anyone physically receives a
+                // copy - see Bug #7/#8) and still sits at 0 stock. Selling
+                // a fake sale against one of those isn't a believable
+                // "oversold" edge case, it's nonsense (selling something
+                // the store never stocked) - and now that Inventory only
+                // shows items with StockQuantity > 0 (user feedback: "i
+                // dont think anything should be in the inventory until we
+                // add it ourself" - see IInventoryService.
+                // SearchReceivedSeriesForDisplay), a negative count would
+                // make an un-received book show up in Inventory looking
+                // actively broken. So: if this cover has never been
+                // "received" (stock already at or below 0), simulate the
+                // store stocking a small, believable handful of copies
+                // first, THEN sell one - same spirit as a real receiving
+                // workflow (Add New Item), just invented here since this
+                // is fake history. Never goes negative from here on.
+                if (cover.StockQuantity <= 0)
+                {
+                    cover.StockQuantity += rng.Next(2, 7);
+                    receivedCovers.Add(cover.Id);
+                }
+                cover.StockQuantity -= 1;
+            }
+
+            if (sale.Lines.Count == 0) continue; // every pick this round collided - vanishingly rare, just skip this one
+
+            _db.Sales.Add(sale);
+            salesCreated++;
+            linesCreated += sale.Lines.Count;
+        }
+
+        // Fake pull-list subscriptions, added 2026-11-24 ("add more fake
+        // subscribers series books to the list") - the fake sales above
+        // give Dashboard/History/Customers something to look at, but
+        // nobody had any ongoing pull-list subscriptions, which left the
+        // FOC Report and "Who's Pulling This?" screens empty even with a
+        // full fake customer roster. Every series actually represented in
+        // `pool` (real, non-placeholder covers already in inventory, same
+        // set the fake sales above draw from) is fair game - 1-3 distinct
+        // series per customer, skipping any (customer, series) pair that
+        // already has an active subscription so a second run only tops
+        // people up instead of duplicating rows (PullListEntry has no
+        // unique index of its own for this, so that check is done here by
+        // hand, same idea as PullListService.AddToPullList's own
+        // idempotency). Always defaults to Cover A rather than trying to
+        // read back each series' real known letters - simple, and "A" is
+        // what the overwhelming majority of pull subscriptions actually
+        // want anyway (see AddToPullListModal's own default).
+        var seriesPool = pool.Select(c => c.Issue.SeriesId).Distinct().ToList();
+        var existingSubscriptions = _db.PullListEntries
+            .Where(p => p.IsActive)
+            .Select(p => new { p.CustomerId, p.SeriesId })
+            .ToHashSet();
+        var subscriptionsCreated = 0;
+        if (seriesPool.Count > 0)
+        {
+            foreach (var customer in allCustomers)
+            {
+                var subscribeCount = rng.Next(1, 4); // 1-3 series per customer
+                var pickedThisCustomer = new HashSet<int>();
+                var ceiling = subscribeCount * 4; // bounded attempts - don't spin forever once a customer is nearly fully subscribed
+                for (var attempt = 0; attempt < ceiling && pickedThisCustomer.Count < subscribeCount; attempt++)
+                {
+                    var seriesId = seriesPool[rng.Next(seriesPool.Count)];
+                    if (!pickedThisCustomer.Add(seriesId)) continue;
+                    if (existingSubscriptions.Contains(new { CustomerId = customer.Id, SeriesId = seriesId })) continue;
+
+                    _db.PullListEntries.Add(new PullListEntry
+                    {
+                        CustomerId = customer.Id,
+                        SeriesId = seriesId,
+                        PreferredCoverLetter = "A",
+                        Quantity = 1,
+                        IsActive = true
+                    });
+                    existingSubscriptions.Add(new { CustomerId = customer.Id, SeriesId = seriesId });
+                    subscriptionsCreated++;
+                }
+            }
+        }
+
+        var (saved, saveError) = TrySaveChanges();
+        if (!saved)
+        {
+            var failLine = $"FAILED TO SAVE: {saveError}";
+            result.Errors.Add(failLine);
+            trace.AppendLine(failLine);
+            result.Trace = trace.ToString();
+            onProgress?.Invoke(failLine);
+            return result;
+        }
+
+        var summary = $"Added {customers.Count} fake customer(s), {salesCreated} fake sale(s) ({linesCreated} line item(s) total), and {subscriptionsCreated} fake pull-list subscription(s), drawn from {pool.Count} real cover(s) already in inventory."
+            + (receivedCovers.Count > 0 ? $" Simulated receiving stock for {receivedCovers.Count} previously-unstocked cover(s) so those fake sales had something real to sell." : "");
+        result.Added.Add(summary);
+        trace.AppendLine(summary);
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+        onProgress?.Invoke($"Done - {summary}");
         return result;
     }
 
@@ -1977,6 +3770,54 @@ public class AutoFetchService : IAutoFetchService
             .GroupBy(s => s.MetronSeriesId!.Value)
             .ToDictionary(g => g.Key, g => g.First());
 
+        // Bug #10 fix (2026-11-24): claimed across the WHOLE batch (every
+        // group this one call processes), not per-group/per-issue. A real
+        // backfill run still hit 'UNIQUE constraint failed: Covers.Barcode'
+        // even with the per-group/per-issue guards below already live
+        // (seenBarcodes's and AddMissingCoverVariants' claimedBarcodes'
+        // own doc comments have the full history) - on 9/19/2026 and
+        // 1/7/2026 specifically, from two DIFFERENT series/issues in the
+        // same file landing on the same barcode (seen live: several
+        // unrelated "BATMAN DAY 2026 - BUNDLES OF 25" promo rows, each a
+        // different series/issue but all falling back to the same
+        // generated LUN-{ProductCode} barcode). Neither a set scoped to
+        // one group nor one scoped to one existing issue can ever catch a
+        // collision between two DIFFERENT groups - each one simply
+        // doesn't know the other exists. One shared set for the whole
+        // batch, passed into AddMissingCoverVariants and used directly
+        // below instead of a fresh set per group, closes that gap.
+        //
+        // Bug #12 fix (2026-11-24): still not wide enough - a real
+        // "Backfill All Lunar History" run kept hitting the identical
+        // 'UNIQUE constraint failed: Covers.Barcode' crash on dozens of
+        // weeks, every one of them importing a FACSIMILE EDITION reprint
+        // (the facsimile-title fix landed the same day - see
+        // LunarTitleParser's doc comment). Root cause: a facsimile
+        // reprint's real barcode/UPC had, in an earlier backfill run
+        // BEFORE the facsimile fix existed, been merged straight onto the
+        // ORIGINAL (non-facsimile) series/issue of the same number - the
+        // parser couldn't tell them apart yet back then. Now that the
+        // parser correctly resolves the facsimile to its own distinct
+        // series, AddEntriesAsIssues treats it as a brand-new issue and
+        // tries to insert a Cover with that same barcode - which already
+        // exists, just attached to the wrong (original) issue. Seeding
+        // batchClaimedBarcodes from only what THIS call's own batch
+        // claims (Bug #10's fix) can never catch that, since the
+        // colliding Cover was created in a COMPLETELY different, earlier
+        // call. Seeding it from the WHOLE Covers table up front catches
+        // this (and any other stray collision against pre-existing data)
+        // before it ever reaches SaveChanges() and takes the entire
+        // week's batch down with it - which is almost certainly the real
+        // mechanism behind task #96's "an otherwise-successful import is
+        // missing some issues" symptom (Kaya #37 present, #36 missing):
+        // one bad barcode in a 300-issue weekly file crashed that WHOLE
+        // week's save, silently losing every other issue in the same
+        // file along with it, not just the one that collided. A
+        // genuinely colliding candidate is now skipped (logged to
+        // result.Errors so it's visible, not silently dropped) instead of
+        // being allowed to reach SaveChanges() and blow up the batch.
+        var batchClaimedBarcodes = _db.Covers.Select(c => c.Barcode).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
         foreach (var group in groups)
         {
             var (seriesName, issueNumber) = group.Key;
@@ -2054,7 +3895,7 @@ public class AutoFetchService : IAutoFetchService
             var existingIssue = series.Issues.FirstOrDefault(i => i.IssueNumber == issueNumber);
             if (existingIssue != null)
             {
-                AddMissingCoverVariants(existingIssue, group, seriesName, barcodePrefix, result);
+                AddMissingCoverVariants(existingIssue, group, seriesName, barcodePrefix, result, batchClaimedBarcodes);
                 continue;
             }
 
@@ -2072,9 +3913,75 @@ public class AutoFetchService : IAutoFetchService
             // all labeled Cover B, were the same underlying gap - no
             // step that both expanded every variant AND gave each one
             // its own non-colliding letter).
+            // Guards against two candidates sharing a barcode - originally
+            // added 2026-11-24 scoped to just this one group, then widened
+            // to the whole batch (batchClaimedBarcodes, declared above)
+            // the same day once a real run showed that wasn't enough - see
+            // this method's own batchClaimedBarcodes comment above for the
+            // full history. A distributor's weekly catalog can legitimately
+            // re-list the identical already-solicited product under more
+            // than one row (seen live for trade/HC items still awaiting
+            // release, and for promo bundle rows), and two genuinely
+            // DIFFERENT series/issues can independently fall back to the
+            // same generated placeholder barcode too - this one shared set
+            // catches both, across every group this call processes.
             var coverCandidates = new List<(Cover Cover, bool IsGuess)>();
+            // Tracks barcodes already claimed by something earlier in THIS
+            // SAME group (i.e. a sibling cover-letter variant of the issue
+            // being built right now), separate from batchClaimedBarcodes
+            // (claimed DB/batch-wide, across every issue in the whole run).
+            // Many publishers (confirmed: Marvel/DC-heavy data) assign the
+            // SAME barcode to every cover-letter variant of one issue - a
+            // UPC identifies the product (issue+price) for point-of-sale
+            // scanning, not the individual print cover - but Covers.Barcode
+            // has a DB-level UNIQUE index, so two Cover rows can't literally
+            // store the same value. Without this distinction, every sibling
+            // variant past the first collided with batchClaimedBarcodes and
+            // got silently dropped here, which is why so few non-Cover-A
+            // covers existed in the DB to backfill art for in the first
+            // place (2026-11-25/26 fix, see claude/metron-integration-notes.md).
+            var thisGroupBarcodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var e in group)
-                coverCandidates.AddRange(BuildCoversFromEntry(e, seriesName, issueNumber, barcodePrefix, result));
+            {
+                foreach (var candidate in BuildCoversFromEntry(e, seriesName, issueNumber, barcodePrefix, result))
+                {
+                    var barcode = candidate.Cover.Barcode;
+                    if (!batchClaimedBarcodes.Add(barcode))
+                    {
+                        if (thisGroupBarcodes.Contains(barcode))
+                        {
+                            // A sibling variant of this same issue legitimately
+                            // shares this barcode - keep it, but it needs its
+                            // own unique value for the DB's unique index. '#'
+                            // never appears in a real numeric barcode, so the
+                            // real barcode stays recoverable as the part
+                            // before it (used by BackfillCoversFromPrhImageCdn
+                            // and any future barcode/UPC lookup).
+                            var derived = $"{barcode}#{candidate.Cover.CoverLetter}";
+                            var suffix = 2;
+                            while (!batchClaimedBarcodes.Add(derived)) { derived = $"{barcode}#{candidate.Cover.CoverLetter}{suffix}"; suffix++; }
+                            candidate.Cover.Barcode = derived;
+                            coverCandidates.Add(candidate);
+                        }
+                        else
+                        {
+                            // Bug #12 fix (2026-11-24): logged instead of a bare
+                            // `continue` - batchClaimedBarcodes now includes every
+                            // barcode already in the DB (see its own doc comment
+                            // above), so a skip here can mean this literal barcode
+                            // already belongs to a DIFFERENT, unrelated issue
+                            // already on file - previously that went straight to
+                            // SaveChanges() and took the WHOLE week's batch down
+                            // with a UNIQUE-constraint crash. Visible here instead
+                            // of silently vanishing either way.
+                            result.Errors.Add($"{seriesName} #{issueNumber:0.##}: skipped a cover (barcode {barcode}) - already in use elsewhere in the system; needs a manual look.");
+                        }
+                        continue;
+                    }
+                    thisGroupBarcodes.Add(barcode);
+                    coverCandidates.Add(candidate);
+                }
+            }
             ResolveCoverLetters(coverCandidates, Enumerable.Empty<string>());
             var covers = coverCandidates.Select(c => c.Cover).ToList();
 
@@ -2110,7 +4017,13 @@ public class AutoFetchService : IAutoFetchService
                 // own and is also exactly the same name pattern
                 // TryLinkAsCollectedEdition now checks for auto-linking -
                 // this keeps both reading the format off the same signal.
-                Type = StripCollectedEditionSuffix(seriesName) != null ? IssueType.CollectedEdition : IssueType.SingleIssue,
+                // TypeHint (PRH's own Format column - see
+                // ImportPrhCatalogRelease) overrides that name-pattern
+                // guess when a source actually knows the real format
+                // directly, rather than everything falling back to the
+                // same guess regardless of what's actually available.
+                Type = group.First().TypeHint
+                    ?? (StripCollectedEditionSuffix(seriesName) != null ? IssueType.CollectedEdition : IssueType.SingleIssue),
                 ReleaseDate = entryReleaseDate,
                 FocDate = entryFocDate,
                 Covers = covers
@@ -2191,7 +4104,14 @@ public class AutoFetchService : IAutoFetchService
         }
 
         string? coverImagePath = null;
-        if (!string.IsNullOrWhiteSpace(e.CoverImageUrl))
+        if (!string.IsNullOrWhiteSpace(e.CoverImageLocalPath))
+        {
+            // Lunar Distribution's own embedded cover photo - already
+            // saved to disk by ImportLunarDistributionRelease before this
+            // entry was built, so there's nothing to fetch here at all.
+            coverImagePath = e.CoverImageLocalPath;
+        }
+        else if (!string.IsNullOrWhiteSpace(e.CoverImageUrl))
         {
             try
             {
@@ -2341,38 +4261,209 @@ public class AutoFetchService : IAutoFetchService
     // changes slightly between scrapes could still re-add), but far
     // better than the old behavior of every guess colliding on a single
     // hardcoded "B" and never growing past one slot at all.
-    private void AddMissingCoverVariants(Issue existingIssue, IEnumerable<ComicListEntry> group, string seriesName, string barcodePrefix, AutoFetchResult result)
+    // True for a cover that was created from a cheap list-only call with
+    // no real data yet, rather than one that's genuinely been enriched -
+    // the SAME check RetryMetronEnrichment/RetryLocgEnrichment already use
+    // to find their own candidates ($0 price + a "MTR-"/"LOCG-" barcode -
+    // see their own query comments). Reused here, not reinvented, so
+    // "placeholder" means the same thing everywhere in this file. "LUN-"
+    // added 2026-11-24 alongside this method's first use (AddMissingCoverVariants
+    // below) - a Lunar row with no real UPC column value gets this same
+    // generated-fallback barcode (see LunarDistributionParser.Parse), so
+    // it deserves the same later-upgrade treatment as an MTR-/LOCG- one.
+    private static bool LooksLikePlaceholderCover(Cover cover) =>
+        cover.Price == 0 && (cover.Barcode.StartsWith("MTR-", StringComparison.OrdinalIgnoreCase)
+            || cover.Barcode.StartsWith("LOCG-", StringComparison.OrdinalIgnoreCase)
+            || cover.Barcode.StartsWith("LUN-", StringComparison.OrdinalIgnoreCase));
+
+    // claimedBarcodes is shared across the WHOLE batch this call is part
+    // of (see Bug #10's fix, AddEntriesAsIssues' own doc comment on
+    // batchClaimedBarcodes, for the full story) - every call site passes
+    // in one set it declared once before its own loop, not a fresh one
+    // per issue, so a collision between THIS issue's covers and some
+    // OTHER issue's covers processed earlier in the same run is caught
+    // too, not just a collision within this one issue's own group.
+    private void AddMissingCoverVariants(Issue existingIssue, IEnumerable<ComicListEntry> group, string seriesName, string barcodePrefix, AutoFetchResult result, HashSet<string> claimedBarcodes)
     {
         var existingLetters = existingIssue.Covers
             .Select(c => c.CoverLetter)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var existingBarcodes = existingIssue.Covers
-            .Select(c => c.Barcode)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        // Was a fresh snapshot of just THIS issue's own existing
+        // barcodes, built here on every call - added 2026-11-24 after a
+        // real Lunar backfill run hit a 'UNIQUE constraint failed:
+        // Covers.Barcode' save failure on several real weeks (358/347/155
+        // /9 entries each, all lost together since TrySaveChanges rolls
+        // back the whole date on any failure). That fixed collisions
+        // WITHIN one issue's group, but a later run (2026-11-24, same
+        // day) still hit the identical crash on 9/19/2026 and 1/7/2026 -
+        // this time from two DIFFERENT issues in the same batch landing
+        // on the same barcode (seen live: several unrelated "BATMAN DAY
+        // 2026 - BUNDLES OF 25" promo rows, each a different series/issue
+        // but all falling back to the same generated LUN-{ProductCode}
+        // barcode). A per-issue set can never catch that, no matter how
+        // careful its own internal bookkeeping is - it simply doesn't
+        // know about any other issue. Bug #10's fix: this is now the ONE
+        // set for the whole batch (seeded here with this issue's own
+        // already-on-file barcodes, same as before), not a new one per
+        // issue - see AddEntriesAsIssues' batchClaimedBarcodes.
+        foreach (var existingBarcode in existingIssue.Covers.Select(c => c.Barcode))
+            claimedBarcodes.Add(existingBarcode);
         var existingArtists = existingIssue.Covers
             .Where(c => !string.IsNullOrWhiteSpace(c.CoverArtist))
             .Select(c => c.CoverArtist!)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+        // Backfills the Issue-level Publisher too, same spirit as the
+        // per-cover placeholder upgrade below - added 2026-11-24 after a
+        // real Lunar backfill run left Publisher/UPC blank on books that
+        // pre-dated the Lunar import (a Metron-sourced issue's Publisher
+        // is only ever set by its separate detail-enrichment call - see
+        // IMetronService's own doc comment on why the cheap list call
+        // can't carry it - so an issue whose enrichment never ran, or
+        // hasn't yet, sits with this blank indefinitely otherwise). Only
+        // ever fills a BLANK Publisher - never overwrites one already set.
+        if (string.IsNullOrWhiteSpace(existingIssue.Publisher))
+        {
+            var publisherFromGroup = group.Select(e => e.Publisher).FirstOrDefault(p => !string.IsNullOrWhiteSpace(p));
+            if (publisherFromGroup != null)
+                existingIssue.Publisher = publisherFromGroup;
+        }
+
         var candidates = new List<(Cover Cover, bool IsGuess)>();
+        var enrichedCovers = 0;
+        // Bug #12 fix (2026-11-24): claimedBarcodes now also carries every
+        // barcode already in the Covers table system-wide (see
+        // AddEntriesAsIssues' batchClaimedBarcodes doc comment), not just
+        // this issue's own + this batch's. That means the skip just below
+        // can now ALSO fire for the completely normal case of this issue's
+        // OWN already-on-file barcode being seen again on a later scrape -
+        // ownBarcodesSnapshot (captured before any seeding) tells the two
+        // cases apart so only a genuine cross-issue conflict gets logged.
+        var ownBarcodesSnapshot = existingIssue.Covers.Select(c => c.Barcode).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        // Tracks barcodes already claimed by something earlier in THIS SAME
+        // call's own group (a sibling cover-letter variant of this issue,
+        // discovered just now) - separate from ownBarcodesSnapshot (already
+        // on file before this call) and from claimedBarcodes itself (which
+        // also carries every OTHER issue's barcodes DB/batch-wide). Many
+        // publishers (confirmed: Marvel/DC-heavy data) assign the SAME
+        // barcode to every cover-letter variant of one issue - a UPC
+        // identifies the product (issue+price), not the individual print
+        // cover - but Covers.Barcode has a DB-level UNIQUE index. Without
+        // this distinction, a sibling variant discovered in this same group
+        // collided with claimedBarcodes right after its first sibling
+        // claimed the shared barcode, and got logged + dropped as a false
+        // "different issue" conflict (2026-11-25/26 fix, see
+        // claude/metron-integration-notes.md).
+        var thisGroupBarcodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var e in group)
         {
             foreach (var (cover, isGuess) in BuildCoversFromEntry(e, seriesName, existingIssue.IssueNumber, barcodePrefix, result))
             {
-                if (existingBarcodes.Contains(cover.Barcode)) continue;
-                if (!isGuess && existingLetters.Contains(cover.CoverLetter)) continue;
+                if (claimedBarcodes.Contains(cover.Barcode))
+                {
+                    // IMPORTANT: this is checked by (letter, barcode) PAIR,
+                    // not barcode alone - because every sibling variant of
+                    // this same issue carries the IDENTICAL barcode when a
+                    // publisher shares one UPC across covers (see the big
+                    // comment above), checking barcode alone would also
+                    // match Cover A's own already-on-file barcode against
+                    // every one of its siblings' candidates, and silently
+                    // drop every single one of them as a false "already on
+                    // file" no-op - exactly the bug this derive-and-keep
+                    // fix exists to prevent. Only a genuine re-scrape of
+                    // the SAME letter with the SAME barcode is a true no-op.
+                    bool alreadyExactlyOnFile = existingIssue.Covers.Any(c =>
+                        string.Equals(c.Barcode, cover.Barcode, StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(c.CoverLetter, cover.CoverLetter, StringComparison.OrdinalIgnoreCase));
+                    if (alreadyExactlyOnFile)
+                    {
+                        continue;
+                    }
+                    // A sibling variant legitimately shares this barcode -
+                    // either one already on file before this call started
+                    // (ownBarcodesSnapshot - e.g. Cover A was enriched in an
+                    // earlier run and its siblings are only being discovered
+                    // now), or one claimed by an earlier row in THIS SAME
+                    // call's own loop (thisGroupBarcodes - e.g. Cover A is
+                    // also brand new this call). Either way, keep it under
+                    // its own unique value instead of dropping it. '#' never
+                    // appears in a real numeric barcode, so the real
+                    // barcode stays recoverable as the part before it (used
+                    // by BackfillCoversFromPrhImageCdn and any future
+                    // barcode/UPC lookup).
+                    if (ownBarcodesSnapshot.Contains(cover.Barcode) || thisGroupBarcodes.Contains(cover.Barcode))
+                    {
+                        var derived = $"{cover.Barcode}#{cover.CoverLetter}";
+                        var suffix = 2;
+                        while (!claimedBarcodes.Add(derived)) { derived = $"{cover.Barcode}#{cover.CoverLetter}{suffix}"; suffix++; }
+                        cover.Barcode = derived;
+                        // falls through below - this candidate proceeds
+                        // exactly like one that never collided at all.
+                    }
+                    else
+                    {
+                        result.Errors.Add($"{seriesName} #{existingIssue.IssueNumber:0.##}: skipped a cover (barcode {cover.Barcode}) - already in use by a different issue in the system; needs a manual look.");
+                        continue;
+                    }
+                }
+                else
+                {
+                    thisGroupBarcodes.Add(cover.Barcode);
+                }
+
+                if (!isGuess && existingLetters.Contains(cover.CoverLetter))
+                {
+                    // Not a genuinely new variant - this is a richer
+                    // re-scrape of a letter already on file. Used to just
+                    // `continue` here and quietly throw the better data
+                    // away, which is exactly how a book discovered early
+                    // via Metron's cheap list call (real UPC/price only
+                    // ever arrive from its separate, sometimes-failed
+                    // detail call) could sit with a placeholder Cover
+                    // forever even after a MUCH richer Lunar row for the
+                    // same cover came through later - confirmed live
+                    // 2026-11-24. Upgrade the existing placeholder instead
+                    // of discarding the new data, but only when the
+                    // existing one actually looks like a placeholder
+                    // (LooksLikePlaceholderCover) - a cover that's already
+                    // been properly enriched from a trustworthy source is
+                    // left alone rather than blindly overwritten by
+                    // whatever the next source happens to say.
+                    var existingCover = existingIssue.Covers.First(c =>
+                        string.Equals(c.CoverLetter, cover.CoverLetter, StringComparison.OrdinalIgnoreCase));
+                    if (LooksLikePlaceholderCover(existingCover))
+                    {
+                        existingCover.Barcode = cover.Barcode;
+                        existingCover.Price = cover.Price;
+                        if (string.IsNullOrWhiteSpace(existingCover.Description)) existingCover.Description = cover.Description;
+                        if (string.IsNullOrWhiteSpace(existingCover.CoverArtist)) existingCover.CoverArtist = cover.CoverArtist;
+                        if (string.IsNullOrWhiteSpace(existingCover.CoverImagePath)) existingCover.CoverImagePath = cover.CoverImagePath;
+                        // Claim it now, not just at the top of the method -
+                        // this is the actual fix (see claimedBarcodes' own
+                        // doc comment above): a later row in this same
+                        // group that happens to carry this same barcode
+                        // must no longer be free to grab it too.
+                        claimedBarcodes.Add(cover.Barcode);
+                        enrichedCovers++;
+                    }
+                    continue;
+                }
                 if (isGuess && !string.IsNullOrWhiteSpace(cover.CoverArtist) && existingArtists.Contains(cover.CoverArtist)) continue;
                 candidates.Add((cover, isGuess));
+                claimedBarcodes.Add(cover.Barcode);
             }
         }
 
-        if (candidates.Count == 0) return;
+        if (candidates.Count > 0)
+        {
+            ResolveCoverLetters(candidates, existingLetters);
+            foreach (var (cover, _) in candidates)
+                existingIssue.Covers.Add(cover);
+            result.Added.Add($"{seriesName} #{existingIssue.IssueNumber:0.##}: +{candidates.Count} new cover variant(s) found on a later scrape.");
+        }
 
-        ResolveCoverLetters(candidates, existingLetters);
-        foreach (var (cover, _) in candidates)
-            existingIssue.Covers.Add(cover);
-
-        result.Added.Add($"{seriesName} #{existingIssue.IssueNumber:0.##}: +{candidates.Count} new cover variant(s) found on a later scrape.");
+        if (enrichedCovers > 0)
+            result.Added.Add($"{seriesName} #{existingIssue.IssueNumber:0.##}: filled in real price/UPC for {enrichedCovers} placeholder cover(s).");
     }
 
     private void DiscoverNewNumberOnes(List<Series> allSeries, AutoFetchResult result)
@@ -2544,5 +4635,796 @@ public class AutoFetchService : IAutoFetchService
                 (i.ReleaseDate != null && i.ReleaseDate >= since && i.ReleaseDate <= until) ||
                 (i.FocDate != null && i.FocDate >= since && i.FocDate <= until))
             .ToList();
+    }
+
+    // Raised from 400 to 600 on 2026-11-24 after "12-Foot Skeleton #2" was
+    // reported as still visibly blurry when zoomed, even though its cover
+    // (a Lunar-embedded photo, not a Comic Vine medium_url) was NOT caught by
+    // the original 400px line. Root cause: the zoom overlay (site.js) blows
+    // any zoomed cover up to as much as 1200px wide, so a cover needs to be
+    // roughly half that (600px) to still look reasonably sharp once
+    // stretched that far - 400px was only ever tuned to catch Comic Vine's
+    // specific old "medium_url" size, not to predict what looks good at the
+    // zoom's own ceiling. Still deliberately conservative on the matching
+    // side: the gates below (an exact issue-number match on Comic Vine, after
+    // auto-linking the series if needed) mean a cover under this width from
+    // some other source just gets skipped rather than mis-replaced, so
+    // there's no real cost to erring wide here - widening this constant only
+    // means more covers get a chance to be checked, never a riskier check.
+    private const int LowResCoverWidthThreshold = 600;
+
+    // Retroactive one-time upgrade pass - see IAutoFetchService.
+    // UpgradeLowResolutionCovers's own doc comment for the full story (both
+    // ComicVineService issue-fetch methods used to save covers at Comic
+    // Vine's smaller "medium_url" size; this is the catch-up for whatever
+    // got saved that way before today's fix). Mirrors RetryMetronEnrichment's
+    // own shape (trace log, per-item try/catch, onProgress once per item,
+    // SaveChanges every 5 + at the end, limit for a Test-N button).
+    //
+    // Follow-up (2026-11-24, same day): the first version of this method
+    // only ever attempted an upgrade for a series ALREADY linked to a Comic
+    // Vine volume (Series.ComicVineVolumeId) - user reported this "does
+    // nothing" for covers that came from the Lunar .xlsx importer, since a
+    // Lunar-only series is never auto-linked to Comic Vine by that import
+    // path at all (Lunar embeds its own cover photo directly - there was
+    // never a reason to also look the series up on Comic Vine). That's most
+    // of this store's low-res covers, not an edge case. Fix: reuses the
+    // SAME conservative TryAutoLink/PickBestVolumeMatch logic the normal
+    // weekly Check Now flow already uses for exactly this (an exact
+    // case-insensitive name match is required, with issue-count/start-year
+    // as the tiebreak - see TryAutoLink's own doc comment for the full
+    // "never guess" rule, including the Superman/Wonder Woman wrong-volume
+    // bugs that rule exists to prevent) - a confident link found here is
+    // just as real and permanent as one found by the normal discovery flow,
+    // and benefits every FUTURE run (new-issue checks, future cover
+    // backfills), not just this one cover. Same 24h AutoLinkRetryCooldown
+    // respected too, so a TP/GN-style series Comic Vine will never carry
+    // doesn't get re-asked on every single run of this button.
+    public AutoFetchResult UpgradeLowResolutionCovers(Action<string>? onProgress = null, int? limit = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Upgrade low-resolution covers run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}" + (limit.HasValue ? $" (TEST RUN - capped at {limit} cover(s))" : ""));
+        trace.AppendLine(new string('=', 60));
+
+        var candidates = _db.Covers
+            .Include(c => c.Issue).ThenInclude(i => i.Series)
+            .Where(c => c.CoverImagePath != null && c.CoverImagePath != "")
+            .ToList();
+        if (limit.HasValue) candidates = candidates.Take(limit.Value).ToList();
+
+        onProgress?.Invoke($"Checking {candidates.Count} cover(s) on file for low-resolution images...");
+
+        var done = 0;
+        var skippedNotLowRes = 0;
+        var skippedNoVolumeLink = 0;
+        var skippedAutoLinkCooldown = 0;
+        var skippedNoExactMatch = 0;
+        var skippedRateLimited = 0;
+        var newlyLinked = 0;
+        var comicVineRateLimited = false;
+        foreach (var cover in candidates)
+        {
+            done++;
+            var series = cover.Issue.Series;
+            var label = $"{series.Name} #{cover.Issue.IssueNumber:0.##} ({cover.CoverLetter})";
+            string outcomeLine;
+
+            try
+            {
+                if (!File.Exists(cover.CoverImagePath!))
+                {
+                    outcomeLine = $"{done}/{candidates.Count} {label}: file on disk is missing - skipped.";
+                    trace.AppendLine(outcomeLine);
+                    onProgress?.Invoke(outcomeLine);
+                    continue;
+                }
+
+                var dims = ImageDimensionReader.TryReadDimensions(cover.CoverImagePath!);
+                if (dims == null || dims.Value.Width >= LowResCoverWidthThreshold)
+                {
+                    skippedNotLowRes++;
+                    continue; // already a decent size (or unreadable) - nothing to do, not worth a trace line per cover
+                }
+
+                // Once Comic Vine is confirmed rate-limited, every further
+                // call to it this run (auto-link OR the cover lookup below)
+                // would just fail the same way - skip without even trying,
+                // same spirit as RescanExistingBooks' own comicVineRateLimited.
+                if (comicVineRateLimited)
+                {
+                    skippedRateLimited++;
+                    continue;
+                }
+
+                if (series.ComicVineVolumeId == null)
+                {
+                    if (series.LastAutoLinkAttempt != null &&
+                        DateTime.Now - series.LastAutoLinkAttempt.Value < AutoLinkRetryCooldown)
+                    {
+                        skippedAutoLinkCooldown++;
+                        continue; // tried to link this one recently and it didn't match - don't retry yet
+                    }
+
+                    if (!TryAutoLink(series, result))
+                    {
+                        skippedNoVolumeLink++;
+                        continue; // no confident Comic Vine match for this series at all (e.g. a Lunar-only title Comic Vine doesn't carry, or a collected-edition name) - leave the existing cover alone
+                    }
+
+                    newlyLinked++;
+                }
+
+                var betterUrl = _comicVine.FindBestCoverImageUrl(series.ComicVineVolumeId!.Value, cover.Issue.IssueNumber);
+                if (string.IsNullOrWhiteSpace(betterUrl))
+                {
+                    skippedNoExactMatch++;
+                    continue; // series is Comic-Vine-linked, but no confident exact ISSUE match there - leave the existing (low-res but real) cover alone
+                }
+
+                var hint = $"{series.Name}_{cover.Issue.IssueNumber}_{cover.CoverLetter}_hires";
+                var newPath = _comicVine.DownloadCoverImage(betterUrl, hint);
+                if (string.IsNullOrWhiteSpace(newPath))
+                {
+                    outcomeLine = $"{done}/{candidates.Count} {label}: found a higher-res URL but the download failed - left the existing cover in place.";
+                    trace.AppendLine(outcomeLine);
+                    onProgress?.Invoke(outcomeLine);
+                    continue;
+                }
+
+                cover.CoverImagePath = newPath;
+                result.CoversBackfilled++;
+                outcomeLine = $"{done}/{candidates.Count} {label}: upgraded ({dims.Value.Width}px -> higher resolution).";
+                result.Added.Add(outcomeLine);
+                trace.AppendLine(outcomeLine);
+                onProgress?.Invoke(outcomeLine);
+            }
+            catch (Exception ex) when (IsRateLimitError(ex))
+            {
+                comicVineRateLimited = true;
+                skippedRateLimited++;
+                outcomeLine = $"{done}/{candidates.Count} {label}: Comic Vine's rate limit is active - skipping it for the rest of this run (covers already upgraded above are kept; the rest can be retried later).";
+                result.Errors.Add(outcomeLine);
+                trace.AppendLine(outcomeLine);
+                onProgress?.Invoke(outcomeLine);
+            }
+            catch (Exception ex)
+            {
+                outcomeLine = $"{done}/{candidates.Count} {label}: upgrade failed - {ex.Message}";
+                result.Errors.Add(outcomeLine);
+                trace.AppendLine(outcomeLine);
+                onProgress?.Invoke(outcomeLine);
+            }
+
+            if (done % 5 == 0 || done == candidates.Count)
+            {
+                var (saved, saveError) = TrySaveChanges();
+                if (!saved) result.Errors.Add($"Batch ending at cover {done}: failed to save - {saveError}");
+            }
+        }
+
+        trace.AppendLine();
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}. Upgraded {result.CoversBackfilled} cover(s) ({newlyLinked} series newly linked to Comic Vine along the way); {skippedNotLowRes} already a decent size, {skippedNoVolumeLink} had no confident Comic Vine match for the series, {skippedAutoLinkCooldown} skipped (auto-link tried recently and failed), {skippedNoExactMatch} had no confident exact issue match, {skippedRateLimited} skipped due to Comic Vine's rate limit.");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+
+        return result;
+    }
+
+    // Added 2026-11-25/26, right after Bug #15's Comic-Vine-auto-link fix
+    // shipped for "lots of covers missing" - the user pushed back ("ok but
+    // the pdfs do have covers"), correctly pointing out that PRH's own PDF
+    // catalog clearly shows real cover art, which doesn't square with "PRH's
+    // feed never includes a cover image." Investigated live in the browser
+    // rather than assuming the PDF embeds its own images: the /downloadpdf/
+    // page's own docgen request carries no per-title artwork at all (its
+    // header_img field is just the same kind of static branding blob the
+    // xls flow's xls_logo already is). The real source turned out to be
+    // completely independent of the docgen chain and much simpler: every
+    // product thumbnail on prhcomics.com's own catalog pages - confirmed for
+    // BOTH ISBN-13 collected editions and PRH's single-issue "CB" format
+    // rows, not just one or the other - loads from a plain, public,
+    // unauthenticated image CDN keyed directly by the item's own barcode:
+    // https://images.penguinrandomhouse.com/cover/{barcode}. No cookies, no
+    // nonce, no admin-ajax round trip - confirmed live with
+    // credentials:'omit'. Confirmed it wants the barcode EXACTLY as PRH's
+    // own feed stores it - a bare 13-digit ISBN-13 for a collected edition,
+    // or the full 17-digit UPC+5-digit-addon for a single issue (truncating
+    // that down to the bare 12-digit UPC always misses). When nothing's on
+    // file for a code it answers HTTP 200 with a generic stock graphic
+    // instead of a 404 - confirmed live this is byte-for-byte identical
+    // (same SHA256) across several different missing codes, so it's folded
+    // into the SAME PlaceholderImageRegistry ComicVineService.
+    // DownloadCoverImage already uses for comicade.com's own "not ready yet"
+    // stock graphic, rather than inventing a second parallel mechanism - see
+    // FetchPrhPlaceholderHashIfUnknown below.
+    //
+    // Candidate query is barcode-SHAPE based, not provenance-based (there's
+    // still no "which source added this" column on Cover - same gap noted
+    // throughout this file): any cover with nothing on disk yet whose
+    // Barcode is purely numeric and either 13 or 17 digits long. That
+    // naturally catches every PRH-sourced cover (PRH stores the real
+    // ISBN/UPC straight into Barcode, never a generated fallback the way
+    // Lunar does for a blank UPC column - see LunarDistributionParser) while
+    // leaving every MTR-/LOCG-/LUN- placeholder barcode alone (none of
+    // those are purely numeric) - and isn't actually limited to PRH-sourced
+    // covers at all: any OTHER source's cover that happens to carry a real
+    // ISBN-13 or a full 17-digit UPC+addon as its own barcode can get a hit
+    // here too, since this turned out to be Penguin Random House's own
+    // general-purpose book-cover image service, not something scoped to
+    // comics specifically. limit caps how many candidates get processed in
+    // one run, same Test-N-button contract as RetryMetronEnrichment/
+    // UpgradeLowResolutionCovers above. Never run automatically.
+    public AutoFetchResult BackfillCoversFromPrhImageCdn(Action<string>? onProgress = null, int? limit = null)
+    {
+        var result = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Backfill covers from PRH's image CDN run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}" + (limit.HasValue ? $" (TEST RUN - capped at {limit} cover(s))" : ""));
+        trace.AppendLine(new string('=', 60));
+
+        // Length check runs in SQL (translatable); the purely-numeric check
+        // runs afterward, in memory, against the already-materialized list -
+        // string.All(char.IsDigit) isn't something EF Core's LINQ provider
+        // can translate, and running it as part of the query itself would
+        // throw at runtime instead of silently client-evaluating (confirmed
+        // against this project's EF Core version elsewhere in this file).
+        //
+        // A cover's own Barcode isn't always the clean 13/17-digit value
+        // itself any more (2026-11-25/26 fix, see
+        // claude/metron-integration-notes.md for the full writeup): a
+        // sibling cover-variant that shares its real barcode with another
+        // cover of the SAME issue (common industry practice - a UPC
+        // identifies the issue+price, not the individual print cover) now
+        // gets a derived barcode of the form "{realBarcode}#{marker}"
+        // instead of being silently dropped at import time, since
+        // Covers.Barcode has a DB-level unique index and can't store the
+        // same value twice. '#' never appears in a real numeric barcode,
+        // so splitting on it and using the part BEFORE it recovers the
+        // real CDN lookup key either way - a clean, un-suffixed barcode
+        // just splits into itself, so this one path handles both shapes.
+        var rawCandidates = _db.Covers
+            .Include(c => c.Issue).ThenInclude(i => i.Series)
+            .Where(c => string.IsNullOrWhiteSpace(c.CoverImagePath) && c.Barcode != null && c.Barcode != "")
+            .ToList();
+
+        var candidates = rawCandidates
+            .Select(c => (Cover: c, LookupBarcode: c.Barcode!.Split('#')[0]))
+            .Where(x => (x.LookupBarcode.Length == 13 || x.LookupBarcode.Length == 17) && x.LookupBarcode.All(char.IsDigit))
+            // Same candidate-selection ordering fix already proven for
+            // RetryMetronEnrichment/RetryLocgEnrichment's own "worst five
+            // picks" bug: unordered (DB scan/Id order) just reflects
+            // whatever order the PRH import happened to insert rows in -
+            // for a 67-catalog backfill that's roughly "oldest catalog
+            // first," which is exactly the kind of old, possibly-never-
+            // illustrated solicitation a Test-N run shouldn't be judged
+            // against. Closest-to-today by absolute distance surfaces
+            // recently-shipped or about-to-ship real issues instead, the
+            // same as every other retry/backfill method in this file.
+            .OrderBy(x => x.Cover.Issue.ReleaseDate.HasValue
+                ? Math.Abs((x.Cover.Issue.ReleaseDate.Value.ToDateTime(TimeOnly.MinValue) - DateTime.Now).TotalDays)
+                : double.MaxValue)
+            .ToList();
+        if (limit.HasValue) candidates = candidates.Take(limit.Value).ToList();
+
+        onProgress?.Invoke($"Checking {candidates.Count} cover(s) with an ISBN/UPC-shaped barcode against PRH's own cover image CDN...");
+
+        FetchPrhPlaceholderHashIfUnknown();
+
+        var done = 0;
+        var noCoverAvailable = 0;
+        foreach (var (cover, lookupBarcode) in candidates)
+        {
+            done++;
+            var series = cover.Issue.Series;
+            var label = $"{series.Name} #{cover.Issue.IssueNumber:0.##} ({cover.CoverLetter})";
+            string outcomeLine;
+
+            try
+            {
+                var bytes = PrhWebsiteFetcher.DownloadCoverBytesAsync(lookupBarcode).GetAwaiter().GetResult();
+                if (bytes == null)
+                {
+                    outcomeLine = $"{done}/{candidates.Count} {label}: download failed - left uncovered.";
+                    trace.AppendLine(outcomeLine);
+                    onProgress?.Invoke(outcomeLine);
+                    continue;
+                }
+
+                var hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes));
+                if (PlaceholderImageRegistry.IsKnownPlaceholder(hash))
+                {
+                    noCoverAvailable++;
+                    continue; // PRH has nothing on file for this barcode yet - not an error, not worth a trace line per cover
+                }
+
+                var hint = $"{series.Name}_{cover.Issue.IssueNumber}_{cover.CoverLetter}_prh-isbn";
+                cover.CoverImagePath = _comicVine.SaveCoverImageBytes(bytes, hint);
+                result.CoversBackfilled++;
+                outcomeLine = $"{done}/{candidates.Count} {label}: found a cover via PRH's image CDN ({lookupBarcode}).";
+                result.Added.Add(outcomeLine);
+                trace.AppendLine(outcomeLine);
+                onProgress?.Invoke(outcomeLine);
+            }
+            catch (Exception ex)
+            {
+                outcomeLine = $"{done}/{candidates.Count} {label}: {ex.Message}";
+                result.Errors.Add(outcomeLine);
+                trace.AppendLine(outcomeLine);
+                onProgress?.Invoke(outcomeLine);
+            }
+
+            if (done % 25 == 0 || done == candidates.Count)
+            {
+                var (saved, saveError) = TrySaveChanges();
+                if (!saved) result.Errors.Add($"Batch ending at cover {done}: failed to save - {saveError}");
+            }
+        }
+
+        trace.AppendLine();
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}. Found {result.CoversBackfilled} cover(s) via PRH's image CDN; {noCoverAvailable} had nothing on file there yet; {result.Errors.Count} error(s).");
+        result.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(result.Trace);
+
+        return result;
+    }
+
+    // Teaches PlaceholderImageRegistry the PRH image CDN's "nothing on file
+    // for this barcode yet" stock-graphic hash, if it isn't already known -
+    // called once at the top of BackfillCoversFromPrhImageCdn so the very
+    // first real miss in that run's own loop always has something to
+    // compare against (without this, the first miss would have nothing to
+    // match yet and would get saved as if it were real art). Best-effort:
+    // if this one lookup fails, the run still works correctly for anything
+    // already in the registry from comicade.com, and self-corrects the next
+    // time ClearPlaceholderCovers runs.
+    private static void FetchPrhPlaceholderHashIfUnknown()
+    {
+        try
+        {
+            var bootstrapBytes = PrhWebsiteFetcher.DownloadCoverBytesAsync("0000000000000").GetAwaiter().GetResult();
+            if (bootstrapBytes == null) return;
+            var bootstrapHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bootstrapBytes));
+            PlaceholderImageRegistry.Add(bootstrapHash);
+        }
+        catch
+        {
+            // Best-effort - see doc comment above.
+        }
+    }
+}
+
+// Tiny helper for AutoFetchService.FetchLunarReleaseFromWebsite - reading
+// the homepage HTML to find today's current release/FOC dates is a
+// two-line regex job, not worth pulling in HtmlAgilityPack (already used
+// elsewhere for comicade.com) or a whole separate service class/interface
+// the way ComicadeFocService got, since nothing else in the app needs to
+// talk to lunardistribution.com's website directly - everything else
+// about Lunar is just reading an .xlsx file, wherever it came from.
+internal static class LunarWebsiteFetcher
+{
+    public static readonly HttpClient Http = BuildClient();
+
+    private static HttpClient BuildClient()
+    {
+        var client = new HttpClient();
+        // Was 30s, which is plenty for the homepage HTML and the small
+        // weekly release file (~68KB) but not for the FOC file - that one
+        // covers a much longer solicited horizon and runs several MB
+        // (6.6MB in testing), confirmed timing out for real on
+        // 2026-11-24 ("The request was canceled due to the configured
+        // HttpClient.Timeout of 30 seconds elapsing"). 300s gives real
+        // headroom for a slower connection without the download hanging
+        // forever if the site is genuinely unreachable.
+        client.Timeout = TimeSpan.FromSeconds(300);
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ComicPos/1.0 (personal single-store inventory tool)");
+        return client;
+    }
+
+    // Finds <button ... class="datafile release" ... data-val="MM/dd/yyyy
+    // h:mm:ss AM/PM" ...> (or class="datafile foc") in the homepage's
+    // plain server-rendered HTML - confirmed present with zero JavaScript
+    // execution via a credentials-omitted fetch() against the live site
+    // on 2026-11-24 (see metron-integration-notes.md), so a simple regex
+    // on the class attribute's exact text is enough; both buttons were
+    // observed with "datafile release"/"datafile foc" in that fixed
+    // order every time, and this only needs two values, not a full HTML
+    // parser.
+    public static string? FindDataVal(string html, string kind)
+    {
+        var pattern = new Regex(
+            $@"<button[^>]*\bclass=""datafile\s+{kind}""[^>]*\bdata-val=""([^""]+)""",
+            RegexOptions.IgnoreCase);
+        var m = pattern.Match(html);
+        return m.Success ? m.Groups[1].Value : null;
+    }
+}
+// Replicates, from plain C# HttpClient calls, the exact multi-step AJAX
+// chain prhcomics.com's own "Download Excel Spreadsheet" button performs
+// for its monthly "Comics Retail" catalog - confirmed live, step by
+// step, via the built-in browser's network/JS inspection tools on
+// 2026-11-25/26 against
+// https://prhcomics.com/catalog-landing-page/?catalogCode=2026-12 (see
+// claude/metron-integration-notes.md for the full write-up). No PRH
+// account/login is required anywhere in this chain - confirmed via
+// window.prhbl_user_is_logged_in === false on a totally anonymous page
+// load that still completed every step below successfully. It's the
+// exact same public flow anyone gets just by visiting the page and
+// clicking the button; it's simply WordPress-AJAX-and-nonce-driven
+// rather than a single static file URL the way Lunar's is.
+//
+// The chain, each step confirmed with a real request/response in the
+// browser before being ported here:
+//   1. GET the catalog-landing-page itself. Four things are scraped
+//      straight out of its rendered HTML by finding each one's
+//      JS-literal assignment in the page's own inline <script> and
+//      reading the quoted text that follows (not by executing any
+//      JavaScript - these are present as plain quoted text in the raw
+//      HTML the server sends, so a plain indexOf-based scrape is
+//      enough, same "look for the literal, not a full parser" approach
+//      LunarWebsiteFetcher.FindDataVal above already uses):
+//        - "product_load_nonce" - a standard WordPress nonce from a
+//          hidden <input>, tied to this page load, NOT to any login/
+//          session - a brand-new anonymous GET always yields a fresh,
+//          directly usable one.
+//        - "xls_logo" / "xls_template" - PRH's own branding image and
+//          blank Excel template, both embedded directly as base64
+//          literals in the page's own script rather than hosted at any
+//          separate URL. Scraped fresh on every run instead of being
+//          hardcoded here, so this keeps working automatically if PRH
+//          ever reskins either one.
+//        - "title_list_product_module_api_url" - a fixed per-book API
+//          URL template the docgen service wants passed through
+//          untouched; scraped the same way for the same reason.
+//   2. POST wp/wp-admin/admin-ajax.php, action=get_product_list, using
+//      that nonce - returns an "api_url"/"api_args" pair describing, in
+//      PRH's own internal title-API terms, exactly which titles this
+//      catalog code covers. This is PRH's own backend already doing the
+//      filtering/query-building - passed straight through unread in
+//      step 4.
+//   3. POST wp/wp-admin/admin-ajax.php, action=get_rest_api_hash, using
+//      the SAME nonce - returns a short-lived "rest_api_hash" that
+//      authorizes the final docgen call below.
+//   4. POST https://sales-docgen.prh.com/wp-json/prh-rest-api/v1/download-xls
+//      - a separate REST microservice (NOT on prhcomics.com) that takes
+//      the api_url/api_args from step 2, the hash from step 3, and the
+//      logo/template scraped in step 1, and returns
+//      {"xls_filename": "...", "xls_base64_encoded": "..."} - a
+//      ready-to-write .xlsx file, base64-encoded. The nested
+//      "post_params"/"xls_title_mapper"/"file_download_name" fields are
+//      sent as PHP-style bracketed form fields (post_params[action]=...
+//      etc.) because that's literally what the real site's own jQuery
+//      sends for a nested object in a form POST (confirmed by reading
+//      the raw outgoing request body in the browser, not guessed) - a
+//      plain JSON body here would not be parsed the same way server-side.
+internal static class PrhWebsiteFetcher
+{
+    public static readonly HttpClient Http = BuildClient();
+
+    private static HttpClient BuildClient()
+    {
+        var client = new HttpClient();
+        client.Timeout = TimeSpan.FromSeconds(120);
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ComicPos/1.0 (personal single-store inventory tool)");
+        return client;
+    }
+
+    private const string AjaxUrl = "https://prhcomics.com/wp/wp-admin/admin-ajax.php";
+    private const string DownloadXlsUrl = "https://sales-docgen.prh.com/wp-json/prh-rest-api/v1/download-xls";
+    private const int PostId = 11811;
+
+    public static async Task<byte[]> DownloadCatalogXlsxAsync(string catalogCode, Action<string>? onProgress)
+    {
+        var pageUrl = $"https://prhcomics.com/catalog-landing-page/?catalogCode={Uri.EscapeDataString(catalogCode)}";
+
+        onProgress?.Invoke($"Reading prhcomics.com's catalog page for {catalogCode}...");
+        var html = await Http.GetStringAsync(pageUrl).ConfigureAwait(false);
+
+        // The page's own "titlelist-load-nonce" hidden input always ships
+        // BLANK in the raw server HTML - confirmed live 2026-11-26 (see
+        // metron-integration-notes.md). The real nonce only appears after
+        // the page's own jQuery runs and POSTs action=get_nonce to this
+        // same admin-ajax.php endpoint, writing the result into that
+        // input client-side. That bootstrap call needs no page context,
+        // cookies, or catalogCode at all - confirmed it works completely
+        // standalone - so it's fetched directly here instead of scraped
+        // from this (always-empty) HTML. This replaces the original
+        // (wrong) approach, which only ever appeared to work when tested
+        // against a browser tab that had already run that bootstrap call
+        // moments earlier - a fresh HttpClient run here always failed
+        // with the site's own "Data not available. Authorization
+        // failed!" error until this fix.
+        onProgress?.Invoke("Getting a fresh request token...");
+        var nonce = await FetchBootstrapNonceAsync().ConfigureAwait(false);
+        var xlsLogo = ExtractLiteral(html, "xls_logo")
+            ?? throw new InvalidOperationException("Couldn't find the page's embedded logo image - prhcomics.com's layout may have changed.");
+        var xlsTemplate = ExtractLiteral(html, "xls_template")
+            ?? throw new InvalidOperationException("Couldn't find the page's embedded spreadsheet template - prhcomics.com's layout may have changed.");
+        var titleListApiUrl = ExtractLiteral(html, "title_list_product_module_api_url")
+            ?? throw new InvalidOperationException("Couldn't find the page's title-list API URL template - prhcomics.com's layout may have changed.");
+        titleListApiUrl = System.Net.WebUtility.HtmlDecode(titleListApiUrl);
+
+        var paramsJson = $"{{\"source-page\":\"catalog-landing-page\",\"catalogCode\":\"{catalogCode}\"}}";
+        const string filtersJson = "{\"l1_category\":\"\",\"filters\":{\"category\":[],\"sale-status\":[],\"format\":[],\"age\":[],\"grade\":[],\"guides\":[],\"publisher\":[],\"comics_publisher\":[]}}";
+
+        onProgress?.Invoke($"Asking prhcomics.com which titles the {catalogCode} catalog covers...");
+        var productListForm = new Dictionary<string, string>
+        {
+            ["product_load_nonce"] = nonce,
+            ["action"] = "get_product_list",
+            ["postType"] = "page",
+            ["postId"] = PostId.ToString(CultureInfo.InvariantCulture),
+            ["isbns"] = "[]",
+            ["params"] = paramsJson,
+            ["filters"] = filtersJson,
+            ["layout"] = "grid-lg",
+            ["sort"] = ""
+        };
+
+        string apiUrl;
+        string apiArgsJson;
+        using (var productListResp = await Http.PostAsync(AjaxUrl, new FormUrlEncodedContent(productListForm)).ConfigureAwait(false))
+        {
+            productListResp.EnsureSuccessStatusCode();
+            var productListJson = await productListResp.Content.ReadAsStringAsync().ConfigureAwait(false);
+            using var productListDoc = JsonDocument.Parse(productListJson);
+            var root = productListDoc.RootElement;
+            if (!root.TryGetProperty("success", out var successEl) || !successEl.GetBoolean())
+                throw new InvalidOperationException($"get_product_list didn't return success: {productListJson}");
+
+            var data = root.GetProperty("data");
+            apiUrl = data.GetProperty("api_url").GetString() ?? "";
+            var apiArgsEl = data.GetProperty("api_args");
+            apiArgsJson = apiArgsEl.ValueKind == JsonValueKind.String ? apiArgsEl.GetString() ?? "{}" : apiArgsEl.GetRawText();
+
+            if (data.TryGetProperty("total", out var totalEl) && totalEl.TryGetInt32(out var total))
+                onProgress?.Invoke($"Catalog {catalogCode} covers {total} title(s) - requesting the spreadsheet...");
+        }
+
+        onProgress?.Invoke("Getting a download authorization token...");
+        string restHash;
+        using (var hashResp = await Http.PostAsync(AjaxUrl, new FormUrlEncodedContent(new Dictionary<string, string>
+               {
+                   ["action"] = "get_rest_api_hash",
+                   ["_ajax_nonce"] = nonce
+               })).ConfigureAwait(false))
+        {
+            hashResp.EnsureSuccessStatusCode();
+            var hashJson = await hashResp.Content.ReadAsStringAsync().ConfigureAwait(false);
+            using var hashDoc = JsonDocument.Parse(hashJson);
+            if (!hashDoc.RootElement.TryGetProperty("success", out var hashSuccessEl) || !hashSuccessEl.GetBoolean())
+                throw new InvalidOperationException($"get_rest_api_hash didn't return success: {hashJson}");
+            restHash = hashDoc.RootElement.GetProperty("data").GetProperty("hash").GetString() ?? "";
+        }
+
+        onProgress?.Invoke("Building the spreadsheet...");
+
+        // Mirrors the SAME dict sent to get_product_list above, with
+        // "download": true added and a fixed default sort - confirmed
+        // live that the site's own download call adds exactly this one
+        // extra field, nothing else differs from the list-fetch params.
+        var postParamsForDownload = new (string Key, string Value)[]
+        {
+            ("product_load_nonce", nonce),
+            ("action", "get_product_list"),
+            ("postType", "page"),
+            ("postId", PostId.ToString(CultureInfo.InvariantCulture)),
+            ("isbns", "[]"),
+            ("params", paramsJson),
+            ("filters", filtersJson),
+            ("download", "true"),
+            ("sort", "frontlistiest_onsale:desc")
+        };
+
+        var titleMapper = new (string Key, string Value)[]
+        {
+            ("excel_header_subtitle", "Subtitle"),
+            ("excel_header_title", "Title"),
+            ("excel_header_author", "Creators"),
+            ("excel_header_isbn", "ISBN/UPC"),
+            ("excel_header_price_usd", "Retail Price (US)"),
+            ("excel_header_price_can", "Retail Price (CAN)"),
+            ("excel_header_format", "Format"),
+            ("excel_header_on_sale_date", "On-Sale Date"),
+            ("excel_header_foc_date", "FOC Date"),
+            ("excel_header_series_frequency", "Series Frequency"),
+            ("excel_header_format_code", "Format"),
+            ("excel_header_division", "Division"),
+            ("excel_header_imprint", "Imprint"),
+            ("excel_header_age", "Age"),
+            ("excel_header_grade_sap", "Grade"),
+            ("excel_header_grade_edu", "Grade Edu"),
+            ("excel_header_quantity", "Quantity")
+        };
+
+        var fileDownloadName = new (string Key, string Value)[]
+        {
+            ("type", "xls"),
+            ("site_name", "PRH-Comics-Retail"),
+            ("wish_list_override", "Pull List"),
+            ("wish_list_slug", "pull-list")
+        };
+
+        var downloadForm = new List<KeyValuePair<string, string>>
+        {
+            new("api_url", apiUrl),
+            new("api_args", apiArgsJson),
+            new("api_map_key", "comics")
+        };
+        AddBracketed(downloadForm, "post_params", postParamsForDownload);
+        downloadForm.Add(new("title_list_product_module_api_url", titleListApiUrl));
+        downloadForm.Add(new("rest_api_hash", restHash));
+        downloadForm.Add(new("title", $"Catalog {CatalogCodeToTitle(catalogCode)}"));
+        downloadForm.Add(new("subtitle", ""));
+        downloadForm.Add(new("clickable-url", pageUrl));
+        downloadForm.Add(new("product-module-page-url", pageUrl));
+        downloadForm.Add(new("file_type", "xls"));
+        downloadForm.Add(new("xls_logo", xlsLogo));
+        downloadForm.Add(new("xls_header_row", "2"));
+        downloadForm.Add(new("xls_meta_keywords", ""));
+        downloadForm.Add(new("xls_title", "Penguin Random House Wish List"));
+        downloadForm.Add(new("xls_desc", ""));
+        downloadForm.Add(new("fill_row_colors", "[{\"column_number\":\"2\",\"color\":\"FFFFD700\"}]"));
+        AddBracketed(downloadForm, "xls_title_mapper", titleMapper);
+        downloadForm.Add(new("xls_trim_us_can_from_price", "false"));
+        downloadForm.Add(new("xls_suppress_digital_price", "false"));
+        downloadForm.Add(new("xls_template", xlsTemplate));
+        AddBracketed(downloadForm, "file_download_name", fileDownloadName);
+        downloadForm.Add(new("request_books_base_url", "https://prhcomics.com"));
+
+        using var downloadRequest = new HttpRequestMessage(HttpMethod.Post, DownloadXlsUrl)
+        {
+            Content = new FormUrlEncodedContent(downloadForm)
+        };
+        downloadRequest.Headers.Referrer = new Uri(pageUrl);
+        downloadRequest.Headers.TryAddWithoutValidation("Origin", "https://prhcomics.com");
+
+        using var downloadResp = await Http.SendAsync(downloadRequest).ConfigureAwait(false);
+        downloadResp.EnsureSuccessStatusCode();
+        var downloadJson = await downloadResp.Content.ReadAsStringAsync().ConfigureAwait(false);
+        using var downloadDoc = JsonDocument.Parse(downloadJson);
+        var xlsBase64 = downloadDoc.RootElement.TryGetProperty("xls_base64_encoded", out var xlsBase64El)
+            ? xlsBase64El.GetString()
+            : null;
+        if (string.IsNullOrEmpty(xlsBase64))
+            throw new InvalidOperationException($"The download call didn't return a file: {downloadJson}");
+
+        return Convert.FromBase64String(xlsBase64);
+    }
+
+    private static void AddBracketed(List<KeyValuePair<string, string>> form, string prefix, (string Key, string Value)[] pairs)
+    {
+        foreach (var (key, value) in pairs)
+            form.Add(new($"{prefix}[{key}]", value));
+    }
+
+    // "2026-12" -> "December 2026", matching the text the page's own
+    // <title>/download dialog use - purely cosmetic (goes into the
+    // generated spreadsheet's "title" field, not anything parsed back
+    // out of it), so falls back to the raw code rather than throwing if
+    // it's ever not that exact shape.
+    private static string CatalogCodeToTitle(string catalogCode)
+    {
+        var parts = catalogCode.Split('-');
+        if (parts.Length == 2
+            && int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var year)
+            && int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var month)
+            && month is >= 1 and <= 12)
+        {
+            return $"{CultureInfo.InvariantCulture.DateTimeFormat.GetMonthName(month)} {year}";
+        }
+        return catalogCode;
+    }
+
+    // POSTs action=get_nonce to admin-ajax.php - the same bootstrap call
+    // the catalog page's own jQuery makes on load (see the big comment on
+    // DownloadCatalogXlsxAsync's nonce line above for how this was found
+    // and confirmed). Confirmed live this returns the identical nonce a
+    // real browser session gets, works with zero cookies, and needs no
+    // catalogCode or page context - it's a flat, non-wrapped JSON object
+    // ({"nonce":"...", "nonceNewsletter":"...", ...}), not the usual
+    // {"success":true,"data":{...}} shape admin-ajax.php's other actions
+    // here use, so it's read directly rather than via the success/data
+    // pattern the other calls in this class check.
+    private static async Task<string> FetchBootstrapNonceAsync()
+    {
+        using var resp = await Http.PostAsync(AjaxUrl, new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["action"] = "get_nonce"
+        })).ConfigureAwait(false);
+        resp.EnsureSuccessStatusCode();
+        var json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("nonce", out var nonceEl))
+            throw new InvalidOperationException($"get_nonce didn't return a nonce: {json}");
+        return nonceEl.GetString()
+            ?? throw new InvalidOperationException($"get_nonce returned a null nonce: {json}");
+    }
+
+    // Discovers every catalog code prhcomics.com currently has a monthly
+    // catalog for, by walking its own public archive listing
+    // (catalog/category/monthly-catalogs/, paginated at /page/N) instead
+    // of guessing a date range - added 2026-11-26 for
+    // FetchAllAvailablePrhCatalogsFromWebsite below, after the store
+    // asked for every available month, not just one at a time. Confirmed
+    // live this archive currently runs from 2021-06 (when PRH's own
+    // comics distribution began) through whichever month is newest right
+    // now, and that walking past the real last page returns a genuine
+    // HTTP 404 - that's the real stopping signal used here, with a
+    // "no new codes on this page" check as a backup in case that ever
+    // changes. Every page also repeats one extra link to whatever month
+    // is currently open for ordering, regardless of which page you're
+    // on - the HashSet naturally drops that repeat once it's already
+    // been seen. Plain GETs, no cookies needed, same as the rest of this
+    // class - this archive page showed no sign of Cloudflare/bot
+    // detection in testing, same as everything else prhcomics.com-side.
+    public static async Task<List<string>> DiscoverAvailableCatalogCodesAsync(Action<string>? onProgress)
+    {
+        var codes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var codeRegex = new Regex(@"catalogCode=(\d{4}-\d{2})", RegexOptions.IgnoreCase);
+
+        // Generous safety cap - the real archive was 6 pages deep when
+        // this was tested (2021-06 through 2026-12), so this leaves
+        // roughly 8x headroom rather than relying solely on the 404/
+        // no-new-codes checks below to stop the walk.
+        for (var page = 1; page <= 50; page++)
+        {
+            var url = page == 1
+                ? "https://prhcomics.com/catalog/category/monthly-catalogs/"
+                : $"https://prhcomics.com/catalog/category/monthly-catalogs/page/{page}";
+
+            onProgress?.Invoke($"Reading prhcomics.com's catalog archive (page {page})...");
+            using var resp = await Http.GetAsync(url).ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode)
+                break; // past the real last page - confirmed live this is a genuine 404, not an empty 200.
+
+            var html = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+            var before = codes.Count;
+            foreach (Match m in codeRegex.Matches(html))
+                codes.Add(m.Groups[1].Value);
+
+            if (codes.Count == before)
+                break; // a real page with nothing new on it - treat as the end too, just in case 404 detection ever changes.
+        }
+
+        var sorted = codes.ToList();
+        sorted.Sort(StringComparer.OrdinalIgnoreCase); // "YYYY-MM" text-sorts chronologically.
+        return sorted;
+    }
+
+    // Plain, public, unauthenticated per-barcode cover image lookup - see
+    // AutoFetchService.BackfillCoversFromPrhImageCdn's own doc comment for
+    // how this was found (it's the same CDN prhcomics.com's own
+    // product-grid thumbnails load from - nothing docgen-specific). Returns
+    // the raw image bytes for ANY successful response, including PRH's own
+    // "nothing on file for this code yet" stock graphic - the caller is the
+    // one that knows about PlaceholderImageRegistry and decides what a
+    // given hash means; this method just fetches bytes. Returns null only
+    // on an outright HTTP failure - this endpoint answers HTTP 200, never a
+    // 404, even for a completely made-up code (confirmed live), so null
+    // here means a real network/transport problem, not "no cover."
+    public static async Task<byte[]?> DownloadCoverBytesAsync(string barcode)
+    {
+        var url = $"https://images.penguinrandomhouse.com/cover/{Uri.EscapeDataString(barcode)}";
+        using var resp = await Http.GetAsync(url).ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode) return null;
+        return await resp.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+    }
+
+    // Finds `'key': '....'` exactly as it appears in the page's own
+    // inline <script> text and returns the quoted value, unescaped.
+    // Every value captured this way is pure base64/URL text with no
+    // embedded quotes, so a plain indexOf-to-next-"'," scan is reliable
+    // - confirmed live against the real page before this was written
+    // (see the class comment above).
+    private static string? ExtractLiteral(string html, string key)
+    {
+        var marker = $"'{key}': '";
+        var start = html.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0) return null;
+        start += marker.Length;
+        var end = html.IndexOf("',", start, StringComparison.Ordinal);
+        return end < 0 ? null : html.Substring(start, end - start);
     }
 }
