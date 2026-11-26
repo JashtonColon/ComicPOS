@@ -190,6 +190,19 @@
              Vine match needed at all, since the barcode IS the lookup key. -->
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunBackfillPrhCovers" title="Looks up every cover with nothing on file yet whose barcode is a real ISBN-13 or a full UPC+addon - PRH's own catalog-wide barcode shapes - directly against PRH's own public cover-image service. No Comic Vine match needed; a barcode with nothing on file there is just left blank.">Backfill PRH/ISBN Covers</button>
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunBackfillPrhCoversTest" title="Same as Backfill PRH/ISBN Covers, but stops after 5 covers - use this first to confirm it's finding the right images before running it against everything.">Backfill PRH/ISBN Covers (Test 5)</button>
+        <!-- Added 2026-11-26 - see AutoFetchService.
+             BackfillCoverVariantsFromPrhBookPages's own doc comment.
+             Different from the two PRH buttons above: those only ever
+             touch a cover's IMAGE (BackfillCoversFromPrhImageCdn) once a
+             Cover row already exists for it. This one finds covers that
+             don't exist in this app's database AT ALL YET - a real Cover
+             B/C/D/etc. PRH has on file for an issue that currently only
+             shows "Cover A" here - by reading each issue's own
+             prhcomics.com product page, and gives each one its own real,
+             distinct barcode (not Bug #16's derived "{barcode}#{letter}"
+             placeholder). -->
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunBackfillPrhCoverVariants" title="Visits each issue's own prhcomics.com product page (using whichever cover's barcode is already on file) and reads its 'Additional covers' section - adds a real Cover row, with its own real barcode, for any sibling cover this app doesn't have on file yet, and upgrades a derived/placeholder barcode to the real one where it finds a match. An issue with nothing more listed there is left untouched.">Backfill PRH Cover Variants</button>
+        <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunBackfillPrhCoverVariantsTest" title="Same as Backfill PRH Cover Variants, but stops after 5 issues - use this first to confirm it's finding real variants before running it against everything.">Backfill PRH Cover Variants (Test 5)</button>
     </div>
 </div>
 
@@ -1094,6 +1107,130 @@ else
             var summary = $"Test run: found {result.CoversBackfilled} cover(s) via PRH's image CDN.";
             if (result.Errors.Count > 0)
                 summary += " Some covers had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Added 2026-11-26 - see AutoFetchService.
+    // BackfillCoverVariantsFromPrhBookPages's own doc comment. Not
+    // confirm-gated - same spirit as the other backfill buttons on this
+    // page: this only ever ADDS a cover that didn't exist before, or
+    // upgrades an already-derived/placeholder barcode to a real one,
+    // never deletes or changes anything else.
+    // Bug #11-style fix (2026-11-26): this previously ran directly against
+    // AutoFetch below (the page's own circuit-scoped instance) - the same
+    // risk RunBackfillAllLunarHistory hit on a real run (see that
+    // method's own comment further down): a long enough gap in this
+    // tab's SignalR circuit (sleep, a flaky network, the tab being
+    // closed) disposes everything scoped to it, including the DbContext
+    // this would still be running SaveChanges against on a background
+    // thread. This scan walks every PRH-shaped-barcode issue in the
+    // catalog, one HTTP request (now paced 300ms apart) at a time -
+    // easily a multi-hour run - so it gets its own independent DI scope
+    // too, same pattern as that fix. Note this does NOT help a run that
+    // was already started before this fix was built and deployed - only
+    // a run started after this rebuild gets the protection.
+    private async Task RunBackfillPrhCoverVariants()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Checking each issue's own prhcomics.com product page for additional cover variants...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() =>
+            {
+                // Deliberately not AutoFetch (the page's circuit-scoped
+                // instance) - see this method's own comment above.
+                using var scope = ScopeFactory.CreateScope();
+                var scopedAutoFetch = scope.ServiceProvider.GetRequiredService<IAutoFetchService>();
+                return scopedAutoFetch.BackfillCoverVariantsFromPrhBookPages(progressLine =>
+                {
+                    InvokeAsync(() =>
+                    {
+                        _status = progressLine;
+                        StateHasChanged();
+                    });
+                });
+            });
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Backfill PRH cover variants failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Found {result.CoverVariantsAdded} new cover(s) and upgraded {result.CoversBackfilled} existing barcode(s) via PRH's own book pages.";
+            if (result.Errors.Count > 0)
+                summary += " Some issues had errors: " + string.Join("; ", result.Errors.Take(10));
+            _resultMessage = summary;
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Same as RunBackfillPrhCoverVariants above, just capped at 5 issues -
+    // a quick way to confirm this is finding real variants before
+    // committing to the full catalog.
+    private async Task RunBackfillPrhCoverVariantsTest()
+    {
+        if (_checking) return;
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Test run (5 issues) - checking prhcomics.com product pages for additional cover variants...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() =>
+            {
+                // Same own-DI-scope fix as RunBackfillPrhCoverVariants
+                // above - cheap insurance even on a 5-issue test run.
+                using var scope = ScopeFactory.CreateScope();
+                var scopedAutoFetch = scope.ServiceProvider.GetRequiredService<IAutoFetchService>();
+                return scopedAutoFetch.BackfillCoverVariantsFromPrhBookPages(progressLine =>
+                {
+                    InvokeAsync(() =>
+                    {
+                        _status = progressLine;
+                        StateHasChanged();
+                    });
+                }, limit: 5);
+            });
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Backfill PRH cover variants test run failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Test run: found {result.CoverVariantsAdded} new cover(s), upgraded {result.CoversBackfilled} existing barcode(s) via PRH's own book pages.";
+            if (result.Errors.Count > 0)
+                summary += " Some issues had errors: " + string.Join("; ", result.Errors.Take(10));
             _resultMessage = summary;
             _resultTrace = result.Trace;
         }
