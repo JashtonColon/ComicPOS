@@ -51,7 +51,14 @@ public class WorkerService : IWorkerService
         var worker = _db.Workers.Find(workerId);
         if (worker == null) return;
 
-        worker.Pin = pin.Trim();
+        var trimmedPin = pin.Trim();
+        if (trimmedPin.Length == 0)
+            throw new InvalidOperationException("Enter a PIN.");
+        // Same one-PIN-one-worker rule as AddWorker, ignoring this worker's own row.
+        if (_db.Workers.Any(w => w.Id != workerId && w.IsActive && w.Pin == trimmedPin))
+            throw new InvalidOperationException("Another active worker already uses that PIN. Pick a different one.");
+
+        worker.Pin = trimmedPin;
         _db.SaveChanges();
     }
 
