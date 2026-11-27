@@ -33,6 +33,20 @@
             <option value="@TypeFilterSingle">Single Issues</option>
             <option value="@TypeFilterCollected">Collected Editions</option>
         </select>
+        <!-- Added 2026-11-27 - the store's own "one button that gets
+             both [Lunar and PRH], all the way back to when they first
+             started doing solicits" request. Chains BackfillAllLunarHistory
+             + FetchAllAvailablePrhCatalogsFromWebsite + a PRH cover-variant
+             catch-up pass into one combined run - see
+             AutoFetchService.FetchAllHistoryBothDistributors's own doc
+             comment for why running them in this fixed order also handles
+             "duplicates between the two distributors" for free (whichever
+             source reaches a series name first keeps it; the other
+             source's issues attach to that same row). This is the single
+             longest-running button on this page - potentially hours, not
+             minutes - so the confirm() below says so plainly. Only ever
+             adds/updates inventory; nothing is deleted. -->
+        <button class="btn-primary btn-sm" disabled="@_checking" @onclick="RunFetchAllHistoryBothDistributors" title="Runs Backfill All Lunar History, then Fetch All Available PRH Catalogs, then retries any PRH cover-variant checks that did not finish (e.g. a Wi-Fi drop), one after another, as one combined operation - everything both distributors have, back to the start of each one's own available history. Can take a long time (potentially hours). Only ever adds/updates inventory; nothing is deleted.">Fetch Everything (Lunar + PRH, Full History)</button>
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRescan">Re-scan Existing</button>
         <!-- Metron is now the primary discovery source (2026-11-22),
              replacing LOCG in that role - a plain token-authenticated
@@ -225,20 +239,33 @@
 
 @if (_showMonthTabs)
 {
-    @* Was a flat row of one pill per distinct month - fine with a handful
-       of months, but the Lunar backfill now spans roughly a year back and
-       a year-plus forward (see AutoFetchService.BackfillAllLunarHistory),
-       so this could grow to 20-30+ pills wrapping across several lines.
-       User feedback 2026-11-24: "too many months available... make it a
-       better selection option." A dropdown scales to any number of months
-       without the layout falling apart, same pattern as the sort/type
-       selects right above. *@
+    @* Was a flat row of one pill per distinct month, then one dropdown
+       listing every "Month Year" combo (2026-11-24: "too many months
+       available... make it a better selection option"). Removing
+       GetNewBooks' +/-3-month cap (2026-11-26, see AutoFetchService.
+       GetNewBooks's own doc comment) immediately grew that one dropdown
+       to 70+ entries spanning 2021-2027. Same-day follow-up: "make the
+       selection where you just choose a month then a year [so] only
+       around 16 options not 70." Two short dropdowns (12 month names +
+       however many distinct years _monthTabs actually has) replace the
+       one long one. Picking BOTH still produces the exact same
+       "Month Year" string SelectMonth always expected, so none of this
+       page's filtering/week-pill logic below needed to change - only
+       one (or neither) picked just falls back to "All months", same as
+       before. *@
     <div class="toolbar" style="margin-top:-8px">
-        <select value="@(_selectedMonthLabel ?? "")" @onchange="@(e => SelectMonth(string.IsNullOrEmpty(e.Value?.ToString()) ? null : e.Value!.ToString()))">
+        <select value="@SelectedMonthNamePart" @onchange="@(e => OnMonthNameChanged(e.Value?.ToString()))">
             <option value="">All months</option>
-            @foreach (var month in _monthTabs)
+            @foreach (var monthName in MonthNameOptions)
             {
-                <option value="@month">@month</option>
+                <option value="@monthName">@monthName</option>
+            }
+        </select>
+        <select value="@SelectedYearPart" @onchange="@(e => OnYearChanged(e.Value?.ToString()))">
+            <option value="">All years</option>
+            @foreach (var year in AvailableYears)
+            {
+                <option value="@year">@year</option>
             }
         </select>
         @if (_selectedMonthLabel != _currentMonthLabel && _monthTabs.Contains(_currentMonthLabel))
@@ -438,6 +465,51 @@ else
         _currentPage = 1;
         RefreshGrid();
     }
+
+    private static readonly string[] MonthNameOptions =
+    {
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    };
+
+    // The two dropdowns' own displayed values, parsed back out of
+    // _selectedMonthLabel (the one "Month Year" string everything else on
+    // this page already keys off - SelectMonth, the filtering above, the
+    // week pills) instead of tracked as separate fields, so there's only
+    // ever one source of truth and nothing can drift out of sync with it
+    // (e.g. right after "Jump to current month" changes _selectedMonthLabel
+    // directly, without going through either dropdown at all).
+    private string SelectedMonthNamePart =>
+        string.IsNullOrEmpty(_selectedMonthLabel) ? "" : _selectedMonthLabel.Split(' ', 2)[0];
+
+    private string SelectedYearPart =>
+        !string.IsNullOrEmpty(_selectedMonthLabel) && _selectedMonthLabel.Split(' ', 2).Length == 2
+            ? _selectedMonthLabel.Split(' ', 2)[1]
+            : "";
+
+    // Only the years _monthTabs actually has an entry for, so the Year
+    // dropdown always matches whichever sort (Release date vs FOC date) is
+    // active right now, same as _monthTabs itself.
+    private List<string> AvailableYears =>
+        _monthTabs
+            .Select(label => label.Split(' ', 2))
+            .Where(parts => parts.Length == 2 && int.TryParse(parts[1], out _))
+            .Select(parts => parts[1])
+            .Distinct()
+            .OrderBy(year => year)
+            .ToList();
+
+    private Task OnMonthNameChanged(string? monthName) =>
+        ApplyMonthYear(string.IsNullOrEmpty(monthName) ? null : monthName, string.IsNullOrEmpty(SelectedYearPart) ? null : SelectedYearPart);
+
+    private Task OnYearChanged(string? year) =>
+        ApplyMonthYear(string.IsNullOrEmpty(SelectedMonthNamePart) ? null : SelectedMonthNamePart, string.IsNullOrEmpty(year) ? null : year);
+
+    // Needs BOTH a month name and a year before there's anything specific
+    // to filter to - picking just one (the other still "All") falls back
+    // to "All months", same as picking "All months" directly always has.
+    private Task ApplyMonthYear(string? monthName, string? year) =>
+        SelectMonth(monthName != null && year != null ? $"{monthName} {year}" : null);
 
     private async Task SelectMonth(string? label)
     {
@@ -1746,6 +1818,71 @@ else
             _resultMessage = result.Added.Count == 0
                 ? (result.Errors.FirstOrDefault() ?? "Nothing generated.")
                 : result.Added[0];
+            _resultTrace = result.Trace;
+        }
+
+        RefreshGrid();
+    }
+
+    // Added 2026-11-27 - see AutoFetchService.
+    // FetchAllHistoryBothDistributors's own doc comment for the full
+    // reasoning. Same own-DI-scope pattern as RunBackfillAllLunarHistory/
+    // RunFetchAllPrhCatalogs below (this can run far longer than either
+    // of those alone, long enough that the tab's circuit dropping before
+    // it finishes would otherwise dispose the DbContext it's still
+    // saving against on a background thread) - confirm-gated with an
+    // explicit warning that this is the single longest-running button on
+    // the page.
+    private async Task RunFetchAllHistoryBothDistributors()
+    {
+        if (_checking) return;
+
+        var confirmed = await JS.InvokeAsync<bool>("confirm",
+            "This runs Backfill All Lunar History, then Fetch All Available PRH Catalogs, then retries any PRH cover-variant checks that did not finish, one after another - everything both distributors have, back to the start of each one's own available history. This is the single longest-running operation on this page and can take a long time (potentially hours). It only ever adds/updates inventory; nothing is deleted.\n\nContinue?");
+        if (!confirmed) return;
+
+        _checking = true;
+        _resultMessage = null;
+        _resultTrace = null;
+        _status = "Starting combined Lunar + PRH full-history fetch (step 1 of 3)...";
+
+        AutoFetchResult? result = null;
+        Exception? error = null;
+        try
+        {
+            result = await Task.Run(() =>
+            {
+                // Deliberately not AutoFetch (the page's circuit-scoped
+                // instance) - see this method's own comment above.
+                using var scope = ScopeFactory.CreateScope();
+                var scopedAutoFetch = scope.ServiceProvider.GetRequiredService<IAutoFetchService>();
+                return scopedAutoFetch.FetchAllHistoryBothDistributors(progressLine =>
+                {
+                    InvokeAsync(() =>
+                    {
+                        _status = progressLine;
+                        StateHasChanged();
+                    });
+                });
+            });
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+
+        _checking = false;
+
+        if (error != null)
+        {
+            _resultMessage = $"Combined Lunar + PRH full-history fetch failed: {error.Message}";
+        }
+        else if (result != null)
+        {
+            var summary = $"Fetched everything: {result.NewIssuesAdded} new issue(s) and {result.CoverVariantsAdded} new cover variant(s) added across both distributors' full history.";
+            if (result.Errors.Count > 0)
+                summary += $" {result.Errors.Count} row(s) had issues (see details below).";
+            _resultMessage = summary;
             _resultTrace = result.Trace;
         }
 

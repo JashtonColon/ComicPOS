@@ -51,7 +51,14 @@ public class WorkerService : IWorkerService
         var worker = _db.Workers.Find(workerId);
         if (worker == null) return;
 
-        worker.Pin = pin.Trim();
+        var trimmedPin = pin.Trim();
+        if (trimmedPin.Length == 0)
+            throw new InvalidOperationException("Enter a PIN.");
+        // Same one-PIN-one-worker rule as AddWorker, ignoring this worker's own row.
+        if (_db.Workers.Any(w => w.Id != workerId && w.IsActive && w.Pin == trimmedPin))
+            throw new InvalidOperationException("Another active worker already uses that PIN. Pick a different one.");
+
+        worker.Pin = trimmedPin;
         _db.SaveChanges();
     }
 
@@ -61,5 +68,20 @@ public class WorkerService : IWorkerService
         if (worker == null || !worker.IsActive) return null;
 
         return worker.Pin == pin.Trim() ? worker : null;
+    }
+
+    // See IWorkerService's own doc comment for the full chicken-and-egg
+    // story this fixes. Deliberately checks for ANY row at all (not just
+    // active ones) - a store that has deliberately deactivated every
+    // worker it has is a different, intentional situation and shouldn't
+    // get a surprise worker re-seeded; a table with zero rows ever is
+    // specifically "brand new install" or "just reset," which is the one
+    // case this exists for.
+    public void EnsureDefaultWorkerExists()
+    {
+        if (_db.Workers.Any()) return;
+
+        _db.Workers.Add(new Worker { Name = "Admin", Pin = "9876", IsActive = true });
+        _db.SaveChanges();
     }
 }

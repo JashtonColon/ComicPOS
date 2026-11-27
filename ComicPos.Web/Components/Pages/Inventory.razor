@@ -40,7 +40,26 @@
 @if (_level == 3)
 {
     <p class="help-text">Edit a field and click away to save. Set the real barcode here when a book from New Books arrives.</p>
-    <p class="help-text">@_holdsLabel</p>
+    @if (_holds.Count == 0)
+    {
+        <p class="help-text">No outstanding holds on this issue.</p>
+    }
+    else
+    {
+        <div class="list-rows" style="margin-bottom:14px">
+            @foreach (var h in _holds)
+            {
+                <div class="list-row">
+                    <div class="list-row-main">
+                        <span class="list-row-title">Held for @h.Customer.Name</span>
+                        <span class="help-text" style="margin-left:8px">x@(h.Quantity), cover @h.CoverLetter, since @h.CreatedAt.ToString("MMM d")@(string.IsNullOrWhiteSpace(h.Notes) ? "" : $" - {h.Notes}")</span>
+                    </div>
+                    <button class="btn-primary btn-sm" @onclick="@(() => FulfillHold(h.Id))">Picked up</button>
+                    <button class="btn-ghost btn-sm" @onclick="@(() => CancelHold(h.Id))">Cancel hold</button>
+                </div>
+            }
+        </div>
+    }
 }
 
 @if (_level == 0)
@@ -166,7 +185,7 @@ else if (_level == 3)
     private List<Series> _seriesRows = new();
     private List<Issue> _issueRows = new();
     private List<CoverRow> _coverRows = new();
-    private string _holdsLabel = "";
+    private List<IssueHold> _holds = new();
     private string? _saveError;
 
     private bool _showAddItem;
@@ -280,16 +299,26 @@ else if (_level == 3)
                 CoverArtist = c.CoverArtist ?? ""
             }).ToList();
 
-        RefreshHoldsLabel();
+        RefreshHolds();
     }
 
-    private void RefreshHoldsLabel()
+    private void RefreshHolds()
     {
-        if (_issueId == null) { _holdsLabel = ""; return; }
-        var holds = IssueHolds.GetOutstandingForIssue(_issueId.Value);
-        _holdsLabel = holds.Count == 0
-            ? "No outstanding holds on this issue."
-            : "Held for: " + string.Join(", ", holds.Select(h => $"{h.Customer.Name} (x{h.Quantity}, cover {h.CoverLetter})"));
+        _holds = _issueId == null ? new() : IssueHolds.GetOutstandingForIssue(_issueId.Value);
+    }
+
+    // Soft-closes the hold (kept in history, see IssueHold) and drops it
+    // from this list, since GetOutstandingForIssue skips closed holds.
+    private void FulfillHold(int holdId)
+    {
+        IssueHolds.FulfillHold(holdId);
+        RefreshHolds();
+    }
+
+    private void CancelHold(int holdId)
+    {
+        IssueHolds.CancelHold(holdId);
+        RefreshHolds();
     }
 
     private void GoBack()
@@ -340,7 +369,7 @@ else if (_level == 3)
         if (_issueId == null) return;
         IssueHolds.CreateHold(result.CustomerId, _issueId.Value, result.CoverLetter, result.Quantity, result.Notes);
         _showHold = false;
-        RefreshHoldsLabel();
+        RefreshHolds();
     }
 
     private void OpenZoom(int coverId) => _zoomSrc = $"/api/cover-image/{coverId}";

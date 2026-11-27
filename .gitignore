@@ -487,3 +487,12 @@ comic_pos.db
 
 # Check Now debug trace (see DebugLog.cs) - regenerated every run
 checknow-debug.txt
+
+# Editing backups and one-off patch scripts from assistant sessions
+*.bak
+*.bak[0-9]*
+_fix_*.py
+ComicPos.Data/*.py
+
+# graphify knowledge-graph output (regenerated with /graphify)
+graphify-out/

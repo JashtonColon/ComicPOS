@@ -116,6 +116,43 @@ public class CheckoutService : ICheckoutService
         {
             _customers.AdjustStoreCredit(sale.CustomerId.Value, -sale.StoreCreditUsed, "Used on sale", sale.Id);
         }
+
+        if (sale.CustomerId.HasValue)
+            FulfillMatchingHolds(sale);
+    }
+
+    // The customer buying the exact issue + cover they had held IS the
+    // pickup, so close those holds instead of leaving them "outstanding"
+    // forever. Exact cover letter only: a hold for Cover A isn't picked up
+    // by buying Cover B - staff can still close that one by hand from
+    // Inventory. Oldest hold first; a hold is closed only once enough
+    // copies were bought to cover its whole quantity.
+    // shortcut: voiding the sale does not reopen these holds, add that to VoidSale if it comes up.
+    private void FulfillMatchingHolds(Sale sale)
+    {
+        var customerId = sale.CustomerId!.Value;
+        var changed = false;
+        foreach (var group in sale.Lines.GroupBy(l => (l.Cover.IssueId, Letter: l.Cover.CoverLetter.Trim().ToUpperInvariant())))
+        {
+            var remaining = group.Sum(l => l.Quantity);
+            var holds = _db.IssueHolds
+                .Where(h => h.CustomerId == customerId && h.IssueId == group.Key.IssueId
+                            && h.CoverLetter == group.Key.Letter && !h.IsFulfilled && !h.IsCancelled)
+                .OrderBy(h => h.CreatedAt)
+                .ToList();
+            foreach (var hold in holds)
+            {
+                if (remaining < hold.Quantity) break;
+                remaining -= hold.Quantity;
+                hold.IsFulfilled = true;
+                hold.FulfilledAt = DateTime.Now;
+                changed = true;
+            }
+        }
+        // The sale is already saved; a failure here must not look like a failed sale.
+        if (!changed) return;
+        try { _db.SaveChanges(); }
+        catch { _db.ChangeTracker.Clear(); }
     }
 
     public List<string> GetLowStockWarnings(Sale sale)

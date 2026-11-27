@@ -38,6 +38,8 @@ public class DashboardService : IDashboardService
             .ToList();
     }
 
+    private const int MaxLowStockRows = 50;
+
     public List<LowStockEntry> GetLowStock(int threshold)
     {
         // Every issue AutoFetchService discovers (up to ~10 months ahead
@@ -47,12 +49,23 @@ public class DashboardService : IDashboardService
         // not-yet-released covers all satisfy "<= threshold" and flood
         // this list, burying the actual problem (something that sold out)
         // under books nobody could possibly have restocked yet.
+        //
+        // Second filter (2026-11-27): after the full-history Lunar/PRH
+        // backfill, every one of ~27,000 catalog covers sat at stock 0, so
+        // "<= threshold" matched ALL of them and the Dashboard rendered a
+        // 27,000-row table (seconds of lag on every Stats View toggle). A
+        // cover the shop never stocked isn't "running low" - so only count
+        // covers that still have 1..threshold copies, or that sold down
+        // to it (has at least one sale). Capped at MaxLowStockRows so a
+        // flood can never freeze the page again.
         var today = DateOnly.FromDateTime(DateTime.Today);
 
         return _db.Covers
-            .Include(c => c.Issue).ThenInclude(i => i.Series)
             .Where(c => c.StockQuantity <= threshold && c.Issue.ReleaseDate != null && c.Issue.ReleaseDate <= today)
-            .ToList()
+            .Where(c => c.StockQuantity > 0 || _db.SaleLines.Any(l => l.CoverId == c.Id))
+            .OrderBy(c => c.StockQuantity)
+            .ThenBy(c => c.Issue.Series.Name)
+            .Take(MaxLowStockRows)
             .Select(c => new LowStockEntry
             {
                 SeriesName = c.Issue.Series.Name,
@@ -61,8 +74,6 @@ public class DashboardService : IDashboardService
                 CoverLetter = c.CoverLetter,
                 StockQuantity = c.StockQuantity
             })
-            .OrderBy(e => e.StockQuantity)
-            .ThenBy(e => e.SeriesName)
             .ToList();
     }
 

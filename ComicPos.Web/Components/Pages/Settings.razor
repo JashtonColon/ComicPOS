@@ -171,8 +171,23 @@
                         <span class="help-text" style="margin-left:8px">(inactive)</span>
                     }
                 </div>
+                @if (_pinEditWorkerId == w.Id)
+                {
+                    <input type="text" inputmode="numeric" maxlength="8" placeholder="New PIN" aria-label="New PIN for @w.Name" style="width:100px"
+                           value="@_pinEditValue" @oninput="e => _pinEditValue = e.Value?.ToString() ?? string.Empty" />
+                    <button class="btn-primary btn-sm" @onclick="SavePin">Save</button>
+                    <button class="btn-ghost btn-sm" @onclick="CancelPinEdit">Cancel</button>
+                }
+                else
+                {
+                    <button class="btn-ghost btn-sm" @onclick="@(() => StartPinEdit(w))">Change PIN</button>
+                }
                 <button class="btn-ghost btn-sm" @onclick="@(() => ToggleWorkerActive(w))">@(w.IsActive ? "Deactivate" : "Reactivate")</button>
             </div>
+            @if (_pinEditWorkerId == w.Id && _pinError != null)
+            {
+                <p class="error-text">@_pinError</p>
+            }
         }
         @if (_workers.Count == 0)
         {
@@ -423,6 +438,43 @@
         _workers = WorkerService.GetAllWorkers();
         _newWorkerName = "";
         _newWorkerPin = "";
+    }
+
+    // Inline "Change PIN" on one worker row at a time. Matters most for the
+    // seeded Admin/9876 worker (WorkerService.EnsureDefaultWorkerExists),
+    // whose PIN anyone reading the code knows.
+    private int? _pinEditWorkerId;
+    private string _pinEditValue = "";
+    private string? _pinError;
+
+    private void StartPinEdit(Worker w)
+    {
+        _pinEditWorkerId = w.Id;
+        _pinEditValue = "";
+        _pinError = null;
+    }
+
+    private void CancelPinEdit()
+    {
+        _pinEditWorkerId = null;
+        _pinError = null;
+    }
+
+    private void SavePin()
+    {
+        if (_pinEditWorkerId == null) return;
+        try
+        {
+            WorkerService.UpdatePin(_pinEditWorkerId.Value, _pinEditValue);
+        }
+        catch (InvalidOperationException ex)
+        {
+            // Blank or duplicate PIN - see WorkerService.UpdatePin.
+            _pinError = ex.Message;
+            return;
+        }
+        _workers = WorkerService.GetAllWorkers();
+        CancelPinEdit();
     }
 
     private void RunBackup()
