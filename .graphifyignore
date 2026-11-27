@@ -1,0 +1,17 @@
+# Extra exclusions for graphify (it also reads .gitignore).
+# Images cost a vision pass each and add nothing to the code graph
+# (2026-11-27: ~89K of a 154K-token build was the logo + placeholder SVG).
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.ico
+*.webp
+
+# Generated EF migration snapshots: huge, repetitive, no design information.
+ComicPos.Data/Migrations/*.Designer.cs
+ComicPos.Data/Migrations/ComicDbContextModelSnapshot.cs
+
+# Throwaway console project.
+ComicPos.Scratch/
