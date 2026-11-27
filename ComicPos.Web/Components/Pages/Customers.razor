@@ -4,6 +4,7 @@
 @inject ICustomerService CustomersService
 @inject ISalesHistoryService History
 @inject IPullListService PullLists
+@inject IIssueHoldService IssueHolds
 @inject IInventoryService Inventory
 @inject ICheckoutService Checkout
 @rendermode InteractiveServer
@@ -63,6 +64,32 @@ else if (_screen == Screen.Detail && _selectedCustomer != null)
         <button class="btn-ghost btn-sm" @onclick="@(() => GoToPullList())">Pull List</button>
         <button class="btn-ghost btn-sm" @onclick="OpenStoreCredit">Store Credit</button>
         <button class="btn-ghost btn-sm" @onclick="ToggleActive">@(_selectedCustomer.IsActive ? "Deactivate" : "Activate")</button>
+    </div>
+
+    @* Holds used to be visible only from each issue's Inventory screen,
+       so there was no way to see everything set aside for one customer. *@
+    <div class="panel" style="margin-top:16px">
+        <p class="list-row-title" style="margin-bottom:10px">Holds</p>
+        @if (_holds.Count == 0)
+        {
+            <p class="help-text">Nothing on hold for this customer.</p>
+        }
+        else
+        {
+            <div class="list-rows">
+                @foreach (var h in _holds)
+                {
+                    <div class="list-row">
+                        <div class="list-row-main">
+                            <span class="list-row-title">@h.Issue.Series.Name #@h.Issue.IssueNumber.ToString("0.##")</span>
+                            <span class="list-row-sub">x@(h.Quantity), cover @h.CoverLetter, since @h.CreatedAt.ToString("MMM d")@(string.IsNullOrWhiteSpace(h.Notes) ? "" : $" - {h.Notes}")</span>
+                        </div>
+                        <button class="btn-primary btn-sm" @onclick="@(() => FulfillHold(h.Id))">Picked up</button>
+                        <button class="btn-ghost btn-sm" @onclick="@(() => CancelHold(h.Id))">Cancel hold</button>
+                    </div>
+                }
+            </div>
+        }
     </div>
 }
 else if (_screen == Screen.StoreCredit && _selectedCustomer != null)
@@ -366,6 +393,29 @@ else if (_screen == Screen.PullList && _selectedCustomer != null)
         if (_selectedCustomer == null) { LoadList(); return; }
         _screen = Screen.Detail;
         _storeCreditBalance = CustomersService.GetStoreCreditBalance(_selectedCustomer.Id);
+        RefreshHolds();
+    }
+
+    private List<IssueHold> _holds = new();
+
+    // GetForCustomer returns every hold ever made; only open ones belong here.
+    private void RefreshHolds()
+    {
+        _holds = _selectedCustomer == null
+            ? new()
+            : IssueHolds.GetForCustomer(_selectedCustomer.Id).Where(h => !h.IsFulfilled && !h.IsCancelled).ToList();
+    }
+
+    private void FulfillHold(int holdId)
+    {
+        IssueHolds.FulfillHold(holdId);
+        RefreshHolds();
+    }
+
+    private void CancelHold(int holdId)
+    {
+        IssueHolds.CancelHold(holdId);
+        RefreshHolds();
     }
 
     private void OpenStoreCredit()

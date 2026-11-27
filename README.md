@@ -10,12 +10,18 @@ dashboard, and database backups.
 1. Open `ComicPos.slnx` in Visual Studio, or from a terminal in this folder:
    ```
    dotnet build ComicPos.slnx
-   dotnet run --project ComicPos.App
+   dotnet run --project ComicPos.Web
    ```
+   then open the address it prints in a browser. `ComicPos.Web` (Blazor) is
+   the actively developed app. `ComicPos.App` (WinForms) still builds and
+   runs against the same database, but gets no new features.
 2. That's it. The database is created automatically the first time the app
    runs (in `%LOCALAPPDATA%\ComicPos\comic_pos.db`), and any future schema
    updates are applied automatically on startup too — there's nothing to
    run by hand.
+3. First login: on a brand-new (or reset) database the app creates one
+   worker, **Admin**, PIN **9876**. Change that PIN right away in
+   **Settings → Workers → Change PIN**, then add your real staff.
 
 ## Day one: getting comics into the system
 
@@ -43,20 +49,34 @@ price and stock quantity and save.
   and click **Remove Selected Item** / press Delete to take it out. Sales
   tax comes from the rate set in **Settings**. After completing a sale you
   can print the receipt to any Windows printer.
-- **Customers** — search or add customers, view their purchase history, and
-  manage their pull list (the comics they get set aside every week).
+- **Customers** — search or add customers, view their purchase history,
+  manage their pull list (the comics they get set aside every week), and see
+  their open **holds** (one-off copies set aside) with Picked up / Cancel.
+- **Holds** — from an issue's screen in **Inventory**, click **Hold** to set
+  a copy aside for a customer. Ringing that customer up for the same issue
+  and cover at Checkout closes the hold automatically; voiding that sale
+  reopens it.
 - **History** — browse all past sales by series/issue. Made a mistake on a
   sale? Open it and click **Void Sale** — it restores the stock and marks
   the sale voided (it's kept for the record, not deleted).
 - **Dashboard** — today/week/month revenue, top sellers, and low-stock
   items at a glance.
-- **New Books** — checks Comic Vine automatically once a week (and on
-  startup if a week has passed) for new #1 launches and new issues of
-  ongoing series from the publishers you track in **Settings**, so you
-  don't have to manually search for what's new. Click **Check Now** to
-  run it on demand. Matches get added straight into inventory (as
-  not-yet-received, zero-stock items) ready for the receiving workflow
-  below.
+- **New Books** — pulls solicitations straight from the two distributors,
+  with no files to download by hand:
+  - **Lunar Distribution** (DC and others): **Fetch Lunar Release** for
+    this week, or **Backfill All Lunar History** for everything back to
+    Lunar's 2020 launch. Cover images come embedded in Lunar's files.
+  - **Penguin Random House** (Marvel, IDW and others): **Fetch PRH
+    Catalog** for one month, or **Fetch All Available PRH Catalogs**.
+    Each import also reads PRH's own book pages for variant covers
+    (Variant B, RI 1:10 incentives, artist variants) and pulls cover art
+    from PRH's image server.
+  - **Fetch Everything** runs all of the above in order. It can take
+    hours; a Wi-Fi drop stops it cleanly and says what to re-run.
+
+  Everything found is added to inventory as not-yet-received, zero-stock
+  items, ready for the receiving workflow above. The older weekly Comic
+  Vine / Metron checks are still there as fallbacks.
 - **FOC Report** — before each Final Order Cutoff date, open this tab,
   generate the report, and either read it on screen or click **Send Email
   to Admin** to email a subscriber-by-subscriber buy list (set up the SMTP

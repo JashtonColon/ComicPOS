@@ -45,13 +45,12 @@ public class ComicListEntry
     // instead of needing AutoFetchService's later Comic Vine backfill pass.
     public string? CoverImageUrl { get; set; }
 
-    // An already-on-disk cover image file - only ever set by
-    // AutoFetchService.ImportLunarDistributionRelease, since that source
-    // extracts a real cover photo straight out of the workbook itself
-    // (no URL at all, nothing to download). Checked BEFORE CoverImageUrl
-    // in BuildCoversFromEntry - see that method - so this never pays for
-    // a pointless network round-trip for an image that's already saved.
-    public string? CoverImageLocalPath { get; set; }
+    // The cover photo embedded in a Lunar Distribution workbook (no URL,
+    // nothing to download). Kept in memory and written to disk only if this
+    // entry really becomes a NEW cover - it used to be saved up front for
+    // every row, which left 121,006 unused files (2.6 GB) after re-runs
+    // (2026-11-27). Checked BEFORE CoverImageUrl in BuildCoversFromEntry.
+    public byte[]? CoverImageBytes { get; set; }
 
     // The publisher's own solicit blurb - what shows up in the New Books
     // detail popup as the issue's description. comicade.com is the only

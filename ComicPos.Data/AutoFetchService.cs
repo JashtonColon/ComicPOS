@@ -987,6 +987,29 @@ public class AutoFetchService : IAutoFetchService
     // unique index was violated, is one or more levels down), so a
     // future failure like this one is diagnosable from the trace log
     // instead of needing to be guessed at the way this one had to be.
+    // Non-null only during a multi-file run (every Lunar week, every PRH
+    // catalog): the whole Series -> Issues -> Covers graph loaded ONCE and
+    // shared by each file's import, instead of re-reading ~40,000 rows per
+    // file (~350 times in a Fetch Everything run). It stays accurate
+    // because the context keeps tracking it: new series are appended by
+    // AddEntriesAsIssues, and EF fix-up adds new issues/covers to their
+    // parent's collections.
+    private List<Series>? _runSeries;
+
+    private List<Series> LoadAllSeriesFromDb() =>
+        _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers).ToList();
+
+    private List<Series> LoadAllSeriesForImport() => _runSeries ?? LoadAllSeriesFromDb();
+
+    // Wraps a multi-file run so its imports share one loaded graph.
+    private T WithSharedSeriesGraph<T>(Func<T> run)
+    {
+        if (_runSeries != null) return run(); // already inside one (Fetch Everything nests two)
+        _runSeries = LoadAllSeriesFromDb();
+        try { return run(); }
+        finally { _runSeries = null; }
+    }
+
     private (bool Success, string? Error) TrySaveChanges()
     {
         try
@@ -997,6 +1020,9 @@ public class AutoFetchService : IAutoFetchService
         catch (Exception ex)
         {
             _db.ChangeTracker.Clear();
+            // Clear() detached the shared graph, including whatever this
+            // failed batch added - reload so the next file starts clean.
+            if (_runSeries != null) _runSeries = LoadAllSeriesFromDb();
             var parts = new List<string>();
             for (var e = ex; e != null; e = e.InnerException)
                 parts.Add(e.Message);
@@ -1704,9 +1730,10 @@ public class AutoFetchService : IAutoFetchService
     // directly from its own distributor rather than anything scraped.
     // See LunarDistributionParser/LunarTitleParser (ComicPos.Importers)
     // for how the file itself gets read and its titles parsed - this
-    // method's own job is just the glue: save each row's embedded image
-    // to disk (there's no URL to download, see ComicListEntry.
-    // CoverImageLocalPath), turn each row into a ComicListEntry, and feed
+    // method's own job is just the glue: carry each row's embedded image
+    // in memory (there's no URL to download, see ComicListEntry.
+    // CoverImageBytes; written to disk only for covers really added, by
+    // SavePendingCoverImages), turn each row into a ComicListEntry, and feed
     // the whole batch through the SAME AddEntriesAsIssues pipeline every
     // other source (ComicList/GCD/Metron/LOCG/Comicade) already uses -
     // not IImportService.ImportFromCsv's separate, older pipeline, which
@@ -1747,28 +1774,11 @@ public class AutoFetchService : IAutoFetchService
 
         onProgress?.Invoke($"Parsed {parsed.Rows.Count} comic row(s) from the file - saving cover images and matching against inventory...");
 
-        var allSeries = _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers).ToList();
+        var allSeries = LoadAllSeriesForImport();
         var entries = new List<ComicListEntry>();
 
-        int imagesSaved = 0, imagesFailed = 0;
         foreach (var row in parsed.Rows)
         {
-            string? localImagePath = null;
-            if (row.ImageBytes is { Length: > 0 })
-            {
-                try
-                {
-                    var hint = $"{row.SeriesName}_{row.IssueNumber:0.##}_{row.CoverLetter}_{Guid.NewGuid():N}".Replace(" ", "_");
-                    localImagePath = _comicVine.SaveCoverImageBytes(row.ImageBytes, hint, ".jpg");
-                    imagesSaved++;
-                }
-                catch (Exception ex)
-                {
-                    imagesFailed++;
-                    result.Errors.Add($"{row.SeriesName} #{row.IssueNumber:0.##}: couldn't save its embedded cover image: {ex.Message}");
-                }
-            }
-
             entries.Add(new ComicListEntry
             {
                 Publisher = row.Publisher,
@@ -1781,7 +1791,7 @@ public class AutoFetchService : IAutoFetchService
                 FocDate = row.FocDate,
                 Upc = row.Upc,
                 Description = row.Description,
-                CoverImageLocalPath = localImagePath,
+                CoverImageBytes = row.ImageBytes is { Length: > 0 } ? row.ImageBytes : null,
                 // A printing marker ("2ND Printing") is worth showing
                 // over a bare artist name when both are somehow present -
                 // see BuildCoversFromEntry's CoverArtist = e.VariantLabel.
@@ -1797,10 +1807,12 @@ public class AutoFetchService : IAutoFetchService
             });
         }
 
-        trace.AppendLine($"{imagesSaved} cover image(s) saved to disk, {imagesFailed} failed.");
         onProgress?.Invoke($"{entries.Count} comic entr{(entries.Count == 1 ? "y" : "ies")} ready - matching against inventory...");
 
         AddEntriesAsIssues(allSeries, entries, DateOnly.FromDateTime(DateTime.Today), "LUN", result);
+
+        var (imagesSaved, imagesFailed) = SavePendingCoverImages(result);
+        trace.AppendLine($"{imagesSaved} cover image(s) saved to disk for new covers, {imagesFailed} failed.");
 
         // Was a bare _db.SaveChanges() - confirmed live 2026-11-24 that a
         // single file's failed save (e.g. a duplicate Cover.Barcode within
@@ -1882,7 +1894,7 @@ public class AutoFetchService : IAutoFetchService
 
         onProgress?.Invoke($"Parsed {parsed.Rows.Count} row(s) from the file - matching against inventory...");
 
-        var allSeries = _db.AllSeries.Include(s => s.Issues).ThenInclude(i => i.Covers).ToList();
+        var allSeries = LoadAllSeriesForImport();
         var entries = parsed.Rows.Select(row => new ComicListEntry
         {
             Publisher = row.Publisher,
@@ -2022,6 +2034,7 @@ public class AutoFetchService : IAutoFetchService
             var sub = ImportPrhCatalogRelease(tempPath, onProgress);
             result.NewIssuesAdded += sub.NewIssuesAdded;
             result.CoversBackfilled += sub.CoversBackfilled;
+            result.CoverVariantsAdded += sub.CoverVariantsAdded;
             result.Added.AddRange(sub.Added);
             result.Errors.AddRange(sub.Errors);
             result.Saved = sub.Saved;
@@ -2058,7 +2071,10 @@ public class AutoFetchService : IAutoFetchService
     // of re-asking PRH about every Lunar-only book in the database.
     private HashSet<int>? _prhPageChecksPending;
 
-    public AutoFetchResult FetchAllAvailablePrhCatalogsFromWebsite(Action<string>? onProgress = null)
+    public AutoFetchResult FetchAllAvailablePrhCatalogsFromWebsite(Action<string>? onProgress = null) =>
+        WithSharedSeriesGraph(() => FetchAllAvailablePrhCatalogsCore(onProgress));
+
+    private AutoFetchResult FetchAllAvailablePrhCatalogsCore(Action<string>? onProgress)
     {
         var result = new AutoFetchResult();
         var trace = new System.Text.StringBuilder();
@@ -2233,20 +2249,30 @@ public class AutoFetchService : IAutoFetchService
     // itself still ignores the return value - it already reports success
     // via NewIssuesAdded/Errors the way it always has, nothing about that
     // one-shot path needed to change.
-    private bool FetchOneLunarFile(string kind, string dateVal, AutoFetchResult result, System.Text.StringBuilder trace, Action<string>? onProgress)
+    // Starts one week's file download in the background (no DbContext use).
+    private static Task<byte[]> StartLunarFileDownload(string kind, string dateVal)
+    {
+        var url = $"https://www.lunardistribution.com/home/productdatafile?{kind}={Uri.EscapeDataString(dateVal)}";
+        return Task.Run(() => LunarWebsiteFetcher.Http.GetByteArrayAsync(url));
+    }
+
+    // download: an already-started StartLunarFileDownload (the history walk
+    // starts the NEXT week's download before importing this one); null means
+    // download now. A failed download surfaces here either way.
+    private bool FetchOneLunarFile(string kind, string dateVal, AutoFetchResult result, System.Text.StringBuilder trace, Action<string>? onProgress, Task<byte[]>? download = null)
     {
         var tempPath = Path.Combine(Path.GetTempPath(), $"lunar_{kind}_{Guid.NewGuid():N}.xlsx");
         try
         {
             onProgress?.Invoke($"Downloading this week's {kind} file ({dateVal})...");
-            var url = $"https://www.lunardistribution.com/home/productdatafile?{kind}={Uri.EscapeDataString(dateVal)}";
-            var bytes = LunarWebsiteFetcher.Http.GetByteArrayAsync(url).GetAwaiter().GetResult();
+            var bytes = (download ?? StartLunarFileDownload(kind, dateVal)).GetAwaiter().GetResult();
             File.WriteAllBytes(tempPath, bytes);
             trace.AppendLine($"Downloaded {kind} file for {dateVal} ({bytes.Length:N0} bytes).");
 
             var sub = ImportLunarDistributionRelease(tempPath, onProgress);
             result.NewIssuesAdded += sub.NewIssuesAdded;
             result.CoversBackfilled += sub.CoversBackfilled;
+            result.CoverVariantsAdded += sub.CoverVariantsAdded;
             result.Added.AddRange(sub.Added);
             result.Errors.AddRange(sub.Errors);
             trace.AppendLine(sub.Trace);
@@ -2341,7 +2367,10 @@ public class AutoFetchService : IAutoFetchService
     // to be run once (or occasionally, to pick up newly-published future
     // weeks) by hand from NewBooks.razor - never on a timer, same
     // reasoning as FetchLunarReleaseFromWebsite above.
-    public AutoFetchResult BackfillAllLunarHistory(Action<string>? onProgress = null)
+    public AutoFetchResult BackfillAllLunarHistory(Action<string>? onProgress = null) =>
+        WithSharedSeriesGraph(() => BackfillAllLunarHistoryCore(onProgress));
+
+    private AutoFetchResult BackfillAllLunarHistoryCore(Action<string>? onProgress)
     {
         var result = new AutoFetchResult();
         var trace = new System.Text.StringBuilder();
@@ -2481,7 +2510,10 @@ public class AutoFetchService : IAutoFetchService
     // three into one combined AutoFetchResult/trace so the caller (a
     // single new button on NewBooks.razor) can show one combined summary
     // at the end instead of three separate popups.
-    public AutoFetchResult FetchAllHistoryBothDistributors(Action<string>? onProgress = null)
+    public AutoFetchResult FetchAllHistoryBothDistributors(Action<string>? onProgress = null) =>
+        WithSharedSeriesGraph(() => FetchAllHistoryBothDistributorsCore(onProgress));
+
+    private AutoFetchResult FetchAllHistoryBothDistributorsCore(Action<string>? onProgress)
     {
         var combined = new AutoFetchResult();
         var trace = new System.Text.StringBuilder();
@@ -2589,6 +2621,20 @@ public class AutoFetchService : IAutoFetchService
         const int deadStreakLimit = 21;
         var weeksImported = 0;
 
+        // One week's download runs while the previous week imports: the next
+        // date comes from the cheap nav lookup, not from the file, so the
+        // ~5.7 MB download no longer blocks the walk. Imported in the same
+        // order as before; the last pending week is imported after the loop
+        // (every exit from the loop is a break, so none can skip it).
+        (Task<byte[]> Download, string Date)? pendingWeek = null;
+        void ImportPendingWeek()
+        {
+            if (pendingWeek is not { } p) return;
+            pendingWeek = null;
+            if (FetchOneLunarFile(fileQueryKey, p.Date, result, trace, onProgress, p.Download))
+                weeksImported++;
+        }
+
         for (var step = 0; step < maxSteps; step++)
         {
             LunarNavResult nav;
@@ -2649,8 +2695,9 @@ public class AutoFetchService : IAutoFetchService
                 // which is how a real run's trace ended up claiming "109
                 // week(s) imported" when a cascading SaveChanges failure
                 // (see TrySaveChanges) meant only 5 of them actually were.
-                if (FetchOneLunarFile(fileQueryKey, current, result, trace, onProgress))
-                    weeksImported++;
+                var thisWeek = (StartLunarFileDownload(fileQueryKey, current), current);
+                ImportPendingWeek(); // previous week imports while this one downloads
+                pendingWeek = thisWeek;
             }
             else
             {
@@ -2722,6 +2769,7 @@ public class AutoFetchService : IAutoFetchService
             current = onward;
         }
 
+        ImportPendingWeek();
         trace.AppendLine($"{(direction < 0 ? "Backward" : "Forward")} walk finished: {weeksImported} week(s) with real data imported.");
     }
 
@@ -4677,12 +4725,10 @@ public class AutoFetchService : IAutoFetchService
         }
 
         string? coverImagePath = null;
-        if (!string.IsNullOrWhiteSpace(e.CoverImageLocalPath))
+        if (e.CoverImageBytes != null)
         {
-            // Lunar Distribution's own embedded cover photo - already
-            // saved to disk by ImportLunarDistributionRelease before this
-            // entry was built, so there's nothing to fetch here at all.
-            coverImagePath = e.CoverImageLocalPath;
+            // Lunar's embedded photo: nothing to fetch. Written to disk later
+            // by SavePendingCoverImages, only if this cover is really added.
         }
         else if (!string.IsNullOrWhiteSpace(e.CoverImageUrl))
         {
@@ -4723,6 +4769,9 @@ public class AutoFetchService : IAutoFetchService
             // Null for every other source.
             Description = string.IsNullOrWhiteSpace(e.Description) ? null : e.Description
         };
+
+        if (e.CoverImageBytes != null)
+            _pendingCoverImages[primary] = (e.CoverImageBytes, $"{seriesName}_{issueNumber:0.##}_{e.CoverLetter}_{Guid.NewGuid():N}".Replace(" ", "_"));
 
         var results = new List<(Cover, bool)> { (primary, e.CoverLetterIsGuess) };
 
@@ -4784,6 +4833,35 @@ public class AutoFetchService : IAutoFetchService
     // over, A through Z and then V2, V3... beyond that (an issue with
     // more than 26 covers is not realistic, but this still has to not
     // crash/overwrite if it somehow happens).
+    // Embedded images waiting for their candidate cover to be kept. Many
+    // candidates are discarded as already-on-file, so only covers EF is about
+    // to INSERT get their image written; the rest are simply dropped.
+    private readonly Dictionary<Cover, (byte[] Bytes, string Hint)> _pendingCoverImages = new();
+
+    private (int Saved, int Failed) SavePendingCoverImages(AutoFetchResult result)
+    {
+        int saved = 0, failed = 0;
+        var added = _db.ChangeTracker.Entries<Cover>()
+            .Where(x => x.State == EntityState.Added)
+            .Select(x => x.Entity);
+        foreach (var cover in added)
+        {
+            if (!_pendingCoverImages.TryGetValue(cover, out var img)) continue;
+            try
+            {
+                cover.CoverImagePath = _comicVine.SaveCoverImageBytes(img.Bytes, img.Hint, ".jpg");
+                saved++;
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                result.Errors.Add($"{img.Hint}: couldn't save its embedded cover image: {ex.Message}");
+            }
+        }
+        _pendingCoverImages.Clear();
+        return (saved, failed);
+    }
+
     private static void ResolveCoverLetters(List<(Cover Cover, bool IsGuess)> candidates, IEnumerable<string> alreadyUsedLetters)
     {
         var used = new HashSet<string>(alreadyUsedLetters, StringComparer.OrdinalIgnoreCase);
@@ -5492,6 +5570,8 @@ public class AutoFetchService : IAutoFetchService
 
         var done = 0;
         var noCoverAvailable = 0;
+        var downloads = new ReadAhead<byte[]?>(candidates.Count, PrhWebsiteFetcher.CoverImagesInFlight,
+            k => PrhWebsiteFetcher.DownloadCoverBytesAsync(candidates[k].LookupBarcode));
         foreach (var (cover, lookupBarcode) in candidates)
         {
             done++;
@@ -5501,7 +5581,7 @@ public class AutoFetchService : IAutoFetchService
 
             try
             {
-                var bytes = PrhWebsiteFetcher.DownloadCoverBytesAsync(lookupBarcode).GetAwaiter().GetResult();
+                var bytes = downloads.Get(done - 1);
                 if (bytes == null)
                 {
                     outcomeLine = $"{done}/{candidates.Count} {label}: download failed - left uncovered.";
@@ -5984,6 +6064,8 @@ public class AutoFetchService : IAutoFetchService
         var done = 0;
         var noPrhPageFound = 0;
         var consecutiveNetworkFailures = 0;
+        var pages = new ReadAhead<string?>(candidates.Count, PrhWebsiteFetcher.BookPagesInFlight,
+            k => PrhWebsiteFetcher.DownloadBookPageHtmlAsync(candidates[k].QueryCover!.Barcode.Split('#')[0]));
         foreach (var (issue, queryCover) in candidates)
         {
             done++;
@@ -6009,7 +6091,7 @@ public class AutoFetchService : IAutoFetchService
             string? html;
             try
             {
-                html = PrhWebsiteFetcher.DownloadBookPageHtmlAsync(lookupBarcode).GetAwaiter().GetResult();
+                html = pages.Get(done - 1);
             }
             catch (Exception ex)
             {
@@ -6151,6 +6233,8 @@ public class AutoFetchService : IAutoFetchService
         // Every candidate starts "pending" and is cleared once PRH answers
         // (page or 404), so errors and anything skipped by an early stop stay.
         _prhPageChecksPending?.UnionWith(candidates.Select(c => c.Issue.Id));
+        var pages = new ReadAhead<string?>(candidates.Count, PrhWebsiteFetcher.BookPagesInFlight,
+            k => PrhWebsiteFetcher.DownloadBookPageHtmlAsync(candidates[k].QueryCover!.Barcode.Split('#')[0]));
 
         foreach (var (issue, queryCover) in candidates)
         {
@@ -6166,7 +6250,7 @@ public class AutoFetchService : IAutoFetchService
             string? html;
             try
             {
-                html = PrhWebsiteFetcher.DownloadBookPageHtmlAsync(lookupBarcode).GetAwaiter().GetResult();
+                html = pages.Get(done - 1);
             }
             catch (Exception ex)
             {
@@ -6202,8 +6286,9 @@ public class AutoFetchService : IAutoFetchService
             if (addedHere > 0 || upgradedHere > 0)
             {
                 var outcomeLine = $"{label}: found {addedHere} new cover(s), upgraded {upgradedHere} barcode(s) via PRH's own book page ({lookupBarcode}).";
+                // Not written to the trace here: ImportPrhCatalogRelease's
+                // "Added:" section prints result.Added, so it showed twice.
                 result.Added.Add(outcomeLine);
-                trace.AppendLine(outcomeLine);
                 onProgress?.Invoke(outcomeLine);
             }
         }
@@ -6239,13 +6324,17 @@ public class AutoFetchService : IAutoFetchService
             FetchPrhPlaceholderHashIfUnknown();
 
             var noCoverAvailable = 0;
+            var imageIndex = 0;
+            var downloads = new ReadAhead<byte[]?>(imageCandidates.Count, PrhWebsiteFetcher.CoverImagesInFlight,
+                k => PrhWebsiteFetcher.DownloadCoverBytesAsync(imageCandidates[k].LookupBarcode));
             foreach (var (issue, cover, lookupBarcode) in imageCandidates)
             {
                 var label = $"{issue.Series.Name} #{issue.IssueNumber:0.##} ({cover.CoverLetter})";
+                var thisIndex = imageIndex++;
 
                 try
                 {
-                    var bytes = PrhWebsiteFetcher.DownloadCoverBytesAsync(lookupBarcode).GetAwaiter().GetResult();
+                    var bytes = downloads.Get(thisIndex);
                     if (bytes == null) continue; // download failed - left uncovered, same as BackfillCoversFromPrhImageCdn's own
 
                     var hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes));
@@ -6382,8 +6471,49 @@ internal static class LunarWebsiteFetcher
 //      sends for a nested object in a form POST (confirmed by reading
 //      the raw outgoing request body in the browser, not guessed) - a
 //      plain JSON body here would not be parsed the same way server-side.
+// Keeps the next few downloads in flight while the caller handles the
+// current one, so a one-at-a-time loop stops waiting on the network for
+// every item. Only the download runs ahead: the caller still processes
+// results in order on its own thread (DbContext is not thread-safe), and
+// its own pacing (Thread.Sleep) still limits how fast requests are started.
+// Get(i) must be called with increasing i; a skipped index is just dropped.
+internal sealed class ReadAhead<T>
+{
+    private readonly Func<int, Task<T>> _start;
+    private readonly Task<T>?[] _tasks;
+    private readonly int _ahead;
+    private int _next;
+
+    public ReadAhead(int count, int ahead, Func<int, Task<T>> start)
+    {
+        _tasks = new Task<T>?[count];
+        _ahead = Math.Max(1, ahead);
+        _start = start;
+    }
+
+    // Blocks until item i's download finishes; rethrows its exception.
+    public T Get(int i)
+    {
+        while (_next < _tasks.Length && _next < i + _ahead)
+        {
+            var k = _next++;
+            _tasks[k] = Task.Run(() => _start(k));
+        }
+        var task = _tasks[i] ?? throw new InvalidOperationException($"ReadAhead item {i} was already taken.");
+        _tasks[i] = null;
+        return task.GetAwaiter().GetResult();
+    }
+}
+
 internal static class PrhWebsiteFetcher
 {
+    // How many downloads ReadAhead keeps in flight. Book pages are the real
+    // prhcomics.com site (no published rate limit), so stay modest - the
+    // callers' 300ms-per-item pacing still caps the rate at ~3 requests/s.
+    // Cover images come from PRH's image CDN, which is built for heavy load.
+    public const int BookPagesInFlight = 4;
+    public const int CoverImagesInFlight = 6;
+
     public static readonly HttpClient Http = BuildClient();
 
     private static HttpClient BuildClient()
@@ -6732,7 +6862,11 @@ internal static class PrhWebsiteFetcher
     public static async Task<string?> DownloadBookPageHtmlAsync(string isbn)
     {
         var url = $"https://prhcomics.com/book/?isbn={Uri.EscapeDataString(isbn)}";
-        using var resp = await Http.GetAsync(url).ConfigureAwait(false);
+        // A book page is a small HTML page; the shared client's 120s timeout
+        // is for catalog .xlsx downloads. With 120s, a stalled connection
+        // took 10 x 120s = 20 min to trip the "network looks down" stop.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var resp = await Http.GetAsync(url, cts.Token).ConfigureAwait(false);
         // A genuine HTTP 404 here - confirmed live 2026-11-26 against real
         // candidates (Feral #28, Lost Fantasy #14, Absolute Wonder Woman
         // #26, all non-PRH-distributed titles) - means this barcode,

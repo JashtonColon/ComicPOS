@@ -157,6 +157,9 @@ namespace ComicPos.Data.Migrations
                     b.Property<DateTime?>("FulfilledAt")
                         .HasColumnType("TEXT");
 
+                    b.Property<int?>("FulfilledBySaleId")
+                        .HasColumnType("INTEGER");
+
                     b.Property<bool>("IsCancelled")
                         .HasColumnType("INTEGER");
 
