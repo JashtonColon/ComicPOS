@@ -62,4 +62,19 @@ public class WorkerService : IWorkerService
 
         return worker.Pin == pin.Trim() ? worker : null;
     }
+
+    // See IWorkerService's own doc comment for the full chicken-and-egg
+    // story this fixes. Deliberately checks for ANY row at all (not just
+    // active ones) - a store that has deliberately deactivated every
+    // worker it has is a different, intentional situation and shouldn't
+    // get a surprise worker re-seeded; a table with zero rows ever is
+    // specifically "brand new install" or "just reset," which is the one
+    // case this exists for.
+    public void EnsureDefaultWorkerExists()
+    {
+        if (_db.Workers.Any()) return;
+
+        _db.Workers.Add(new Worker { Name = "Admin", Pin = "9876", IsActive = true });
+        _db.SaveChanges();
+    }
 }
