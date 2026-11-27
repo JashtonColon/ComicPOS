@@ -92,7 +92,18 @@ public static class LunarDistributionParser
         {
             if (!columnIndex.TryGetValue(column, out var col)) return null;
             var cell = xlRow.Cell(col);
-            if (cell.TryGetValue(out DateTime dt)) return DateOnly.FromDateTime(dt);
+            if (cell.IsEmpty()) return null;
+            // ClosedXML's typed DateTime accessor can still "succeed" on a
+            // blank or stray non-date numeric cell, returning an
+            // implausible date near Excel's own 1900 epoch instead of
+            // failing outright (confirmed live 2026-11-26: 38 "Absolute
+            // Universe" issues got FocDate 1900-01-01/1900-11-01 this
+            // way, from a blank "FinalOrderCutoff" cell). No real
+            // solicitation date in this app's whole history predates
+            // 2021, so treat anything before year 2000 as a parse
+            // failure instead of propagating it - same guard applies to
+            // InstoreDate below since both columns share this helper.
+            if (cell.TryGetValue(out DateTime dt) && dt.Year >= 2000) return DateOnly.FromDateTime(dt);
             return DateOnly.TryParse(cell.GetString().Trim(), out var d) ? d : null;
         }
 
