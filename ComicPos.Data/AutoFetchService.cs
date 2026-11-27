@@ -645,6 +645,10 @@ public class AutoFetchService : IAutoFetchService
         if (placeholdersCleared > 0)
             trace.AppendLine($"Found {placeholdersCleared} cover(s) that were actually a source's generic \"not ready yet\" placeholder graphic, not real art - cleared so they're re-fetched below instead of staying stuck.");
 
+        var focDatesFixed = FixImplausibleFocDates();
+        if (focDatesFixed > 0)
+            trace.AppendLine($"Found {focDatesFixed} issue(s) with an impossible FOC date (before year 2000, from a parser bug now fixed) - corrected to an estimate based on their release date.");
+
         // Every series with at least one cover still missing art - not
         // just the ones already linked to a Comic Vine volume (the old
         // filter here). Metron (tried below for every series, see the
@@ -2252,38 +2256,62 @@ public class AutoFetchService : IAutoFetchService
     // "...12:00:00 AM" form the homepage's own buttons carry), so this
     // walks and downloads using one single date-string format throughout.
     //
-    // Walking backward via "previous" from today found the server's own
-    // built-in floor live: the oldest real release date (2025-11-18 at the
-    // time this was written/tested) reports "1/1/0001" as ITS OWN
-    // previous - .NET's DateTime.MinValue, unmistakably a deliberate "nothing
-    // earlier exists" sentinel rather than just another date. Walking
-    // forward via "next" on the FOC side similarly ran out around mid-2027
-    // before jumping to a "12/31/2039" far-future sentinel. Both are
-    // detected by parsed year rather than an exact string match (see
-    // WalkAndImportLunarDates below), in case the exact sentinel value
-    // ever changes on their end.
+    // Walking backward via "previous" from today originally looked like it
+    // found the server's own built-in floor live: the oldest release date
+    // reached (2025-11-18 at the time this was first written) reports
+    // "1/1/0001" as ITS OWN previous - .NET's DateTime.MinValue. CORRECTED
+    // 2026-11-27 (the store found this by hand - see
+    // full-reset-2026-11-27.md): that sentinel is NOT "nothing earlier
+    // exists." Confirmed live against dozens of real historical dates
+    // spanning 2025 all the way back to 2013 that lunardistribution.com
+    // returns that exact same fixed pair - previous "1/1/0001", next
+    // "12/2/2025" - for EVERY date before 2025-12-02, no matter which one
+    // is actually requested. The real explanation: the site only keeps a
+    // genuine previous/next CHAIN for "live" dates (2025-12-02 onward);
+    // everything older sits in a flat archive with no chain at all, but
+    // still answers with real product data when a specific date is asked
+    // for directly - confirmed real, non-empty results as far back as
+    // Lunar Distribution's own first week of business, April 2020 (the
+    // company didn't exist before then - it was formed in about three
+    // weeks after Diamond Comic Distributors' COVID shutdown, per
+    // Lunar co-founder Christina Merkler's own account). So
+    // WalkAndImportLunarDates below has two phases for the backward
+    // (release) direction: follow the server's own chain while it's real,
+    // then - once that fixed sentinel shows up - switch to self-computed
+    // date stepping (Lunar only ever has entries on Tuesdays and
+    // Wednesdays, confirmed live in both regimes) down to Lunar's own
+    // 2020-04-01 launch floor, rather than stopping the moment the chain
+    // itself gives out. Walking forward via "next" on the FOC side still
+    // ran out around mid-2027 before jumping to a "12/31/2039" far-future
+    // sentinel - FOC has no archive at all before the live window
+    // (confirmed empty for every pre-2025-12-02 date tried), so the
+    // forward direction doesn't need this two-phase treatment. Both
+    // sentinels are detected by parsed year rather than an exact string
+    // match (see WalkAndImportLunarDates below), in case the exact
+    // sentinel value ever changes on their end.
     //
     // One wrinkle confirmed live: the server's own previous/next chain
-    // isn't perfectly gapless - once in roughly a year of weekly history
-    // during testing, a "previous" pointer led to a dead date that itself
-    // came back as the bare no-fields response, even though real data
-    // existed even further back. Simply stopping there would have silently
-    // truncated the backfill a few months early, so the walk below
-    // recovers from a dead date by stepping one calendar day at a time
-    // (bounded by a dead-streak limit) until it finds a real date again,
-    // then resumes using the server's own chain from there - confirmed
-    // live that this correctly steps across the one gap found during
-    // testing (which spanned about a week of dead dates).
+    // isn't perfectly gapless even within the live regime - once, a
+    // "previous" pointer led to a dead date that itself came back as the
+    // bare no-fields response, even though real data existed even further
+    // back. Simply stopping there would have silently truncated the
+    // backfill early, so the walk below recovers from a dead date by
+    // stepping past the gap (bounded by a dead-streak limit) until it
+    // finds a real date again, then resumes from there - confirmed live
+    // that this correctly steps across the one gap found during testing
+    // (which spanned about a week of dead dates). The same recovery
+    // applies once self-computed stepping through the archive begins,
+    // using the archive's own Tuesday/Wednesday cadence instead of a
+    // plain day-at-a-time step.
     //
-    // This can mean dozens of file downloads+imports in one run (a little
-    // over a year of weekly history both ways at the time this was
-    // written), so it reuses FetchOneLunarFile's existing per-file
-    // error handling (one bad week's failure doesn't stop the rest) and
-    // reports progress once per week like BackfillYearFromLocg/
-    // CheckForNewIssuesViaMetron do. Meant to be run once (or
-    // occasionally, to pick up newly-published future weeks) by hand from
-    // NewBooks.razor - never on a timer, same reasoning as
-    // FetchLunarReleaseFromWebsite above.
+    // This can mean hundreds of file downloads+imports in one run (over
+    // six years of twice-weekly history on the release side alone), so it
+    // reuses FetchOneLunarFile's existing per-file error handling (one bad
+    // week's failure doesn't stop the rest) and reports progress once per
+    // week like BackfillYearFromLocg/CheckForNewIssuesViaMetron do. Meant
+    // to be run once (or occasionally, to pick up newly-published future
+    // weeks) by hand from NewBooks.razor - never on a timer, same
+    // reasoning as FetchLunarReleaseFromWebsite above.
     public AutoFetchResult BackfillAllLunarHistory(Action<string>? onProgress = null)
     {
         var result = new AutoFetchResult();
@@ -2327,25 +2355,42 @@ public class AutoFetchService : IAutoFetchService
         var releaseStart = releaseDate?.Split(' ')[0];
         var focStart = focDate?.Split(' ')[0];
 
-        // Generous safety cap, not a real expected count - the real
-        // backward walk observed live during testing took ~65 steps to
-        // cover a little over a year of weekly history, so this leaves
-        // roughly 6x headroom in case the real cadence is ever denser
-        // (and the dead-streak/sentinel checks inside the walk itself are
-        // what actually stops it under normal conditions long before this
-        // would ever be hit).
-        const int maxSteps = 400;
+        // Generous safety caps, not real expected counts - the
+        // dead-streak/sentinel/archive-floor checks inside the walk
+        // itself are what actually stop it under normal conditions long
+        // before either of these would ever be hit.
+        //
+        // The FOC (forward) side never gained the archive-walk below - it
+        // has no pre-live archive at all (confirmed empty for every
+        // pre-2025-12-02 date tried) - so its cap stays at the original
+        // live-chain-only estimate (~65 steps observed, ~6x headroom).
+        const int focMaxSteps = 400;
+
+        // The release (backward) side now also self-steps through the
+        // archive down to Lunar's own 2020-04-01 launch floor (see the
+        // long doc comment above) once the live chain's sentinel shows
+        // up: roughly 6.7 years of TWO entries/week (confirmed - Tuesday
+        // and Wednesday both carry real data) is on the order of 700
+        // steps; this leaves close to 2x headroom over that estimate.
+        const int releaseMaxSteps = 1400;
+
+        // Lunar's own first week of business - co-founder Christina
+        // Merkler's own account (icv2 interview) gives the first shipment
+        // as "04/'20." A small buffer below that costs almost nothing (a
+        // handful of extra empty-date checks) and guards against the
+        // launch-week date being slightly fuzzier than one exact day.
+        var archiveFloor = new DateOnly(2020, 3, 15);
 
         if (releaseStart != null)
         {
-            onProgress?.Invoke("Walking backward through Lunar's release history as far as it goes...");
-            WalkAndImportLunarDates("/home/instoreproducts", "release", releaseStart, direction: -1, maxSteps, result, trace, onProgress);
+            onProgress?.Invoke("Walking backward through Lunar's release history as far as it goes (including the pre-2025-12-02 archive, down to Lunar's own 2020 launch)...");
+            WalkAndImportLunarDates("/home/instoreproducts", "release", releaseStart, direction: -1, releaseMaxSteps, result, trace, onProgress, archiveFloor);
         }
 
         if (focStart != null)
         {
             onProgress?.Invoke("Walking forward through Lunar's FOC solicitations as far as they go...");
-            WalkAndImportLunarDates("/home/focproducts", "foc", focStart, direction: +1, maxSteps, result, trace, onProgress);
+            WalkAndImportLunarDates("/home/focproducts", "foc", focStart, direction: +1, focMaxSteps, result, trace, onProgress);
         }
 
         trace.AppendLine(new string('=', 60));
@@ -2354,6 +2399,99 @@ public class AutoFetchService : IAutoFetchService
         DebugLog.WriteCheckNowLog(result.Trace);
         onProgress?.Invoke($"Done - {result.NewIssuesAdded} new issue(s) added total across all of Lunar's available history.");
         return result;
+    }
+
+    // Added 2026-11-27 - the store asked for "one button that gets both
+    // [Lunar and PRH], all the way back to when they first started doing
+    // solicits... deal with duplicates between the two distributors
+    // accordingly." This chains the two existing full-history methods
+    // together, in a FIXED order, never concurrently:
+    //
+    // 1. BackfillAllLunarHistory (above) runs to completion first.
+    // 2. FetchAllAvailablePrhCatalogsFromWebsite runs second.
+    // 3. BackfillCoverVariantsFromPrhBookPages runs last, as a catch-up
+    //    pass for any PRH issue whose own book page didn't have every
+    //    sibling cover listed yet at the exact moment it was imported in
+    //    step 2 (same reasoning BackfillCoverVariantsFromPrhBookPages's
+    //    own doc comment already gives for why it's useful as a repeat-
+    //    able catch-up, not just a one-time tool).
+    //
+    // Running Lunar fully to completion BEFORE PRH starts is what makes
+    // the "deal with duplicates accordingly" half of the request work for
+    // free, with no new matching code: both ImportLunarDistributionRelease
+    // and ImportPrhCatalogRelease already route every row through the one
+    // shared AddEntriesAsIssues, which looks up a Series by
+    // SeriesNameKey.Normalize(...) before ever creating a new one. So
+    // whichever distributor's import reaches a given series name FIRST is
+    // the one whose Series row sticks - the other distributor's issues
+    // just attach onto that same existing row instead of creating a
+    // second one. That's exactly "choose the first one that appeared,"
+    // the store's own call on how to handle this, with zero new series-
+    // matching logic needed - just a fixed run order against the same
+    // live database (if this ran Lunar and PRH concurrently instead, two
+    // brand-new series rows could get created for the same real series
+    // at nearly the same moment, racing each other - sequential order is
+    // what rules that out entirely, not just makes it less likely).
+    //
+    // Ceiling per distributor, not a bug: Lunar's release-side walk now
+    // reaches all the way back to Lunar Distribution's own 2020-04-01
+    // launch (see BackfillAllLunarHistory's own doc comment above for the
+    // full two-regime discovery and why the site's "1/1/0001" sentinel
+    // doesn't mean what it first looked like it meant). FOC has no
+    // archive before the live window at all, so its ceiling stays at
+    // whatever the site's own live chain covers. PRH's own archive goes
+    // back to 2021-06 (see DiscoverAvailableCatalogCodesAsync's own doc
+    // comment). "All the way back to when they first started doing
+    // solicits" means three different real floors (Lunar release, Lunar
+    // FOC, PRH) - this reaches all of them; none is a shortcut taken by
+    // this code, each is the genuine floor on that distributor's own
+    // server.
+    //
+    // Each of the three steps already reports its own progress and
+    // writes its own full trace to checknow-debug.txt; this wraps all
+    // three into one combined AutoFetchResult/trace so the caller (a
+    // single new button on NewBooks.razor) can show one combined summary
+    // at the end instead of three separate popups.
+    public AutoFetchResult FetchAllHistoryBothDistributors(Action<string>? onProgress = null)
+    {
+        var combined = new AutoFetchResult();
+        var trace = new System.Text.StringBuilder();
+        trace.AppendLine($"Combined Lunar+PRH full-history fetch run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        trace.AppendLine(new string('=', 60));
+
+        void Merge(AutoFetchResult part, string label)
+        {
+            combined.SeriesChecked += part.SeriesChecked;
+            combined.SeriesAutoLinked += part.SeriesAutoLinked;
+            combined.NewIssuesAdded += part.NewIssuesAdded;
+            combined.CoversBackfilled += part.CoversBackfilled;
+            combined.CoverVariantsAdded += part.CoverVariantsAdded;
+            combined.Added.AddRange(part.Added);
+            combined.Errors.AddRange(part.Errors);
+            if (!part.Saved) combined.Saved = false;
+            trace.AppendLine(new string('-', 60));
+            trace.AppendLine($"[{label}]");
+            trace.AppendLine(part.Trace);
+        }
+
+        onProgress?.Invoke("Step 1 of 3: Backfilling Lunar's full history (as far back as lunardistribution.com itself goes)...");
+        var lunar = BackfillAllLunarHistory(progressLine => onProgress?.Invoke($"Lunar: {progressLine}"));
+        Merge(lunar, "Lunar full-history backfill");
+
+        onProgress?.Invoke("Step 2 of 3: Fetching every available PRH catalog (2021-06 through now)...");
+        var prh = FetchAllAvailablePrhCatalogsFromWebsite(progressLine => onProgress?.Invoke($"PRH: {progressLine}"));
+        Merge(prh, "PRH full-history catalog fetch");
+
+        onProgress?.Invoke("Step 3 of 3: Catching up any PRH cover variants missed above...");
+        var coverCatchUp = BackfillCoverVariantsFromPrhBookPages(progressLine => onProgress?.Invoke($"PRH cover catch-up: {progressLine}"));
+        Merge(coverCatchUp, "PRH cover-variant catch-up pass");
+
+        trace.AppendLine(new string('=', 60));
+        trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}. {combined.NewIssuesAdded} new issue(s) added, {combined.CoverVariantsAdded} new cover variant(s) added, {combined.CoversBackfilled} barcode(s) upgraded - combined across both distributors' full history.");
+        combined.Trace = trace.ToString();
+        DebugLog.WriteCheckNowLog(combined.Trace);
+        onProgress?.Invoke($"Done - {combined.NewIssuesAdded} new issue(s) and {combined.CoverVariantsAdded} new cover(s) added across Lunar + PRH's full history.");
+        return combined;
     }
 
     // One direction of the walk described in BackfillAllLunarHistory's own
@@ -2371,10 +2509,20 @@ public class AutoFetchService : IAutoFetchService
         int maxSteps,
         AutoFetchResult result,
         System.Text.StringBuilder trace,
-        Action<string>? onProgress)
+        Action<string>? onProgress,
+        DateOnly? archiveFloor = null)
     {
         var current = startDate;
         var deadStreak = 0;
+
+        // Once true, the server's own previous/next can no longer be
+        // trusted at all (see the archive discovery in the big doc
+        // comment on BackfillAllLunarHistory) - every remaining step
+        // computes its own next candidate date instead. Only ever set
+        // for the backward (release) direction, and only when a caller
+        // actually passed an archiveFloor (the forward FOC walk never
+        // enters this mode - it has no pre-live archive to fall into).
+        var inArchiveMode = false;
 
         // One real gap found during live testing spanned about a week of
         // consecutive dead dates before the chain picked back up; this
@@ -2412,7 +2560,25 @@ public class AutoFetchService : IAutoFetchService
                     trace.AppendLine($"Couldn't parse '{current}' as a date to step past the gap - stopping.");
                     break;
                 }
-                current = FormatLunarDate(dead.AddDays(direction));
+
+                if (inArchiveMode)
+                {
+                    // Keep stepping on the archive's own Tuesday/Wednesday
+                    // cadence rather than a plain day-at-a-time step,
+                    // which would waste calls on days that structurally
+                    // never have data in either regime.
+                    var archiveGapNext = PreviousLunarCandidate(dead);
+                    if (archiveFloor.HasValue && archiveGapNext < archiveFloor.Value)
+                    {
+                        trace.AppendLine($"Reached the archive floor ({archiveFloor.Value:M/d/yyyy}) - stopping.");
+                        break;
+                    }
+                    current = FormatLunarDate(archiveGapNext);
+                }
+                else
+                {
+                    current = FormatLunarDate(dead.AddDays(direction));
+                }
                 continue;
             }
 
@@ -2434,6 +2600,28 @@ public class AutoFetchService : IAutoFetchService
                 trace.AppendLine($"{current}: real catalog date, 0 items.");
             }
 
+            if (!DateOnly.TryParseExact(current, "M/d/yyyy", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var currentParsed))
+            {
+                trace.AppendLine($"Couldn't parse '{current}' to decide the next step - stopping.");
+                break;
+            }
+
+            if (inArchiveMode)
+            {
+                // Already past the live chain - an archive date's own
+                // previous/next are the same fixed, useless pair every
+                // time (see the doc comment on BackfillAllLunarHistory),
+                // so don't even look at them; just keep self-stepping.
+                var nextArchiveCandidate = PreviousLunarCandidate(currentParsed);
+                if (archiveFloor.HasValue && nextArchiveCandidate < archiveFloor.Value)
+                {
+                    trace.AppendLine($"Reached the archive floor ({archiveFloor.Value:M/d/yyyy}) - stopping.");
+                    break;
+                }
+                current = FormatLunarDate(nextArchiveCandidate);
+                continue;
+            }
+
             var onward = direction < 0 ? nav.Previous : nav.Next;
             if (string.IsNullOrEmpty(onward))
             {
@@ -2450,6 +2638,26 @@ public class AutoFetchService : IAutoFetchService
             if (!DateOnly.TryParseExact(onward, "M/d/yyyy", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var onwardParsed)
                 || onwardParsed.Year is < 2000 or > 2100)
             {
+                // CORRECTED 2026-11-27: for the backward release walk,
+                // this is NOT the real end of history - it's the known
+                // flat-archive sentinel (see the long doc comment on
+                // BackfillAllLunarHistory). Switch to self-computed
+                // Tuesday/Wednesday stepping from the last date that DID
+                // have real data, instead of stopping here.
+                if (direction < 0 && archiveFloor.HasValue)
+                {
+                    trace.AppendLine($"{current}: server's own chain ends here (reports a fixed '{onward}' for every archive date - not a real floor, see full-reset-2026-11-27.md). Switching to direct date-stepping to keep going through the archive.");
+                    inArchiveMode = true;
+                    var firstArchiveCandidate = PreviousLunarCandidate(currentParsed);
+                    if (firstArchiveCandidate < archiveFloor.Value)
+                    {
+                        trace.AppendLine($"Reached the archive floor ({archiveFloor.Value:M/d/yyyy}) - stopping.");
+                        break;
+                    }
+                    current = FormatLunarDate(firstArchiveCandidate);
+                    continue;
+                }
+
                 trace.AppendLine($"Reached the site's own end-of-data marker ({onward}) - stopping.");
                 break;
             }
@@ -2461,6 +2669,17 @@ public class AutoFetchService : IAutoFetchService
     }
 
     private static string FormatLunarDate(DateOnly d) => $"{d.Month}/{d.Day}/{d.Year}";
+
+    // Steps from a known Tuesday or Wednesday catalog date to the
+    // previous one in Lunar's own two-entry-per-week pattern - confirmed
+    // live across both the archive (back to 2020-03) and the live regime
+    // that these are the ONLY two days that ever carry data: Wednesday
+    // steps back 1 day to that same week's Tuesday; Tuesday steps back 6
+    // days to the previous week's Wednesday. Only used once the archive
+    // fallback in WalkAndImportLunarDates kicks in, where the server's
+    // own previous/next can't be trusted at all.
+    private static DateOnly PreviousLunarCandidate(DateOnly d) =>
+        d.DayOfWeek == DayOfWeek.Wednesday ? d.AddDays(-1) : d.AddDays(-6);
 
     private sealed class LunarNavResult
     {
@@ -3531,6 +3750,48 @@ public class AutoFetchService : IAutoFetchService
 
         if (cleared > 0) _db.SaveChanges();
         return cleared;
+    }
+
+    // Scans every issue for a FocDate predating year 2000 - impossible
+    // for any real solicitation anywhere in this store's history (the
+    // earliest genuine PRH/Lunar date in this whole app is 2021) - and
+    // corrects it to the same "3 weeks before street date" estimate
+    // already used when a Comic-Vine-sourced issue has no real FOC date
+    // at all (see RunCheckForNewIssues' own
+    // FocDate = cvIssue.StoreDate?.AddDays(-21)). Added 2026-11-26 after
+    // 38 "Absolute Universe" issues (all Lunar-sourced) turned up with
+    // FocDate 1900-01-01/1900-11-01 - traced to LunarDistributionParser.
+    // GetDate trying ClosedXML's typed DateTime cell accessor before ever
+    // falling back to text, so a blank or stray non-date "FinalOrderCutoff"
+    // cell could still "succeed" with a bogus date near Excel's own 1900
+    // epoch instead of failing cleanly (see that parser's own doc comment
+    // for the fix on the import side - this is only the catch-up for
+    // whatever already got saved that way before today). Purely local, no
+    // network calls - safe to always run here alongside
+    // ClearPlaceholderCovers above.
+    private int FixImplausibleFocDates()
+    {
+        var bad = _db.Issues
+            .Where(i => i.FocDate != null && i.FocDate.Value.Year < 2000)
+            .ToList();
+
+        var fixedCount = 0;
+        foreach (var issue in bad)
+        {
+            // Release date is always the better-trusted of the two here -
+            // every one of the 38 that surfaced this had a perfectly
+            // normal ReleaseDate and only FocDate was broken. Falling back
+            // to null (rather than leaving the provably-wrong 1900 value)
+            // only matters for the rare case where ReleaseDate is somehow
+            // ALSO missing - unknown is safer than wrong.
+            issue.FocDate = issue.ReleaseDate.HasValue
+                ? issue.ReleaseDate.Value.AddDays(-21)
+                : null;
+            fixedCount++;
+        }
+
+        if (fixedCount > 0) _db.SaveChanges();
+        return fixedCount;
     }
 
     // Called from RescanExistingBooks (for a series that still has a
@@ -4878,17 +5139,24 @@ public class AutoFetchService : IAutoFetchService
         }
     }
 
+    // Used to hard-cap this to today +/- 3 months. (2026-11-26: user
+    // reported the New Books page's own "All Months" dropdown still
+    // topped out around 2845 issues no matter what, when the DB actually
+    // has 7141+ PRH-sourced issues alone - traced to this method, not the
+    // page.) The page's month tabs and "All Months" selector only ever
+    // group/filter WHATEVER this method already returned - they can't see
+    // past a bound imposed here. Returning everything lets both UIs'
+    // existing "All Months" option (and their month-tab lists) reach
+    // every month actually in the database, not just a fixed window
+    // around today. The page still defaults to showing the current
+    // month's tab on load (that logic lives in NewBooks.razor/
+    // AutoFetchControl.cs, unchanged) - this only removes the invisible
+    // ceiling underneath it.
     public List<Issue> GetNewBooks()
     {
-        var since = DateOnly.FromDateTime(DateTime.Today.AddMonths(-3));
-        var until = DateOnly.FromDateTime(DateTime.Today.AddMonths(3));
-
         return _db.Issues
             .Include(i => i.Series)
             .Include(i => i.Covers)
-            .Where(i =>
-                (i.ReleaseDate != null && i.ReleaseDate >= since && i.ReleaseDate <= until) ||
-                (i.FocDate != null && i.FocDate >= since && i.FocDate <= until))
             .ToList();
     }
 
@@ -5263,6 +5531,56 @@ public class AutoFetchService : IAutoFetchService
         return (lookup.Length == 13 || lookup.Length == 17) && lookup.All(char.IsDigit);
     }
 
+    // PRH's own "Additional covers" carousel labels a variant "Variant
+    // B (Artist)" or, for a ratio-incentive copy, "Variant RI (10)
+    // (Artist)" - never "Cover B"/"CVR B" the way the catalog's own
+    // Title column does (confirmed live 2026-11-26, Godzilla Rivals:
+    // Mothra Vs. M.O.G.U.E.R.A. #1's own 2 real variants). PrhTitleParser.
+    // CoverLetterMarker only recognizes the catalog's own wording and is
+    // deliberately left alone here (shared with the catalog importer,
+    // already proven for that different grammar) - these two are this
+    // scrape path's own fallback, checked only when that one found
+    // nothing, so a "Cover X"/"CVR X"-worded carousel item (if PRH ever
+    // writes one that way) still goes through the original path
+    // unchanged.
+    private static readonly Regex CarouselVariantRiMarker = new(@"\bVariant\s+RI\s*(?:\((\d+)\))?", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex CarouselVariantLetterMarker = new(@"\bVariant\s+([A-Za-z])\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex CarouselTrailingArtist = new(@"\(([^)]+)\)\s*$", RegexOptions.Compiled);
+
+    // Third naming style, found 2026-11-26 on Amazing Spider-Man #25's
+    // real page ("AMAZING SPIDER-MAN #25 MARK CHIARELLO VARIANT [DS]"):
+    // the artist comes BEFORE the bare word "Variant", with no letter
+    // or "RI" at all - neither regex above matches this. Only tried
+    // when both of those fail. Captures whatever sits between the
+    // issue's own "#N" and "Variant" (artist name, sometimes with a
+    // short descriptor like "Classified Target") and uses it as BOTH
+    // the cover letter and the artist credit, since there's no real
+    // letter to fall back on and a named variant is still its own
+    // distinct cover, not a dupe of Cover A.
+    private static readonly Regex CarouselArtistBeforeVariant = new(@"#\s*\d+(?:\.\d+)?\s+(.+?)\s+Variant\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // Fourth naming style, found 2026-11-27 (real run: Midnight X-Men
+    // #2's own "Additional covers" carousel). Unlike every style above,
+    // this one carries NO series name and NO "#N" at all - just
+    // "COVER E JOSHUA SWABY MIDNIGHT GALLERY 1:25" on its own, confirmed
+    // live by re-fetching prhcomics.com's own page for this exact issue
+    // (its OTHER sibling covers on the same carousel came through with
+    // the full "MIDNIGHT X-MEN #2 COVER F ... VARIANT [1:50]" wording,
+    // so this short form isn't universal - PRH's own markup is simply
+    // inconsistent about it, seemingly tied to which specific cover a
+    // request happens to land on). With no series/issue# for
+    // PrhTitleParser.ApplyTitle to anchor on, the whole raw title falls
+    // into SeriesName with nothing usable left for CoverLetter, which is
+    // what produced 478 false "already in use by a different issue"
+    // errors in one run - every single one checked turned out to
+    // already be this SAME issue's own real cover (see the barcode
+    // check right before the claimedBarcodes conflict check below,
+    // which is the actual fix for those 478; this regex is the
+    // complementary half, so a brand-new cover using this short wording
+    // gets a clean single-letter CoverLetter instead of the whole raw
+    // string).
+    private static readonly Regex CarouselCoverLetterPrefix = new(@"^\s*(?:CVR|Cover)\s+([A-Za-z])\b\s*(.*)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     // Shared by BackfillCoverVariantsFromPrhBookPages and
     // ImportPrhCatalogRelease - given ONE issue's own prhcomics.com
     // book-page HTML (the caller does the actual HTTP fetch and its own
@@ -5285,6 +5603,10 @@ public class AutoFetchService : IAutoFetchService
         var alreadyKnownHere = 0;
         string? unrelatedRawTitle = null;
         float? unrelatedIssueNumber = null;
+
+        // See the seriesLooksUnrelated check below for why this is
+        // needed alongside the issue-number check, not instead of it.
+        var seriesKeyExpected = SeriesNameKey.Normalize(issue.Series.Name).ToUpperInvariant();
 
         foreach (var item in scraped)
         {
@@ -5324,7 +5646,38 @@ public class AutoFetchService : IAutoFetchService
             var row = new PrhCatalogRow();
             PrhTitleParser.ApplyTitle(row, item.RawTitle);
 
-            if (row.IssueNumber.HasValue && Math.Abs(row.IssueNumber.Value - issue.IssueNumber) > 0.01f)
+            // Added 2026-11-26 (bug report: a PRH catalog import run
+            // where several scrapes "rolled into an unrelated
+            // carousel", one of them landing on a DIFFERENT SERIES
+            // entirely - a Godzilla Rivals one-shot's own scrape rolling
+            // into a Teenage Mutant Ninja Turtles carousel item, caught
+            // below only because THAT item happened to carry an
+            // explicit "#3"). The issue-number check alone has a blind
+            // spot: PrhTitleParser.ApplyTitle defaults a "#N"-less
+            // title's IssueNumber to 1 (built for a true catalog one-
+            // shot row), so an unrelated one-shot/OGN by the same
+            // author with no "#N" of its own silently "matches"
+            // whenever the issue being checked is ALSO #1 - exactly the
+            // population most likely to hit this scrape path in the
+            // first place (confirmed live: prhcomics.com's own
+            // "Additional covers" carousel fell straight through into
+            // an "Other Books by this Author" carousel for this issue,
+            // and its first two, genuinely-this-issue entries -
+            // "Variant B", "Variant RI (10)" - both have no "#N" of
+            // their own either, so they never would have tripped this
+            // check regardless). seriesLooksUnrelated is a second,
+            // independent guard that doesn't replace the issue-number
+            // check (still useful on its own, e.g. two issues of the
+            // SAME series) - it just closes the gap that one can't see
+            // through on its own.
+            var seriesKeyScraped = string.IsNullOrWhiteSpace(row.SeriesName)
+                ? ""
+                : SeriesNameKey.Normalize(row.SeriesName).ToUpperInvariant();
+            var seriesLooksUnrelated = seriesKeyScraped.Length > 0
+                && !seriesKeyScraped.Contains(seriesKeyExpected, StringComparison.Ordinal)
+                && !seriesKeyExpected.Contains(seriesKeyScraped, StringComparison.Ordinal);
+
+            if (seriesLooksUnrelated || (row.IssueNumber.HasValue && Math.Abs(row.IssueNumber.Value - issue.IssueNumber) > 0.01f))
             {
                 // Don't log yet - whether this is a genuine "nothing
                 // here" or just "already fully covered, nothing new"
@@ -5337,7 +5690,61 @@ public class AutoFetchService : IAutoFetchService
                 break;
             }
 
-            var coverLetter = row.CoverLetter; // defaults to "A" if no marker found - see PrhTitleParser; shouldn't happen for a genuine "additional cover"
+            // PrhTitleParser.ApplyTitle can't split "Variant B
+            // (Vasquez)" or "Variant RI (10) (Height)" apart the way it
+            // splits the catalog's own "Cover B (Vasquez)" wording (its
+            // CoverLetterMarker never matches "Variant", so the whole
+            // string falls into SeriesName with nothing left over for
+            // VariantText) - without this, every one of these would
+            // silently default to coverLetter "A" and collide with the
+            // Main Cover already on file instead of becoming its own
+            // cover. Checked first, falling back to row.CoverLetter
+            // (PrhTitleParser's own result) only if neither matches, so
+            // a "Cover X"-worded carousel item still works the old way.
+            var coverLetter = row.CoverLetter;
+            string? carouselVariantArtist = null;
+            var coverPrefixMatch = CarouselCoverLetterPrefix.Match(item.RawTitle);
+            var carouselMarkerFound = coverPrefixMatch.Success;
+            if (coverPrefixMatch.Success)
+            {
+                coverLetter = coverPrefixMatch.Groups[1].Value.ToUpperInvariant();
+                var prefixRemainder = coverPrefixMatch.Groups[2].Value.Trim();
+                if (prefixRemainder.Length > 0) carouselVariantArtist = prefixRemainder;
+            }
+            else
+            {
+                var riMatch = CarouselVariantRiMarker.Match(item.RawTitle);
+                carouselMarkerFound = riMatch.Success;
+                if (riMatch.Success)
+                {
+                    coverLetter = riMatch.Groups[1].Success ? $"RI ({riMatch.Groups[1].Value})" : "RI";
+                }
+                else
+                {
+                    var letterMatch = CarouselVariantLetterMarker.Match(item.RawTitle);
+                    if (letterMatch.Success)
+                    {
+                        coverLetter = letterMatch.Groups[1].Value.ToUpperInvariant();
+                        carouselMarkerFound = true;
+                    }
+                    else
+                    {
+                        var namedMatch = CarouselArtistBeforeVariant.Match(item.RawTitle);
+                        var namedText = namedMatch.Success ? namedMatch.Groups[1].Value.Trim() : "";
+                        if (namedText.Length > 0)
+                        {
+                            coverLetter = namedText;
+                            carouselVariantArtist = namedText;
+                            carouselMarkerFound = true;
+                        }
+                    }
+                }
+            }
+            if (carouselMarkerFound && carouselVariantArtist is null)
+            {
+                var artistMatch = CarouselTrailingArtist.Match(item.RawTitle);
+                if (artistMatch.Success) carouselVariantArtist = artistMatch.Groups[1].Value.Trim();
+            }
             decimal price = 0;
             if (!string.IsNullOrWhiteSpace(item.PriceText))
             {
@@ -5363,8 +5770,9 @@ public class AutoFetchService : IAutoFetchService
                 {
                     existingCover.Barcode = item.Isbn;
                     if (price > 0) existingCover.Price = price;
-                    if (string.IsNullOrWhiteSpace(existingCover.CoverArtist) && !string.IsNullOrWhiteSpace(row.VariantText))
-                        existingCover.CoverArtist = row.VariantText;
+                    var upgradeArtist = carouselVariantArtist ?? row.VariantText;
+                    if (string.IsNullOrWhiteSpace(existingCover.CoverArtist) && !string.IsNullOrWhiteSpace(upgradeArtist))
+                        existingCover.CoverArtist = upgradeArtist;
                     claimedBarcodes.Add(item.Isbn);
                     upgradedHere++;
                     result.CoversBackfilled++;
@@ -5375,6 +5783,29 @@ public class AutoFetchService : IAutoFetchService
                     // but not "nothing here" either. See alreadyKnownHere.
                     alreadyKnownHere++;
                 }
+                continue;
+            }
+
+            // Bug found 2026-11-27 (real run: 478 "skipped ... already in
+            // use by a different issue" lines in one overnight backfill),
+            // clustered around multi-cover one-shots like the "Midnight"
+            // trio, VENOM: POV, Punisher Showdowns, Doomquest, Iron Man
+            // #12 - every single one checked turned out to be a FALSE
+            // alarm: the barcode was already filed on THIS SAME issue,
+            // just under a cover letter this particular scrape didn't
+            // resolve (confirmed live against the real DB: barcode
+            // 75960621668000216 already belongs to Midnight X-Men #2's
+            // own Cover "E", not some other issue). claimedBarcodes only
+            // says a barcode is claimed by SOMEONE in this run/database -
+            // it doesn't say by whom, so a barcode that's actually
+            // already on THIS issue (just unmatched by the coverLetter
+            // string above) was being misreported as a conflict with "a
+            // different issue." Checked first, before ever calling it
+            // that: if it's already one of this issue's own covers,
+            // under ANY letter, that's not a conflict at all.
+            if (issue.Covers.Any(c => string.Equals(c.Barcode, item.Isbn, StringComparison.OrdinalIgnoreCase)))
+            {
+                alreadyKnownHere++;
                 continue;
             }
 
@@ -5392,7 +5823,7 @@ public class AutoFetchService : IAutoFetchService
                 Barcode = item.Isbn,
                 Price = price,
                 StockQuantity = 0,
-                CoverArtist = row.VariantText
+                CoverArtist = carouselVariantArtist ?? row.VariantText
             };
             issue.Covers.Add(newCover);
             claimedBarcodes.Add(item.Isbn);
@@ -5489,6 +5920,7 @@ public class AutoFetchService : IAutoFetchService
 
         var done = 0;
         var noPrhPageFound = 0;
+        var consecutiveNetworkFailures = 0;
         foreach (var (issue, queryCover) in candidates)
         {
             done++;
@@ -5522,8 +5954,19 @@ public class AutoFetchService : IAutoFetchService
                 result.Errors.Add(errLine);
                 trace.AppendLine(errLine);
                 onProgress?.Invoke(errLine);
+                if (PrhWebsiteFetcher.IsNetworkFailure(ex) && ++consecutiveNetworkFailures >= PrhWebsiteFetcher.MaxConsecutiveNetworkFailures)
+                {
+                    var stopLine = $"STOPPED EARLY at {done}/{candidates.Count}: {consecutiveNetworkFailures} network failures in a row - the connection looks down. Nothing past this point was checked; re-run this button once you're back online.";
+                    result.Errors.Add(stopLine);
+                    trace.AppendLine(stopLine);
+                    onProgress?.Invoke(stopLine);
+                    var (savedStop, saveErrorStop) = TrySaveChanges();
+                    if (!savedStop) result.Errors.Add($"Batch ending at issue {done}: failed to save - {saveErrorStop}");
+                    break;
+                }
                 continue;
             }
+            consecutiveNetworkFailures = 0;
 
             if (html == null)
             {
@@ -5641,6 +6084,7 @@ public class AutoFetchService : IAutoFetchService
         var claimedBarcodes = _db.Covers.Select(c => c.Barcode).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var done = 0;
         var noPrhPageFound = 0;
+        var consecutiveNetworkFailures = 0;
 
         foreach (var (issue, queryCover) in candidates)
         {
@@ -5663,8 +6107,17 @@ public class AutoFetchService : IAutoFetchService
                 var errLine = $"{label}: additional-covers lookup failed: {ex.Message}";
                 result.Errors.Add(errLine);
                 trace.AppendLine(errLine);
+                if (PrhWebsiteFetcher.IsNetworkFailure(ex) && ++consecutiveNetworkFailures >= PrhWebsiteFetcher.MaxConsecutiveNetworkFailures)
+                {
+                    var stopLine = $"STOPPED additional-covers check early at {done}/{candidates.Count}: {consecutiveNetworkFailures} network failures in a row - the connection looks down. Run Backfill PRH Cover Variants once you're back online to catch the rest.";
+                    result.Errors.Add(stopLine);
+                    trace.AppendLine(stopLine);
+                    onProgress?.Invoke(stopLine);
+                    break;
+                }
                 continue;
             }
+            consecutiveNetworkFailures = 0;
 
             if (html == null)
             {
@@ -6198,6 +6651,17 @@ internal static class PrhWebsiteFetcher
     // ParseAdditionalCovers below and AutoFetchService.
     // BackfillCoverVariantsFromPrhBookPages's own doc comment for the
     // full story of how this was found.
+    // One blip (a single timeout) shouldn't kill a multi-hour pass, but 10
+    // misses in a row means the connection is gone (2026-11-27: a Wi-Fi
+    // drop turned into 2,002 "No such host" errors before this existed).
+    public const int MaxConsecutiveNetworkFailures = 10;
+
+    // True for "couldn't reach the site at all" (DNS failure, no route,
+    // timeout). False for a real HTTP error status (500, 403...), where the
+    // site did answer - EnsureSuccessStatusCode sets StatusCode on those.
+    public static bool IsNetworkFailure(Exception ex) =>
+        ex is HttpRequestException { StatusCode: null } || ex is TaskCanceledException;
+
     public static async Task<string?> DownloadBookPageHtmlAsync(string isbn)
     {
         var url = $"https://prhcomics.com/book/?isbn={Uri.EscapeDataString(isbn)}";
