@@ -63,9 +63,12 @@ public interface IAutoFetchService
     // linked series. Updates the last-checked timestamp when done.
     AutoFetchResult CheckForNewIssues();
 
-    // Everything in the last-3-months/next-3-months window, for the New
-    // Books tab - whatever's already in the database (Comic Vine finds,
-    // CSV imports, or hand-entered items alike), not a fresh API call.
+    // Every issue already in the database (Comic Vine finds, CSV imports,
+    // or hand-entered items alike) for the New Books tab - not a fresh API
+    // call. Used to narrow this to a last-3-months/next-3-months window;
+    // removed 2026-11-26 so the page's own "All Months" filter and month
+    // tabs can actually reach every month in the database instead of
+    // being capped before they ever see it.
     List<Issue> GetNewBooks();
 
     // A manual, explicit "fix my existing data" action - separate from the
@@ -308,6 +311,14 @@ public interface IAutoFetchService
     // one-time catch-up (or an occasional re-run to pick up newly
     // published future weeks), kicked off by hand from NewBooks.razor.
     AutoFetchResult BackfillAllLunarHistory(Action<string>? onProgress = null);
+
+    // Added 2026-11-27 - see AutoFetchService.FetchAllHistoryBothDistributors's
+    // own doc comment for the full reasoning: chains BackfillAllLunarHistory,
+    // then FetchAllAvailablePrhCatalogsFromWebsite, then
+    // BackfillCoverVariantsFromPrhBookPages, in that fixed order, into one
+    // combined result - the store's "one button that gets both [Lunar and
+    // PRH], all the way back" request.
+    AutoFetchResult FetchAllHistoryBothDistributors(Action<string>? onProgress = null);
 
     // Dev/demo seed data - added 2026-11-24, the store asked for fake
     // customers, a fake sales history, and (added later the same day)
