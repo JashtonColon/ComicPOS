@@ -127,7 +127,7 @@ public class CheckoutService : ICheckoutService
     // by buying Cover B - staff can still close that one by hand from
     // Inventory. Oldest hold first; a hold is closed only once enough
     // copies were bought to cover its whole quantity.
-    // shortcut: voiding the sale does not reopen these holds, add that to VoidSale if it comes up.
+    // Each closed hold records FulfilledBySaleId, so VoidSale can reopen them.
     private void FulfillMatchingHolds(Sale sale)
     {
         var customerId = sale.CustomerId!.Value;
@@ -146,6 +146,7 @@ public class CheckoutService : ICheckoutService
                 remaining -= hold.Quantity;
                 hold.IsFulfilled = true;
                 hold.FulfilledAt = DateTime.Now;
+                hold.FulfilledBySaleId = sale.Id;
                 changed = true;
             }
         }
@@ -183,6 +184,15 @@ public class CheckoutService : ICheckoutService
 
         foreach (var line in sale.Lines)
             line.Cover.StockQuantity += line.Quantity;
+
+        // The customer didn't keep the books, so holds this sale picked up
+        // are outstanding again (only ones checkout closed, never manual ones).
+        foreach (var hold in _db.IssueHolds.Where(h => h.FulfilledBySaleId == sale.Id))
+        {
+            hold.IsFulfilled = false;
+            hold.FulfilledAt = null;
+            hold.FulfilledBySaleId = null;
+        }
 
         sale.IsVoided = true;
         _db.SaveChanges();

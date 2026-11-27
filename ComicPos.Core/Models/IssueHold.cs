@@ -34,6 +34,11 @@ public class IssueHold
     public bool IsFulfilled { get; set; }
     public DateTime? FulfilledAt { get; set; }
 
+    // The sale that picked this hold up, when checkout closed it
+    // automatically (CheckoutService.FulfillMatchingHolds). Lets VoidSale
+    // reopen exactly those holds. Null for holds closed by hand.
+    public int? FulfilledBySaleId { get; set; }
+
     // A hold that's no longer wanted (customer changed their mind) -
     // separate from IsFulfilled so "cancelled" and "picked up" aren't the
     // same bucket when looking back at history.
