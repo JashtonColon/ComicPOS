@@ -15,3 +15,8 @@ ComicPos.Data/Migrations/ComicDbContextModelSnapshot.cs
 
 # Throwaway console project.
 ComicPos.Scratch/
+
+# One-off patch scripts from editing sessions (also in .gitignore, but
+# graphify keeps nodes for on-disk files unless excluded here explicitly).
+_fix_*.py
+ComicPos.Data/*.py
