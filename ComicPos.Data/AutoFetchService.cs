@@ -2048,6 +2048,16 @@ public class AutoFetchService : IAutoFetchService
     // catalogs, each its own full download+import, so this is a
     // genuinely long-running operation; same "run by hand, never on a
     // timer" reasoning as BackfillAllLunarHistory.
+    // FetchAllHistoryBothDistributors checks for this prefix to tell
+    // "PRH unreachable, nothing was checked" apart from per-book errors.
+    private const string PrhArchiveUnreachablePrefix = "Couldn't read prhcomics.com's catalog archive listing:";
+
+    // Non-null only while FetchAllHistoryBothDistributors runs: issue Ids
+    // whose per-import PRH book-page check didn't complete (network error,
+    // or the check stopped early), so its step 3 retries just those instead
+    // of re-asking PRH about every Lunar-only book in the database.
+    private HashSet<int>? _prhPageChecksPending;
+
     public AutoFetchResult FetchAllAvailablePrhCatalogsFromWebsite(Action<string>? onProgress = null)
     {
         var result = new AutoFetchResult();
@@ -2055,14 +2065,33 @@ public class AutoFetchService : IAutoFetchService
         trace.AppendLine($"PRH full-history website fetch run at {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
         trace.AppendLine(new string('=', 60));
 
+        // This one request gates the whole fetch, so a short Wi-Fi blip at
+        // this exact moment used to lose everything (2026-11-27). Retry
+        // network failures a few times before giving up; a real HTTP
+        // error from the site is not retried.
         List<string> codes;
         try
         {
-            codes = PrhWebsiteFetcher.DiscoverAvailableCatalogCodesAsync(onProgress).GetAwaiter().GetResult();
+            codes = null!;
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    codes = PrhWebsiteFetcher.DiscoverAvailableCatalogCodesAsync(onProgress).GetAwaiter().GetResult();
+                    break;
+                }
+                catch (Exception ex) when (attempt < 3 && PrhWebsiteFetcher.IsNetworkFailure(ex))
+                {
+                    var retryLine = $"Couldn't reach prhcomics.com ({ex.Message}) - retrying in 10s (attempt {attempt} of 3)...";
+                    trace.AppendLine(retryLine);
+                    onProgress?.Invoke(retryLine);
+                    Thread.Sleep(10_000);
+                }
+            }
         }
         catch (Exception ex)
         {
-            var line = $"Couldn't read prhcomics.com's catalog archive listing: {ex.Message}";
+            var line = $"{PrhArchiveUnreachablePrefix} {ex.Message}";
             result.Errors.Add(line);
             trace.AppendLine(line);
             result.Trace = trace.ToString();
@@ -2479,12 +2508,40 @@ public class AutoFetchService : IAutoFetchService
         Merge(lunar, "Lunar full-history backfill");
 
         onProgress?.Invoke("Step 2 of 3: Fetching every available PRH catalog (2021-06 through now)...");
-        var prh = FetchAllAvailablePrhCatalogsFromWebsite(progressLine => onProgress?.Invoke($"PRH: {progressLine}"));
+        AutoFetchResult prh;
+        _prhPageChecksPending = new HashSet<int>();
+        HashSet<int> pending;
+        try
+        {
+            prh = FetchAllAvailablePrhCatalogsFromWebsite(progressLine => onProgress?.Invoke($"PRH: {progressLine}"));
+        }
+        finally
+        {
+            pending = _prhPageChecksPending;
+            _prhPageChecksPending = null;
+        }
         Merge(prh, "PRH full-history catalog fetch");
 
-        onProgress?.Invoke("Step 3 of 3: Catching up any PRH cover variants missed above...");
-        var coverCatchUp = BackfillCoverVariantsFromPrhBookPages(progressLine => onProgress?.Invoke($"PRH cover catch-up: {progressLine}"));
-        Merge(coverCatchUp, "PRH cover-variant catch-up pass");
+        // Step 2's per-import check already covered every issue in every PRH
+        // catalog, so step 3 only retries the ones whose check didn't finish -
+        // not a whole-database pass (~4,800 Lunar-only books PRH never sells).
+        trace.AppendLine(new string('-', 60));
+        if (prh.Errors.Any(e => e.StartsWith(PrhArchiveUnreachablePrefix)))
+        {
+            var skipLine = "[PRH cover-variant retry] SKIPPED - prhcomics.com couldn't be reached in step 2, so there's nothing to retry yet. Run Fetch All Available PRH Catalogs once you're back online.";
+            trace.AppendLine(skipLine);
+            onProgress?.Invoke(skipLine);
+        }
+        else if (pending.Count == 0)
+        {
+            trace.AppendLine("[PRH cover-variant retry] Nothing to retry - every PRH book-page check in step 2 completed.");
+        }
+        else
+        {
+            onProgress?.Invoke($"Step 3 of 3: Retrying {pending.Count} PRH cover-variant check(s) that didn't finish above...");
+            var retry = BackfillCoverVariantsFromPrhBookPages(progressLine => onProgress?.Invoke($"PRH cover retry: {progressLine}"), null, pending);
+            Merge(retry, "PRH cover-variant retry");
+        }
 
         trace.AppendLine(new string('=', 60));
         trace.AppendLine($"Finished at {DateTime.Now:yyyy-MM-dd HH:mm:ss}. {combined.NewIssuesAdded} new issue(s) added, {combined.CoverVariantsAdded} new cover variant(s) added, {combined.CoversBackfilled} barcode(s) upgraded - combined across both distributors' full history.");
@@ -5875,7 +5932,12 @@ public class AutoFetchService : IAutoFetchService
     // up pass, for anything imported before that existed, or any issue
     // whose prhcomics.com page didn't have its variants listed yet at
     // import time but does now.
-    public AutoFetchResult BackfillCoverVariantsFromPrhBookPages(Action<string>? onProgress = null, int? limit = null)
+    public AutoFetchResult BackfillCoverVariantsFromPrhBookPages(Action<string>? onProgress = null, int? limit = null) =>
+        BackfillCoverVariantsFromPrhBookPages(onProgress, limit, onlyIssueIds: null);
+
+    // onlyIssueIds: when set, check just these issues (Fetch Everything's
+    // retry of failed checks) instead of every issue in the database.
+    private AutoFetchResult BackfillCoverVariantsFromPrhBookPages(Action<string>? onProgress, int? limit, IReadOnlyCollection<int>? onlyIssueIds)
     {
         var result = new AutoFetchResult();
         var trace = new System.Text.StringBuilder();
@@ -5886,6 +5948,7 @@ public class AutoFetchService : IAutoFetchService
             .Include(i => i.Series)
             .Include(i => i.Covers)
             .Where(i => i.Covers.Any())
+            .Where(i => onlyIssueIds == null || onlyIssueIds.Contains(i.Id))
             .ToList();
 
         var candidates = rawIssues
@@ -6085,6 +6148,9 @@ public class AutoFetchService : IAutoFetchService
         var done = 0;
         var noPrhPageFound = 0;
         var consecutiveNetworkFailures = 0;
+        // Every candidate starts "pending" and is cleared once PRH answers
+        // (page or 404), so errors and anything skipped by an early stop stay.
+        _prhPageChecksPending?.UnionWith(candidates.Select(c => c.Issue.Id));
 
         foreach (var (issue, queryCover) in candidates)
         {
@@ -6118,6 +6184,7 @@ public class AutoFetchService : IAutoFetchService
                 continue;
             }
             consecutiveNetworkFailures = 0;
+            _prhPageChecksPending?.Remove(issue.Id);
 
             if (html == null)
             {

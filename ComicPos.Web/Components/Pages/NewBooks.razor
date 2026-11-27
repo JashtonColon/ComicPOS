@@ -46,7 +46,7 @@
              longest-running button on this page - potentially hours, not
              minutes - so the confirm() below says so plainly. Only ever
              adds/updates inventory; nothing is deleted. -->
-        <button class="btn-primary btn-sm" disabled="@_checking" @onclick="RunFetchAllHistoryBothDistributors" title="Runs Backfill All Lunar History, then Fetch All Available PRH Catalogs, then a PRH cover-variant catch-up pass, one after another, as one combined operation - everything both distributors have, back to the start of each one's own available history. Can take a long time (potentially hours). Only ever adds/updates inventory; nothing is deleted.">Fetch Everything (Lunar + PRH, Full History)</button>
+        <button class="btn-primary btn-sm" disabled="@_checking" @onclick="RunFetchAllHistoryBothDistributors" title="Runs Backfill All Lunar History, then Fetch All Available PRH Catalogs, then retries any PRH cover-variant checks that did not finish (e.g. a Wi-Fi drop), one after another, as one combined operation - everything both distributors have, back to the start of each one's own available history. Can take a long time (potentially hours). Only ever adds/updates inventory; nothing is deleted.">Fetch Everything (Lunar + PRH, Full History)</button>
         <button class="btn-ghost btn-sm" disabled="@_checking" @onclick="RunRescan">Re-scan Existing</button>
         <!-- Metron is now the primary discovery source (2026-11-22),
              replacing LOCG in that role - a plain token-authenticated
@@ -1838,7 +1838,7 @@ else
         if (_checking) return;
 
         var confirmed = await JS.InvokeAsync<bool>("confirm",
-            "This runs Backfill All Lunar History, then Fetch All Available PRH Catalogs, then a PRH cover-variant catch-up pass, one after another - everything both distributors have, back to the start of each one's own available history. This is the single longest-running operation on this page and can take a long time (potentially hours). It only ever adds/updates inventory; nothing is deleted.\n\nContinue?");
+            "This runs Backfill All Lunar History, then Fetch All Available PRH Catalogs, then retries any PRH cover-variant checks that did not finish, one after another - everything both distributors have, back to the start of each one's own available history. This is the single longest-running operation on this page and can take a long time (potentially hours). It only ever adds/updates inventory; nothing is deleted.\n\nContinue?");
         if (!confirmed) return;
 
         _checking = true;
