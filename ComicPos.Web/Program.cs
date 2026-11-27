@@ -78,6 +78,14 @@ using (var scope = app.Services.CreateScope())
         return;
     }
 
+    // Added 2026-11-27 - see IWorkerService.EnsureDefaultWorkerExists'
+    // own doc comment: a database with zero workers (brand-new install,
+    // or right after a full reset) would otherwise lock the store out of
+    // Settings entirely, since Settings is gated behind a worker login
+    // and the only way to add a worker is from Settings. A no-op once
+    // any worker exists.
+    scope.ServiceProvider.GetRequiredService<IWorkerService>().EnsureDefaultWorkerExists();
+
     // One-time repair for the "wrong era cover" bug fixed 2026-11-21 (see
     // StoreSettings.WrongEraCoverCleanupApplied and AutoFetchService's new
     // IssueDateHint) - clears out covers that already got filled in, but
